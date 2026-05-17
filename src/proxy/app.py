@@ -7,8 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .config import get_settings
-from .nim import NIMClient
-from .routes import router, set_nim_client
+from .client import ProviderClient
+from .routes import router, set_provider_client
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +34,10 @@ def _configure_logging(log_file: str):
 async def lifespan(app: FastAPI):
     settings = get_settings()
     _configure_logging(settings.log_file)
-    logger.info("Starting cc-nim-proxy → %s (%s)", settings.nvidia_nim_base_url, settings.nvidia_nim_model)
+    logger.info("Starting cc-nim-proxy → %s (%s)", settings.provider_base_url, settings.provider_model)
 
-    nim = NIMClient(settings)
-    set_nim_client(nim)
+    client = ProviderClient(settings)
+    set_provider_client(client)
 
     # Start Telegram bot if configured
     tg_app = None
@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
         await tg_app.stop()
         await tg_app.shutdown()
 
-    await nim.aclose()
+    await client.aclose()
     logger.info("Proxy shut down")
 
 

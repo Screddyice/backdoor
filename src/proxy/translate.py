@@ -128,12 +128,12 @@ def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
     oai_messages.extend(messages_to_openai(req.messages))
 
     payload: dict[str, Any] = {
-        "model": settings.nvidia_nim_model,
+        "model": settings.provider_model,
         "messages": oai_messages,
-        "max_tokens": min(req.max_tokens, settings.nvidia_nim_max_tokens),
+        "max_tokens": min(req.max_tokens, settings.provider_max_tokens),
         "stream": req.stream,
-        "temperature": req.temperature if req.temperature is not None else settings.nvidia_nim_temperature,
-        "top_p": req.top_p if req.top_p is not None else settings.nvidia_nim_top_p,
+        "temperature": req.temperature if req.temperature is not None else settings.provider_temperature,
+        "top_p": req.top_p if req.top_p is not None else settings.provider_top_p,
     }
 
     oai_tools = tools_to_openai(req.tools)

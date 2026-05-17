@@ -10,15 +10,15 @@ class Settings(BaseSettings):
     port: int = 8082
     log_file: str = "proxy.log"
 
-    # NVIDIA NIM
-    nvidia_nim_api_key: str = ""
-    nvidia_nim_model: str = "meta/llama-3.3-70b-instruct"
-    nvidia_nim_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_nim_max_tokens: int = 32768
-    nvidia_nim_temperature: float = 1.0
-    nvidia_nim_top_p: float = 1.0
+    # Provider — any OpenAI-compatible API (NIM, DeepSeek, Groq, OpenRouter, Ollama, …)
+    provider_api_key: str = ""
+    provider_model: str = "meta/llama-3.3-70b-instruct"
+    provider_base_url: str = "https://integrate.api.nvidia.com/v1"
+    provider_max_tokens: int = 32768
+    provider_temperature: float = 1.0
+    provider_top_p: float = 1.0
 
-    # Request optimizations — avoid burning NIM quota on Claude Code housekeeping calls
+    # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True
     skip_title_generation: bool = True
     skip_suggestion_mode: bool = True

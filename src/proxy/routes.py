@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from .config import Settings, get_settings
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
-from .nim import NIMClient, NIMError
+from .client import ProviderClient, ProviderError
 from .tokens import count_messages
 from .translate import build_nim_payload, nim_response_to_anthropic, stream_openai_to_anthropic
 from .optimizations import (
@@ -21,19 +21,18 @@ from .optimizations import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Module-level client, initialised in app lifespan
-_nim_client: NIMClient | None = None
+_client: ProviderClient | None = None
 
 
-def set_nim_client(client: NIMClient):
-    global _nim_client
-    _nim_client = client
+def set_provider_client(c: ProviderClient):
+    global _client
+    _client = c
 
 
-def get_nim_client() -> NIMClient:
-    if _nim_client is None:
-        raise RuntimeError("NIM client not initialised")
-    return _nim_client
+def get_provider_client() -> ProviderClient:
+    if _client is None:
+        raise RuntimeError("Provider client not initialised")
+    return _client
 
 
 def _mock_response(req: MessagesRequest, text: str) -> MessagesResponse:
@@ -83,7 +82,7 @@ async def create_message(
     if fast:
         return fast
 
-    client = get_nim_client()
+    client = get_provider_client()
     payload = build_nim_payload(req, settings)
     msg_id = f"msg_{uuid.uuid4().hex}"
 
@@ -96,16 +95,16 @@ async def create_message(
         )
 
     try:
-        nim_resp = await client.complete(payload)
-    except NIMError as e:
-        logger.error("NIM error %s: %s", e.status_code, e.message)
+        resp = await client.complete(payload)
+    except ProviderError as e:
+        logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
-    return nim_response_to_anthropic(nim_resp, req, msg_id)
+    return nim_response_to_anthropic(resp, req, msg_id)
 
 
 async def _stream(
-    client: NIMClient,
+    client: ProviderClient,
     payload: dict,
     msg_id: str,
     req: MessagesRequest,
@@ -116,8 +115,8 @@ async def _stream(
         async for chunk in client.stream(payload):
             for event in stream_openai_to_anthropic(chunk, state, msg_id, req, input_tokens):
                 yield event
-    except NIMError as e:
-        logger.error("NIM stream error %s: %s", e.status_code, e.message)
+    except ProviderError as e:
+        logger.error("Provider stream error %s: %s", e.status_code, e.message)
         import json
         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':e.message}})}\n\n"
 
