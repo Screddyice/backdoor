@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ ! -d ".venv" ]; then
+  echo "Installing dependencies (first run only)..."
+  uv sync
+fi
+
+exec uv run python3 wizard.py "$@"

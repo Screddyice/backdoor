@@ -81,11 +81,10 @@ The harness is free. The intelligence is cheap. That's the whole point.
 ```bash
 git clone https://github.com/ajsai47/backdoor
 cd backdoor
-cp .env.example .env   # add your provider URL + key
-./run.sh               # starts the proxy and opens Claude Code
+./backdoor   # animated setup wizard — picks your provider, writes your config, launches Claude Code
 ```
 
-That's it. `run.sh` handles everything — installs deps on first run, starts the proxy, launches Claude Code pointed at it, and shuts everything down cleanly when you're done.
+That's it. The wizard handles everything: animated intro, provider selection, API key entry, and launching your first session. If you'd rather skip the wizard and configure manually, copy `.env.example` to `.env`, fill it in, and run `./run.sh` directly.
 
 ---
 
