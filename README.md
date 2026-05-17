@@ -138,6 +138,28 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in `.env` and you can tr
 
 ---
 
+## Troubleshooting
+
+**`Proxy failed to start`**
+Something is already using port 8082. Either stop the other process or change `PORT=8083` in your `.env`.
+
+**`PROVIDER_API_KEY is not set`**
+Open `.env` and replace `your-api-key-here` with your actual key.
+
+**`Claude Code is not installed`**
+Install it from [claude.ai/code](https://claude.ai/code).
+
+**`Model not found` or `404` from the provider**
+The model name in `PROVIDER_MODEL` doesn't match what the provider expects. Check the provider's docs for the exact model slug — they vary (e.g. DeepSeek uses `deepseek-chat`, Groq uses `llama-3.3-70b-versatile`).
+
+**Responses feel slow**
+Switch to Groq — it's the fastest inference available and has a free tier.
+
+**Nothing is logged**
+Check `proxy.log` in the project directory. If it's empty, the proxy didn't start at all — run `uv run uvicorn server:app` directly to see the error.
+
+---
+
 ## How it works under the hood
 
 Claude Code talks to `localhost:8082` thinking it's Anthropic. Backdoor receives the request, translates it from Anthropic's Messages API format to OpenAI's chat completions format, forwards it to your chosen provider, and streams the response back — translated back into Anthropic's SSE format in real time. Tool calls, streaming deltas, token counts — all handled transparently.

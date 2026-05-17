@@ -88,12 +88,13 @@ async def create_message(
     last_user = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
     preview = (last_user if isinstance(last_user, str) else str(last_user))[:80]
     mode = "stream" if req.stream else "complete"
-    logger.info("→ DeepSeek [%s] tools=%s | %r", mode, len(req.tools or []), preview)
+    provider = settings.provider_model
+    logger.info("→ %s [%s] tools=%s | %r", provider, mode, len(req.tools or []), preview)
 
     if req.stream:
         input_tokens = count_messages(req.messages, req.system, req.tools)
         return StreamingResponse(
-            _stream(client, payload, msg_id, req, input_tokens),
+            _stream(client, payload, msg_id, req, input_tokens, provider),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -105,7 +106,7 @@ async def create_message(
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
     result = nim_response_to_anthropic(resp, req, msg_id)
-    logger.info("← DeepSeek [%s] stop=%s out_tokens=%s", mode, result.get("stop_reason"), result.get("usage", {}).get("output_tokens"))
+    logger.info("← %s [%s] stop=%s out_tokens=%s", provider, mode, result.get("stop_reason"), result.get("usage", {}).get("output_tokens"))
     return result
 
 
@@ -115,13 +116,14 @@ async def _stream(
     msg_id: str,
     req: MessagesRequest,
     input_tokens: int,
+    provider: str,
 ) -> AsyncIterator[str]:
     state: dict = {}
     try:
         async for chunk in client.stream(payload):
             for event in stream_openai_to_anthropic(chunk, state, msg_id, req, input_tokens):
                 yield event
-        logger.info("← DeepSeek [stream] done stop=%s", state.get("stop_reason", "end_turn"))
+        logger.info("← %s [stream] done", provider)
     except ProviderError as e:
         logger.error("Provider stream error %s: %s", e.status_code, e.message)
         import json
