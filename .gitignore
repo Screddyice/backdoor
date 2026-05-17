@@ -7,3 +7,4 @@ dist/
 proxy.log
 workspace/
 .DS_Store
+.supercoder/
