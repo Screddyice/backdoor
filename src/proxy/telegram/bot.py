@@ -13,11 +13,11 @@ from .session import SessionManager
 logger = logging.getLogger(__name__)
 
 _manager: SessionManager | None = None
-_allowed_id: int = 0
+_allowed_id: int | None = None
 
 
 def _guard(update: Update) -> bool:
-    if not update.effective_user:
+    if not update.effective_user or _allowed_id is None:
         return False
     return update.effective_user.id == _allowed_id
 

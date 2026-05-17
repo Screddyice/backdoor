@@ -27,13 +27,17 @@ class Settings(BaseSettings):
 
     # Telegram (optional)
     telegram_bot_token: str = ""
-    telegram_allowed_user_id: int = 0
+    telegram_allowed_user_id: int | None = None
 
     # CLI sessions (used by Telegram integration)
     claude_workspace: str = "./workspace"
     max_cli_sessions: int = 5
 
 
-@lru_cache
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def clear_settings_cache():
+    get_settings.cache_clear()
