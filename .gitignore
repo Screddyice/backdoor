@@ -1,0 +1,9 @@
+.env
+*.pyc
+__pycache__/
+.venv/
+dist/
+*.egg-info/
+proxy.log
+workspace/
+.DS_Store
