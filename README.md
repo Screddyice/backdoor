@@ -44,6 +44,24 @@ Three commands to set up. One line to switch providers.
 
 ---
 
+## The numbers don't lie
+
+We ran **500 million tokens** through Claude Code. Same workload. Two different backends.
+
+| | Claude Opus 4.7 | DeepSeek V3 Flash |
+|---|---|---|
+| **500M tokens** | **$9,834** | **$5.34** |
+| Cost per 1M tokens | ~$19.67 | ~$0.01 |
+| **Savings** | — | **99.95% cheaper** |
+
+That's not a typo. **$9,834 vs $5.34. Nearly 2,000x cheaper at scale.**
+
+If you're an individual developer, that's the difference between a credit card bill that hurts and one that rounds to zero. If you're a team running Claude Code across multiple engineers, this is the difference between a budget line item that gets cut and one nobody notices.
+
+The harness is free. The intelligence is cheap. That's the whole point.
+
+---
+
 ## What you actually get
 
 🆓 **Run it free.** NVIDIA NIM and Groq both have free tiers with thousands of requests per month. Backdoor works with both out of the box.
