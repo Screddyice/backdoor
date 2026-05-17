@@ -6,103 +6,96 @@
 ██████╔╝██║  ██║╚██████╗██║  ██╗██████╔╝╚██████╔╝╚██████╔╝██║  ██║
 ╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚═════╝ ╚═╝  ╚═╝
 ```
-> Run Claude Code against any AI provider. DeepSeek, Groq, Ollama, OpenRouter — your call.
+
+**Use Claude Code with any AI — not just Anthropic.**
+
+---
+
+## What is this?
+
+Claude Code is one of the best AI coding tools out there. The problem is it only works with Anthropic's API, which costs money and requires an account.
+
+Backdoor fixes that. It sits between Claude Code and the internet, quietly swapping out the Anthropic API for whatever AI provider you want. DeepSeek, Groq, Ollama running on your own machine — anything. Claude Code never knows the difference. You get the same experience, your way.
 
 ---
 
 ## Why would you use this?
 
-**Claude Code is the best AI coding agent available.** The UX, the tool use, the agentic loops — nothing else comes close. But it's wired to Anthropic's API, which means every session costs real money.
+**You want to try Claude Code without paying.**
+Several providers have generous free tiers — NVIDIA NIM and Groq both let you make thousands of requests per month for free. Backdoor lets you use Claude Code on top of those.
 
-This proxy breaks that dependency. You get the full Claude Code experience — same CLI, same tools, same workflow — while the actual inference runs on whatever backend you choose. Free tiers, cheaper APIs, local models, all of it.
+**You want to spend less.**
+DeepSeek costs about 95% less than Claude's API for the same amount of work. If you're using Claude Code heavily, that adds up fast.
 
-| You want to... | How this helps |
-|---|---|
-| Try Claude Code without an Anthropic bill | Point it at NVIDIA NIM's free tier |
-| Run it cheaper at scale | DeepSeek-V3 costs ~95% less than Claude Sonnet |
-| Work fully offline | Route to a local Ollama or LM Studio instance |
-| Benchmark models against real coding tasks | Swap `PROVIDER_MODEL` in one line, no other changes |
-| One API key for 200+ models | Use OpenRouter as the backend |
+**You want to run everything locally.**
+Point Backdoor at Ollama or LM Studio and nothing ever leaves your machine. No API keys, no internet, no usage bills — just your computer doing the work.
 
----
+**You want to try different models.**
+Swap one line in a config file and Claude Code is running on a completely different AI. Great for figuring out which model works best for your specific projects.
 
-## Before & After
-
-**Before** — Claude Code, stock:
-```
-Claude Code CLI
-       │
-       ▼
- Anthropic API   ← $$$, rate limits, requires paid account
-       │
-       ▼
-  Claude model
-```
-
-**After** — Claude Code through cc-nim-proxy:
-```
-Claude Code CLI   ← unchanged, same UX
-       │
-       ▼
- cc-nim-proxy     ← translates Anthropic → OpenAI format
-       │           ← intercepts housekeeping calls (quota probes,
-       │             title gen, etc.) to save quota
-       ▼
- Any provider     ← DeepSeek, Groq, NVIDIA NIM, OpenRouter,
-       │             Ollama, LM Studio, anything OpenAI-compatible
-       ▼
-  Response        ← translated back to Anthropic format
-       │
-       ▼
-Claude Code CLI   ← sees a normal Claude response, none the wiser
-```
+**You want to use OpenRouter.**
+OpenRouter gives you access to 200+ models through a single API key. Backdoor works with it out of the box, so you can switch between models whenever you want.
 
 ---
 
-## Quick start
+## Getting started
+
+You need [uv](https://docs.astral.sh/uv/) installed. That's it.
 
 ```bash
-# 1. Clone and install
-git clone https://github.com/ajsai47/cc-nim-proxy
-cd cc-nim-proxy
-uv sync
+# 1. Clone the repo
+git clone https://github.com/ajsai47/backdoor
+cd backdoor
 
-# 2. Configure your provider
+# 2. Set up your provider
 cp .env.example .env
-# edit .env — set PROVIDER_BASE_URL, PROVIDER_API_KEY, PROVIDER_MODEL
+# open .env and fill in your provider URL, API key, and model name
 
-# 3. Launch (starts proxy + Claude Code in one command)
+# 3. Start it up
 ./run.sh
 ```
 
+`run.sh` starts Backdoor and opens Claude Code automatically. When you quit Claude Code, Backdoor shuts down too.
+
 ---
 
-## Provider setup
+## Picking a provider
 
-Pick one. Change two lines in `.env`.
+Open `.env` and set these three values:
 
-| Provider | `PROVIDER_BASE_URL` | `PROVIDER_MODEL` | Cost |
+```
+PROVIDER_BASE_URL=...
+PROVIDER_API_KEY=...
+PROVIDER_MODEL=...
+```
+
+Here's what to put in for the most popular options:
+
+| Provider | BASE_URL | MODEL | Cost |
 |---|---|---|---|
-| NVIDIA NIM | `https://integrate.api.nvidia.com/v1` | `meta/llama-3.3-70b-instruct` | Free tier |
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` | ~$0.001/1K tokens |
-| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | Free tier |
-| OpenRouter | `https://openrouter.ai/api/v1` | *(any model slug)* | Varies |
-| Ollama (local) | `http://localhost:11434/v1` | `llama3.3` | Free |
-| LM Studio (local) | `http://localhost:1234/v1` | *(model loaded in app)* | Free |
+| NVIDIA NIM | `https://integrate.api.nvidia.com/v1` | `meta/llama-3.3-70b-instruct` | Free tier available |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` | Very cheap |
+| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | Free tier available |
+| OpenRouter | `https://openrouter.ai/api/v1` | any model slug | Varies |
+| Ollama (local) | `http://localhost:11434/v1` | any model you've pulled | Free |
+| LM Studio (local) | `http://localhost:1234/v1` | whichever model is loaded | Free |
 
 ---
 
-## What it does under the hood
+## Open source and built to be flexible
 
-Claude Code sends requests in Anthropic's Messages API format. Every other provider speaks OpenAI's format. This proxy bridges the two:
+Backdoor works with any provider that speaks the OpenAI API format — which is most of them. If a new provider launches tomorrow, you can use it the same day by dropping in their URL and key. No waiting for updates.
 
-- **Translates** `system` blocks, content blocks, tool definitions, and tool results between formats
-- **Streams** — converts OpenAI SSE chunks back to Anthropic SSE events in real time
-- **Intercepts** housekeeping requests (quota probes, title generation, suggestion mode) and short-circuits them locally so they don't consume provider quota
-- **Counts tokens** via tiktoken when Claude Code asks
+The whole thing is open source. Read the code, change it, make it your own. There's no lock-in here — not to a provider, not to us.
 
 ---
 
-## Telegram bot (optional)
+## Optional: control it from Telegram
 
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in `.env` to control Claude Code sessions remotely from your phone. Send a message to the bot, get the output back.
+If you add a `TELEGRAM_BOT_TOKEN` and your Telegram user ID to `.env`, you can send prompts to Claude Code from your phone and get the responses back in chat.
+
+---
+
+## How it works (the short version)
+
+Claude Code sends requests in Anthropic's format. Every other provider uses a different format. Backdoor translates between the two in real time — including streaming responses, tool use, and everything else Claude Code relies on. It also short-circuits a handful of internal housekeeping requests that Claude Code makes automatically, so they don't eat into your provider quota.
