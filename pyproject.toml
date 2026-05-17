@@ -1,7 +1,7 @@
 [project]
-name = "cc-nim-proxy"
+name = "backdoor"
 version = "1.0.0"
-description = "Proxy that translates Claude Code CLI (Anthropic API) to NVIDIA NIM"
+description = "Run Claude Code against any AI provider. DeepSeek, Groq, Ollama, OpenRouter — your call."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi[standard]>=0.115",

@@ -27,7 +27,7 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     assert update.message
     await update.message.reply_text(
-        "cc-nim-proxy bot ready.\n\n"
+        "Backdoor bot ready.\n\n"
         "Send any message to run it as a Claude Code prompt.\n"
         "Commands: /stop — cancel running sessions."
     )

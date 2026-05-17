@@ -85,6 +85,10 @@ async def create_message(
     client = get_provider_client()
     payload = build_nim_payload(req, settings)
     msg_id = f"msg_{uuid.uuid4().hex}"
+    last_user = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
+    preview = (last_user if isinstance(last_user, str) else str(last_user))[:80]
+    mode = "stream" if req.stream else "complete"
+    logger.info("→ DeepSeek [%s] tools=%s | %r", mode, len(req.tools or []), preview)
 
     if req.stream:
         input_tokens = count_messages(req.messages, req.system, req.tools)
@@ -100,7 +104,9 @@ async def create_message(
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
-    return nim_response_to_anthropic(resp, req, msg_id)
+    result = nim_response_to_anthropic(resp, req, msg_id)
+    logger.info("← DeepSeek [%s] stop=%s out_tokens=%s", mode, result.get("stop_reason"), result.get("usage", {}).get("output_tokens"))
+    return result
 
 
 async def _stream(
@@ -115,6 +121,7 @@ async def _stream(
         async for chunk in client.stream(payload):
             for event in stream_openai_to_anthropic(chunk, state, msg_id, req, input_tokens):
                 yield event
+        logger.info("← DeepSeek [stream] done stop=%s", state.get("stop_reason", "end_turn"))
     except ProviderError as e:
         logger.error("Provider stream error %s: %s", e.status_code, e.message)
         import json

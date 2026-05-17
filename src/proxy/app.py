@@ -34,7 +34,7 @@ def _configure_logging(log_file: str):
 async def lifespan(app: FastAPI):
     settings = get_settings()
     _configure_logging(settings.log_file)
-    logger.info("Starting cc-nim-proxy → %s (%s)", settings.provider_base_url, settings.provider_model)
+    logger.info("Starting backdoor → %s (%s)", settings.provider_base_url, settings.provider_model)
 
     client = ProviderClient(settings)
     set_provider_client(client)
@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="cc-nim-proxy", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="backdoor", version="1.0.0", lifespan=lifespan)
     app.include_router(router)
     return app
 
