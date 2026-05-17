@@ -110,15 +110,17 @@ PROVIDER_MODEL=deepseek-chat
 
 ---
 
-## Why this matters
+## Why this exists
 
-The best coding agent shouldn't be a walled garden.
+I'm a huge fan of Anthropic. Genuinely. Their models are some of the most impressive technology I've ever used, and Claude Code is the best coding agent ever built — it's not close.
 
-Claude Code's real value is the **harness** — how it reasons about your codebase, how it chains tools together, how it recovers from errors and tries again. That's the hard part, and Anthropic nailed it.
+This project isn't a knock on them. It's a tribute to how good the harness is.
 
-The model underneath is just an API call. It should be yours to choose.
+What I believe is simple: the best tools should be accessible to everyone, not just the people who can afford the top-tier API. A student, a solo developer, a builder in a country where $9,000/month in API costs is unthinkable — they deserve to experience what Claude Code can do. Vendor lock-in shouldn't be the thing standing between a great developer and a great tool.
 
-Backdoor exists because developers deserve to use the best tools without being forced into a single vendor. Run the best agent. Pick the best model for your budget, your privacy requirements, your use case. Keep both.
+Anthropic built the magic. Backdoor makes sure everyone gets to use it.
+
+**Run Claude Code. Bring your own model. Keep building.**
 
 ---
 
