@@ -417,7 +417,7 @@ def _has(cmd):
 # ─── Toggle screen ────────────────────────────────────────────────────────────
 
 def ask_power_tools():
-    bun_ok = _has_bun()
+    bun_ok = _has("bun")
     enabled = [True] * len(POWER_TOOLS)
 
     while True:
