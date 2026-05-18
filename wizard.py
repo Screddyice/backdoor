@@ -395,7 +395,7 @@ PROVIDERS = [
 
 # ─── Genie wizard UI ──────────────────────────────────────────────────────────
 
-GENIE_PROMPT = f"""{G}
+_GENIE_ART = """\
                     ░░░   ░░░   ░░░
                   ░  ·  ░  ·  ░  ·  ░
                     ░░░░░░░░░░░░░░░
@@ -412,16 +412,25 @@ GENIE_PROMPT = f"""{G}
               ░░░░░░░░░░░░░░░░░░░░░░░
             ░░░░░░░░░░░░░░░░░░░░░░░░░░
           ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-        ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-{RST}"""
+        ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"""
+
+_GENIE_H = _GENIE_ART.count('\n') + 1  # ~18 lines
+
+def _genie_pad(extra_lines=3):
+    """Vertical padding so genie sits in upper-center of terminal."""
+    pad = max(0, (TH - _GENIE_H - extra_lines) // 3)
+    return '\n' * pad
 
 def cls():
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
 
+def _show_genie(extra_lines=3):
+    w(_genie_pad(extra_lines) + G + _GENIE_ART + RST + '\n')
+
 def genie_ask(question):
     cls()
-    w(GENIE_PROMPT)
+    _show_genie(extra_lines=4)
     w(f"  {G}{BLD}  {question}{RST}\n")
     w(f"  {G}❯ {RST}")
     return input().strip()
@@ -432,7 +441,7 @@ def genie_say(line):
 
 def pick_provider():
     cls()
-    w(GENIE_PROMPT)
+    _show_genie(extra_lines=12)
     w(f"\n  {G}{BLD}  Choose your provider:{RST}\n\n")
     for i, p in enumerate(PROVIDERS, 1):
         w(f"  {G}  {BLD}[{i}]{RST}  {W}{p['name']}{RST}  {DIM}{p['note']}{RST}\n")
@@ -464,7 +473,7 @@ def run_wizard():
 
     # Model
     cls()
-    w(GENIE_PROMPT)
+    _show_genie(extra_lines=5)
     w(f"\n  {G}{BLD}  Provider: {W}{provider['name']}{RST}\n")
 
     if provider["model"]:
@@ -480,7 +489,7 @@ def run_wizard():
     # API Key
     if provider["key_url"]:
         cls()
-        w(GENIE_PROMPT)
+        _show_genie(extra_lines=4)
         w(f"\n  {G}{BLD}  API Key  {DIM}(get one at {provider['key_url']}){RST}\n")
         w(f"  {G}❯ {RST}")
         api_key = input().strip()
@@ -494,14 +503,14 @@ def run_wizard():
     base_url = provider["url"]
     if provider["name"] == "Custom":
         cls()
-        w(GENIE_PROMPT)
+        _show_genie(extra_lines=4)
         w(f"\n  {G}{BLD}  Provider URL:{RST}\n")
         w(f"  {G}❯ {RST}")
         base_url = input().strip()
 
     # Confirm
     cls()
-    w(GENIE_PROMPT)
+    _show_genie(extra_lines=8)
     w(f"\n  {G}{BLD}  Ready to go, {name}.{RST}\n\n")
     w(f"  {DW}  Provider  {RST}{W}{provider['name']}{RST}\n")
     w(f"  {DW}  Model     {RST}{W}{model}{RST}\n")
@@ -537,7 +546,7 @@ MAX_CLI_SESSIONS=5
 
     # Launch
     cls()
-    w(GENIE_PROMPT)
+    _show_genie(extra_lines=3)
     w(f"\n  {G}{BLD}  .env written. Firing up Backdoor...{RST}\n\n")
     time.sleep(0.8)
 

@@ -51,7 +51,7 @@ PROVIDER_LABEL="${PROVIDER_MODEL:-unknown}"
 # ── Start proxy ───────────────────────────────────────────────────────────────
 
 echo "Starting Backdoor → $PROVIDER_LABEL"
-uv run uvicorn server:app --host 127.0.0.1 --port "$PORT" --log-level warning &
+uv run python -m uvicorn server:app --host 127.0.0.1 --port "$PORT" --log-level warning &
 PROXY_PID=$!
 
 # Wait for proxy to be ready
