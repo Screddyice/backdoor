@@ -39,7 +39,7 @@ wheels = [
 ]
 
 [[package]]
-name = "cc-nim-proxy"
+name = "backdoor"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
