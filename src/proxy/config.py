@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     provider_max_tokens: int = 32768
     provider_temperature: float = 1.0
     provider_top_p: float = 1.0
+    provider_reasoning_effort: str = ""
 
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True

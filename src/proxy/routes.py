@@ -89,10 +89,11 @@ async def create_message(
     preview = (last_user if isinstance(last_user, str) else str(last_user))[:80]
     mode = "stream" if req.stream else "complete"
     provider = settings.provider_model
-    logger.info("→ %s [%s] tools=%s | %r", provider, mode, len(req.tools or []), preview)
+    est_in = count_messages(req.messages, req.system, req.tools)
+    logger.info("→ %s [%s] tools=%s in≈%s | %r", provider, mode, len(req.tools or []), est_in, preview)
 
     if req.stream:
-        input_tokens = count_messages(req.messages, req.system, req.tools)
+        input_tokens = est_in
         return StreamingResponse(
             _stream(client, payload, msg_id, req, input_tokens, provider),
             media_type="text/event-stream",

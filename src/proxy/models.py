@@ -47,7 +47,11 @@ ContentBlock = TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock
 # ---------------------------------------------------------------------------
 
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
+    # Claude Code may send "system" (and occasionally "tool") roles inside the
+    # messages array, not just "user"/"assistant". Keep this permissive — the
+    # role is passed straight through to the OpenAI-compatible backend, which
+    # accepts system/tool messages. A strict Literal here 422s real requests.
+    role: str
     content: str | list[dict[str, Any]]
 
 
