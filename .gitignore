@@ -8,3 +8,14 @@ proxy.log
 workspace/
 .DS_Store
 .supercoder/
+profiles/
+.active
+.proxy.pid
+modal/__pycache__/
+# Claude Harness - Ephemeral/Per-Session State
+.claude-harness/sessions/
+.claude-harness/memory/compaction-backups/
+.claude-harness/memory/working/
+
+# Claude Code - Local settings
+.claude/settings.local.json
