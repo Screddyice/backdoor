@@ -35,6 +35,31 @@ prompt is now ~50K tokens, which doesn't even fit the 32B's 32K window.
 points backdoor at the offline profile, and launches Claude Code. Anything after
 the first word is passed straight to `claude` (e.g. `qwen fast --resume`).
 
+## `/model qwen` in any terminal Claude Code session (hybrid router)
+
+A second proxy instance runs permanently on **:8083** in `ROUTER_MODE=hybrid`
+(LaunchAgent `com.screddy.backdoor-router`, KeepAlive). It routes by requested
+model name: `qwen` / `qwen-coder` / `qwen-fast` → the matching local profile;
+**every other model and endpoint passes through byte-faithfully to
+api.anthropic.com** (auth headers, SSE, compression untouched).
+
+`~/.zshrc` exports `ANTHROPIC_BASE_URL=http://127.0.0.1:8083` for terminal
+shells (health-guarded: if the router is down, new shells fall back to direct
+Anthropic). So in any normal terminal Claude Code session:
+
+    /model qwen        # switch this session to the local Qwen3.5 9B
+    /model qwen-coder  # the 32B coder
+    claude --model qwen -p "..."   # one-shot
+
+Notes:
+- The offline `qwen` wrapper still pins :8082 explicitly — unaffected.
+- GUI/IDE/cron Claude Code sessions don't read .zshrc → they stay direct cloud
+  (no /model qwen there; launch from a terminal if you want it).
+- Do NOT put ANTHROPIC_BASE_URL in ~/.claude/settings.json env — settings env
+  OVERRIDES process env (verified), which would hijack the :8082 wrapper.
+- Restart: `launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router`;
+  log: `router.log` in the repo.
+
 ## Manual control (the underlying `bd` CLI)
 
 ```bash
