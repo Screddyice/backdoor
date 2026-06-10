@@ -10,7 +10,10 @@ from .config import Settings
 
 logger = logging.getLogger(__name__)
 
-TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+# read=600: a local model cold-prefilling a 50K-token harness prompt emits no
+# bytes for several minutes; 120s here silently killed those streams mid-prefill
+# (the client then retried, re-prefilling from scratch — doubling every turn).
+TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=5.0)
 
 
 class ProviderError(Exception):
