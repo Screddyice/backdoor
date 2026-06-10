@@ -1,5 +1,7 @@
 """FastAPI route handlers."""
 
+import asyncio
+import json
 import logging
 import uuid
 from typing import AsyncIterator
@@ -11,7 +13,7 @@ from .config import Settings, get_settings
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
-from .translate import build_nim_payload, nim_response_to_anthropic, stream_openai_to_anthropic
+from .translate import build_nim_payload, nim_response_to_anthropic, start_stream_events, stream_openai_to_anthropic
 from .optimizations import (
     is_quota_probe, is_title_generation, is_suggestion_mode,
     is_prefix_detection, extract_prefix,
@@ -127,15 +129,37 @@ async def _stream(
     provider: str,
 ) -> AsyncIterator[str]:
     state: dict = {}
+    pending: asyncio.Task | None = None
     try:
-        async for chunk in client.stream(payload):
+        # Open the SSE conversation immediately and heartbeat while waiting:
+        # a local model prefilling a big prompt (e.g. 50K-token full-harness
+        # session) emits NOTHING for minutes, and a byte-silent stream gets
+        # killed + retried by the client at ~120s, doubling every cold prefill.
+        for event in start_stream_events(state, msg_id, req, input_tokens):
+            yield event
+
+        aiter = client.stream(payload).__aiter__()
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(aiter.__anext__())
+            try:
+                chunk = await asyncio.wait_for(asyncio.shield(pending), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield 'event: ping\ndata: {"type": "ping"}\n\n'
+                continue
+            except StopAsyncIteration:
+                pending = None
+                break
+            pending = None
             for event in stream_openai_to_anthropic(chunk, state, msg_id, req, input_tokens):
                 yield event
         logger.info("← %s [stream] done in_tokens=%s", provider, input_tokens)
     except ProviderError as e:
         logger.error("Provider stream error %s: %s", e.status_code, e.message)
-        import json
         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':e.message}})}\n\n"
+    finally:
+        if pending is not None:
+            pending.cancel()
 
 
 @router.post("/v1/messages/count_tokens")

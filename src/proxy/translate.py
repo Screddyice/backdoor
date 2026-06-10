@@ -87,14 +87,21 @@ def extract_text_tool_calls(text: str, tool_names: set[str]) -> list[dict[str, A
 def _tool_names(req: MessagesRequest) -> set[str]:
     return {t.name for t in (req.tools or [])}
 
+# Claude Code prepends this line to the system prompt with a per-request hash
+# (`cch=...`). One changing token near position 0 invalidates the ENTIRE prompt
+# prefix in Ollama's KV cache, forcing a full re-prefill of a 50K-token harness
+# prompt on every turn (~2 min each). Useless for local backends — strip it.
+_BILLING_HEADER_RE = re.compile(r"^x-anthropic-billing-header:[^\n]*\n?")
+
+
 def _system_text(system: str | list[dict[str, Any]] | None) -> str | None:
     if system is None:
         return None
     if isinstance(system, str):
-        return system
+        return _BILLING_HEADER_RE.sub("", system)
     # Array of content blocks — concatenate text parts
     parts = [b["text"] for b in system if b.get("type") == "text" and b.get("text")]
-    return "\n".join(parts) or None
+    return _BILLING_HEADER_RE.sub("", "\n".join(parts)) or None
 
 
 def _content_to_openai(content: str | list[dict[str, Any]]) -> str | list[dict[str, Any]] | None:
@@ -130,6 +137,10 @@ def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
         if isinstance(content, str):
             result.append({"role": msg.role, "content": content})
             continue
+
+        # Drop thinking blocks on the way back — OpenAI-compat backends don't
+        # accept them, and the reasoning already shaped the turn it belongs to.
+        content = [b for b in content if b.get("type") not in ("thinking", "redacted_thinking")]
 
         # Detect tool_result blocks → must become role=tool messages
         has_tool_results = any(b.get("type") == "tool_result" for b in content)
@@ -252,6 +263,19 @@ def nim_response_to_anthropic(nim: dict[str, Any], req: MessagesRequest, msg_id:
     structured_tool_calls = message.get("tool_calls") or []
     text = message.get("content") or ""
 
+    # Surface reasoning (qwen3.x thinking models etc.) as an Anthropic thinking
+    # block instead of dropping it — a reasoning-only turn otherwise becomes an
+    # EMPTY assistant message and Claude Code shows/returns nothing.
+    reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+    if reasoning and not text and not structured_tool_calls:
+        # Reasoning-only turn (qwen3.5 does this intermittently): the model put
+        # its answer in reasoning and emitted no text. Promote it so the turn
+        # isn't an empty assistant message.
+        text = reasoning
+        reasoning = ""
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+
     # Fallback: some models (qwen2.5-coder) emit the tool call as plain JSON in
     # `content` instead of structured `tool_calls`. Detect and convert it so
     # Claude Code sees real tool_use blocks.
@@ -326,6 +350,47 @@ def _map_finish_reason(reason: str | None) -> str:
 # Streaming conversion — OpenAI SSE chunks → Anthropic SSE events
 # ---------------------------------------------------------------------------
 
+def start_stream_events(
+    state: dict,
+    msg_id: str,
+    req: MessagesRequest,
+    input_tokens: int,
+) -> list[str]:
+    """Initialize streaming state and return the opening SSE events.
+
+    Called lazily by stream_openai_to_anthropic on the first chunk, or eagerly
+    by the route handler so the client gets bytes immediately (a local model
+    prefilling a big prompt sends nothing for minutes otherwise)."""
+    state["started"] = True
+    state["block_index"] = 0
+    state["tool_calls"] = {}
+    state["output_tokens"] = 0
+    # Content-embedded tool-call fallback (qwen2.5-coder etc.).
+    # tool_mode: request offered tools, so model output *might* be a tool call.
+    # text_decision: None=undecided, "text"=streaming prose, "buffer"=holding
+    #   suspected tool-call JSON until finish.
+    state["tool_mode"] = bool(req.tools)
+    state["text_decision"] = None
+    state["buf"] = ""
+    state["thinking_open"] = False
+    return [
+        _sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": req.model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+        }),
+        _sse("ping", {"type": "ping"}),
+    ]
+
+
 def stream_openai_to_anthropic(
     chunk: dict[str, Any],
     state: dict,
@@ -341,31 +406,7 @@ def stream_openai_to_anthropic(
     events: list[str] = []
 
     if not state.get("started"):
-        state["started"] = True
-        state["block_index"] = 0
-        state["tool_calls"] = {}
-        state["output_tokens"] = 0
-        # Content-embedded tool-call fallback (qwen2.5-coder etc.).
-        # tool_mode: request offered tools, so model output *might* be a tool call.
-        # text_decision: None=undecided, "text"=streaming prose, "buffer"=holding
-        #   suspected tool-call JSON until finish.
-        state["tool_mode"] = bool(req.tools)
-        state["text_decision"] = None
-        state["buf"] = ""
-        events.append(_sse("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": req.model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-            },
-        }))
-        events.append(_sse("ping", {"type": "ping"}))
+        events.extend(start_stream_events(state, msg_id, req, input_tokens))
 
     choices = chunk.get("choices", [])
     if not choices:
@@ -375,9 +416,29 @@ def stream_openai_to_anthropic(
     delta = choice.get("delta", {})
     finish = choice.get("finish_reason")
 
+    # Reasoning delta (qwen3.x thinking models etc.) — stream as an Anthropic
+    # thinking block instead of dropping it; a reasoning-only turn otherwise
+    # becomes an EMPTY assistant message and Claude Code shows/returns nothing.
+    reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+    if reasoning:
+        state["reasoning_buf"] = state.get("reasoning_buf", "") + reasoning
+        if not state.get("thinking_open"):
+            state["thinking_open"] = True
+            events.append(_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": state["block_index"],
+                "content_block": {"type": "thinking", "thinking": ""},
+            }))
+        events.append(_sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": state["block_index"],
+            "delta": {"type": "thinking_delta", "thinking": reasoning},
+        }))
+
     # Text delta
     text = delta.get("content")
     if text:
+        _close_thinking_block(events, state)
         if not state["tool_mode"] or state["text_decision"] == "text":
             # Plain streaming: emit immediately.
             _emit_text_delta(events, state, text)
@@ -397,6 +458,7 @@ def stream_openai_to_anthropic(
 
     # Tool call deltas
     for tc_delta in delta.get("tool_calls") or []:
+        _close_thinking_block(events, state)
         tc_idx = tc_delta["index"]
         if tc_idx not in state["tool_calls"]:
             # Close any open text block first
@@ -436,6 +498,7 @@ def stream_openai_to_anthropic(
     # Finish
     if finish:
         converted_tool_use = False
+        _close_thinking_block(events, state)
 
         # Resolve any buffered content we were holding back.
         if state["buf"]:
@@ -471,6 +534,14 @@ def stream_openai_to_anthropic(
                 _emit_text_delta(events, state, state["buf"])
             state["buf"] = ""
 
+        # Reasoning-only safety net: the model finished without any visible
+        # text or tool call (qwen3.5 with thinking does this intermittently).
+        # Promote the accumulated reasoning to a text block so the assistant
+        # message isn't empty.
+        if (not state.get("text_emitted") and not state["tool_calls"]
+                and not converted_tool_use and state.get("reasoning_buf")):
+            _emit_text_delta(events, state, state["reasoning_buf"])
+
         if state.get("text_block_open"):
             events.append(_sse("content_block_stop", {
                 "type": "content_block_stop",
@@ -496,11 +567,28 @@ def stream_openai_to_anthropic(
     return events
 
 
+def _close_thinking_block(events: list[str], state: dict) -> None:
+    """Close an open thinking block (signature_delta keeps the Anthropic SSE
+    shape valid) and advance the block index so text/tool blocks don't collide."""
+    if not state.get("thinking_open"):
+        return
+    idx = state["block_index"]
+    events.append(_sse("content_block_delta", {
+        "type": "content_block_delta",
+        "index": idx,
+        "delta": {"type": "signature_delta", "signature": ""},
+    }))
+    events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
+    state["thinking_open"] = False
+    state["block_index"] += 1
+
+
 def _emit_text_delta(events: list[str], state: dict, text: str) -> None:
     """Open a text content block if needed and append a text delta."""
     if not text:
         return
     idx = state["block_index"]
+    state["text_emitted"] = True
     if not state.get("text_block_open"):
         state["text_block_open"] = True
         events.append(_sse("content_block_start", {
