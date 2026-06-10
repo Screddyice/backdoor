@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,6 +19,17 @@ class Settings(BaseSettings):
     provider_temperature: float = 1.0
     provider_top_p: float = 1.0
     provider_reasoning_effort: str = ""
+
+    # Router mode:
+    #   "profile" (default) — translate EVERY request to the active profile's
+    #     OpenAI-compatible backend (classic backdoor behaviour; what the
+    #     `qwen` wrapper instance on :8082 uses).
+    #   "hybrid" — route by requested model name: names in MODEL_ROUTES go to
+    #     their local profile; everything else passes through byte-faithful to
+    #     the real Anthropic API. Lets a normal cloud Claude Code session
+    #     switch to the local model with `/model qwen`.
+    router_mode: str = "profile"
+    anthropic_upstream: str = "https://api.anthropic.com"
 
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True
@@ -42,3 +54,24 @@ def get_settings() -> Settings:
 
 def clear_settings_cache():
     get_settings.cache_clear()
+
+
+# Model names a Claude Code session can request (via `/model <name>` or
+# `--model <name>`) that route to a LOCAL profile in hybrid mode.
+MODEL_ROUTES: dict[str, str] = {
+    "qwen": "local-qwen35",
+    "qwen-coder": "local-coder",
+    "qwen-fast": "local-fast",
+}
+
+
+@lru_cache(maxsize=8)
+def load_profile_settings(profile: str) -> Settings:
+    """Settings built from profiles/<profile>.env (relative to the repo cwd).
+
+    Process env still takes precedence in pydantic-settings, so the router
+    instance must not export PROVIDER_* vars (the LaunchAgent doesn't)."""
+    path = f"profiles/{profile}.env"
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"profile env not found: {path}")
+    return Settings(_env_file=path)
