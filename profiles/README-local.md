@@ -5,7 +5,7 @@ model**, completely offline. No internet needed once the models are downloaded.
 
 ```
 Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
-   (UI +              (translates              (serves the         (Qwen2.5-Coder,
+   (UI +              (translates              (serves the         (Qwen3.5 9B,
     harness)           Anthropic<->OpenAI)      open weights)        on-device)
 ```
 
@@ -15,22 +15,21 @@ Claude Code plugin — the only thing that changes is the model underneath.
 ## One command
 
 ```bash
-qwen            # Lean (default). 32B, ~945-tok prompt, ~6s/turn. Harness
-                # slash-commands available on demand. FAST — daily driver.
-qwen fast       # Lean on the 14B (snappier). OPTIONAL: needs `ollama pull qwen2.5-coder:14b`.
-qwen full       # AUTO-HOOK mode: harness + claude-mem (memory) + ralph-loop,
-                # hooks ACTIVE. ~29K-tok prompt => ~5 min cold first turn. Heavy.
+qwen            # FULL harness (default). Qwen3.5 9B @ 128K ctx, with
+                # claude-harness + claude-mem + ralph-loop hooks ACTIVE.
+                # ~50K-tok prompt; ~40s first turn of a session, ~8s after.
+qwen lean       # Minimal (~945-tok) prompt on the 9B. Fastest; harness
+                # slash-commands on demand, no auto hooks.
+qwen coder      # Qwen2.5-Coder 32B (best raw code quality; 32K ctx; lean).
+qwen fast       # Lean on the 14B coder. OPTIONAL: needs `ollama pull qwen2.5-coder:14b`.
 ```
 
 (`claude-local` is a symlink alias for `qwen` if you prefer the longer name.)
 
-**14B is optional.** Only the 32B is installed — it runs fine on this Mac even on
-battery. If you ever want a lighter/faster model for unplugged use, install it once
-while online and `qwen fast` will start working:
-
-```bash
-ollama pull qwen2.5-coder:14b
-```
+**Why 9B beats 32B as the default:** Qwen3.5 9B is 256K-native (no rope
+penalty), has native tool-calling (no content-JSON fallback needed), and is
+~4× faster — which is what makes the FULL harness viable. The full-harness
+prompt is now ~50K tokens, which doesn't even fit the 32B's 32K window.
 
 `qwen` makes sure the Ollama daemon is up, confirms the model is pulled,
 points backdoor at the offline profile, and launches Claude Code. Anything after
@@ -40,8 +39,9 @@ the first word is passed straight to `claude` (e.g. `qwen fast --resume`).
 
 ```bash
 bd list                 # show backends (* = active)
-bd switch local-coder   # 32B offline
-bd switch local-fast    # 14B offline
+bd switch local-qwen35  # Qwen3.5 9B @ 128K (default)
+bd switch local-coder   # 32B coder offline
+bd switch local-fast    # 14B coder offline
 bd switch modal-qwen    # back to the Modal cloud backend (needs internet)
 bd claude               # launch Claude Code through the active backend
 bd status               # what's active + proxy health
@@ -50,11 +50,28 @@ bd stop                 # stop the proxy
 
 ## Profiles
 
-| Profile        | Model               | Notes                                   |
-|----------------|---------------------|-----------------------------------------|
-| `local-coder`  | qwen2.5-coder:32b   | ~20GB. Best local coding. Default.      |
-| `local-fast`   | qwen2.5-coder:14b   | ~9GB. Faster, lighter — good on battery.|
-| `modal-qwen`   | (Modal cloud)       | Pre-existing cloud backend. Online only.|
+| Profile         | Model               | Notes                                    |
+|-----------------|---------------------|------------------------------------------|
+| `local-qwen35`  | qwen3.5:9b-128k     | ~6.6GB. 256K-native, tools+thinking. **Default.** |
+| `local-coder`   | qwen2.5-coder:32b   | ~20GB. Best raw code quality. 32K ctx.   |
+| `local-fast`    | qwen2.5-coder:14b   | ~9GB. Faster, lighter — good on battery. |
+| `modal-qwen`    | (Modal cloud)       | Pre-existing cloud backend. Online only. |
+
+`qwen3.5:9b-128k` is a local tag built from `modelfiles/qwen3.5-9b-128k.Modelfile`
+(`FROM qwen3.5:9b` + `PARAMETER num_ctx 131072`). Rebuild after re-pulling:
+
+```bash
+ollama pull qwen3.5:9b
+ollama create qwen3.5:9b-128k -f ~/backdoor/modelfiles/qwen3.5-9b-128k.Modelfile
+```
+
+The num_ctx is baked into the model (not `OLLAMA_CONTEXT_LENGTH`) so the global
+32768 default stays right for the 32B, whose KV cache would blow 36GB at 128K.
+Thinking is disabled in the profile (`PROVIDER_REASONING_EFFORT=none`): with it
+on, qwen3.5 intermittently ends a turn with reasoning ONLY (empty visible
+message) and every turn pays reasoning latency. Blank the var to re-enable —
+the proxy will surface reasoning as Anthropic thinking blocks, and promotes a
+reasoning-only finish to text so turns are never empty.
 
 ## The pieces (so future-you can fix it)
 
@@ -68,35 +85,47 @@ bd stop                 # stop the proxy
   - `OLLAMA_KEEP_ALIVE=5m` — unload the model 5 min after last use to free RAM/battery.
   - Restart it after edits: `launchctl kickstart -k gui/$(id -u)/com.screddy.ollama`
 - **backdoor proxy** lives at `~/backdoor` (symlink to
-  `~/projects/third-party/ajsai47/backdoor`). The `bd` CLI and `claude-local` wrapper
+  `~/projects/Screddyice/backdoor`). The `bd` CLI and `claude-local` wrapper
   are in `~/.local/bin`.
-- **Profiles** are `profiles/local-coder.env` and `profiles/local-fast.env` here.
+- **Profiles** are `profiles/local-qwen35.env`, `local-coder.env`, `local-fast.env`.
   `PROVIDER_API_KEY=ollama` is a dummy (Ollama ignores it; bd just refuses an empty key).
 
 ## Updating / adding models (needs internet)
 
 ```bash
-ollama pull qwen2.5-coder:32b      # re-pull / update
+ollama pull qwen3.5:9b             # re-pull / update the default (then re-create the -128k tag)
+ollama pull qwen2.5-coder:32b      # re-pull the coder
 ollama pull <some-other-model>     # then add a profile pointing PROVIDER_MODEL at it
 ollama list                        # see what's available offline
 ```
 
-## Making qwen2.5-coder work inside Claude Code (proxy patches)
+## Proxy patches that make local models drive Claude Code
 
-Two proxy changes were required so qwen2.5-coder actually drives Claude Code's
-agentic loop (both in `src/proxy/`). These are local edits — re-apply if you ever
-`git pull` the backdoor repo and they're lost:
+All in `src/proxy/`, committed to the Screddyice/backdoor repo:
 
-1. **`translate.py` — content-embedded tool-call fallback.** qwen2.5-coder ignores
-   the `<tool_call>` wrapper and emits the tool call as bare JSON in the message
-   content, so Ollama never fills `tool_calls` and Claude Code sees plain text
-   instead of a tool call. The proxy now detects that JSON (validated against the
-   request's tool names) and converts it to a real `tool_use` block — in both the
-   non-streaming and streaming paths. Streaming only buffers output that *looks
-   like* a tool call (starts with `{`), so normal prose/code still streams live.
-2. **`models.py` — accept non-user/assistant roles.** Claude Code sends `system`
-   (and sometimes `tool`) roles inside the messages array; the proxy's strict
-   `Literal["user","assistant"]` 422'd every request. `Message.role` is now `str`.
+1. **`translate.py` — content-embedded tool-call fallback** (qwen2.5-coder).
+   Detects bare-JSON tool calls in message content (validated against the
+   request's tool names) and converts them to real `tool_use` blocks, in both
+   non-streaming and streaming paths. Qwen3.5 doesn't need this (native
+   tool_calls), but the 32B coder profile still does.
+2. **`models.py` — accept non-user/assistant roles.** `Message.role` is `str`,
+   not `Literal["user","assistant"]` — Claude Code sends other roles.
+3. **`translate.py` — billing-header strip (THE cache fix).** Claude Code
+   prepends `x-anthropic-billing-header: ... cch=<hash>;` to the system prompt
+   with a hash that CHANGES EVERY REQUEST. One changing token at position ~30
+   invalidates Ollama's entire KV prefix cache → full ~50K re-prefill (~2 min)
+   on EVERY turn. The proxy strips that line; with it gone, turn 2+ of a
+   session reuses the prefix and takes ~8s.
+4. **`translate.py` — reasoning → thinking blocks.** Ollama's `reasoning`
+   field (qwen3.x thinking) is converted to Anthropic thinking blocks instead
+   of dropped, and a reasoning-only finish is promoted to text so the
+   assistant message is never empty. Thinking blocks are stripped from history
+   on the way back to OpenAI format.
+5. **`routes.py` — eager message_start + 15s heartbeat pings.** During a long
+   prefill Ollama emits zero bytes; without the heartbeat the byte-silent
+   stream gets killed and retried, doubling every cold prefill.
+6. **`client.py` — upstream read timeout 120s → 600s.** 120s killed any
+   prefill over 2 minutes (this was the actual source of the kill/retry loop).
 
 ## MCP servers are OFF by default for local runs
 
@@ -107,11 +136,14 @@ also need internet, so they're useless offline. Disabling them leaves Claude
 Code's built-in tools (Read/Write/Edit/Bash/Grep/Glob/…), which is what local
 coding needs. Override with `QWEN_MCP=1 qwen` if you ever want them back.
 
-## Lean mode is the default (this is what makes it usable)
+## Full harness is the default (lean is the speed escape hatch)
 
-The real bottleneck on a local model was **prompt size**, not the model. With all
-plugins + hooks loaded, Claude Code's prompt is 30K+ tokens (skills lists, the
-SessionStart briefing, etc.) → minutes/turn on a 32B. So `qwen` launches with:
+On the 32B, prompt size made full mode unusable (minutes/turn), so lean was the
+default. On the 9B with the billing-header cache fix, full mode is ~40s for the
+first turn of a session and ~8s per turn after — so the full harness (hooks,
+auto-memory, briefing, loop) is now the default.
+
+`qwen lean` still launches with:
 
     claude --bare --plugin-dir <claude-harness>  --strict-mcp-config ...
 
@@ -120,8 +152,8 @@ SessionStart briefing, etc.) → minutes/turn on a 32B. So `qwen` launches with:
   (`/claude-harness:flow`, …) are available on demand — you just don't get the
   automatic hook behaviours (auto-memory, briefing injection).
 
-Measured: **lean ≈ 945 tokens / ~6s per turn**; a full Read-tool agentic loop
-completes in ~16s. Full mode ≈ 30K+ tokens / minutes per turn.
+Measured: **lean ≈ 945 tokens / ~6s per turn**; full ≈ 50K tokens, ~40s first
+turn / ~8s warm turns (KV prefix cache).
 
 `qwen` execs `claude` directly (not `bd claude`) so it runs in **your current
 directory** — `bd claude` would `cd` into the backdoor repo and break file paths.
@@ -140,30 +172,29 @@ directory** — `bd claude` would `cd` into the backdoor repo and break file pat
   To enable search later, point full mode's `--mcp-config` at `~/backdoor/claude-mem-mcp.json`
   and trim the corpus inject for room.
 
-### Auto-hook mode (`qwen full`)
+### Auto-hook mode (the default)
 Enables **claude-harness + claude-mem (memory) + ralph-loop (loop)** with their
 hooks active — the real harness experience (auto-memory, session briefing,
-checkpoints, loop). The other heavy plugins (superpowers/gstack/etc.) stay off so
-the prompt (~29K tokens) fits the native 32K window. Config: `hook-mode.settings.json`.
+checkpoints, loop). The other heavy plugins (superpowers/gstack/etc.) stay off
+to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
 
-Trade-off: the cold first turn prefills ~29K tokens (~5 min on the 32B); only ~3K
-headroom remains, so it's best for shorter memory-aware sessions, not long
-file-heavy ones. **`qwen` (lean) is the daily driver; `qwen full` is opt-in.**
-
-> Note: do NOT try an extended-context model variant. Qwen2.5-Coder above its
-> native 32K (via Ollama rope-scaling) is catastrophically slow — measured 260s
-> vs 3.4s for the same tiny prompt at 64K vs 32K. Stay at native 32K.
+> Note: do NOT rope-scale qwen2.5-coder above its native 32K — measured 260s vs
+> 3.4s for the same tiny prompt at 64K vs 32K. Qwen3.5 is 256K-native, so the
+> 128K tag has no such penalty.
 
 ### Overrides
-- `QWEN_FULL=1 qwen` — same as `qwen full`.
+- `QWEN_LEAN=1 qwen` / `qwen lean` — minimal prompt, no auto hooks.
+- `QWEN_FULL=1 qwen` — force full mode (e.g. `QWEN_FULL=1 qwen coder`).
 - `QWEN_MCP=1 qwen`  — keep your global MCP servers (adds ~420 tools; needs internet).
 
-## Performance reality (local 32B)
+## Performance reality (local 9B, full harness)
 
-- Generation is ~20 tok/s; lean mode keeps prefill tiny, so turns are ~6-16s.
-- Ollama reuses the KV cache for a stable prompt prefix (verified: 39s cold → 0.3s
-  warm), so repeated context within a session is cheap.
-- For even snappier work, `ollama pull qwen2.5-coder:14b` and use `qwen fast`.
+- First turn of a session: ~40s (prefills the session-specific parts of the 50K
+  prompt; the shared bulk is usually already in Ollama's KV cache).
+- Subsequent turns: ~8s. Tool round-trips add ~2-5s each.
+- `qwen lean`: ~6s/turn, full agentic Read loop ~16s.
+- If turns suddenly take minutes again, suspect a new cache-busting prompt
+  prefix (see proxy patch #3) — diff two consecutive payloads.
 
 ## Reliability notes
 
@@ -172,5 +203,7 @@ file-heavy ones. **`qwen` (lean) is the daily driver; `qwen full` is opt-in.**
 - If a download dies and `ollama pull` later fails with `Error: EOF`, the multipart
   resume state is corrupt. Fix:
   `find ~/.ollama/models/blobs/ -name '*-partial-*' -size -1000k -delete` then re-pull.
-- If responses look truncated or tool calls misbehave, check the context length is
-  still 32k: `grep CONTEXT /tmp/ollama-launchd.log` (look for `default_num_ctx=32768`).
+- If responses look truncated or tool calls misbehave, check the loaded context:
+  `ollama ps` should show CONTEXT 131072 for qwen3.5:9b-128k (the Modelfile
+  num_ctx). The LaunchAgent's `OLLAMA_CONTEXT_LENGTH=32768` only applies to
+  models without a baked num_ctx (i.e. the 32B/14B coders).
