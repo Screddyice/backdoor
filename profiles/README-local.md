@@ -77,16 +77,19 @@ bd stop                 # stop the proxy
 
 | Profile         | Model               | Notes                                    |
 |-----------------|---------------------|------------------------------------------|
-| `local-qwen35`  | qwen3.5:9b-128k     | ~6.6GB. 256K-native, tools+thinking. **Default.** |
+| `local-qwen35`  | qwen3.5:9b-256k     | ~6.6GB (16GB loaded @256K). Tools+thinking. **Default.** |
 | `local-coder`   | qwen2.5-coder:32b   | ~20GB. Best raw code quality. 32K ctx.   |
 | `local-fast`    | qwen2.5-coder:14b   | ~9GB. Faster, lighter — good on battery. |
 | `modal-qwen`    | (Modal cloud)       | Pre-existing cloud backend. Online only. |
 
-`qwen3.5:9b-128k` is a local tag built from `modelfiles/qwen3.5-9b-128k.Modelfile`
-(`FROM qwen3.5:9b` + `PARAMETER num_ctx 131072`). Rebuild after re-pulling:
+`qwen3.5:9b-256k` is a local tag built from `modelfiles/qwen3.5-9b-256k.Modelfile`
+(`FROM qwen3.5:9b` + `PARAMETER num_ctx 262144` — the full native context, needed
+for full-MCP sessions: ~50K harness + ~148K MCP schemas + headroom). A 128K
+variant (`qwen3.5:9b-128k`) also exists for MCP-off use. Rebuild after re-pulling:
 
 ```bash
 ollama pull qwen3.5:9b
+ollama create qwen3.5:9b-256k -f ~/backdoor/modelfiles/qwen3.5-9b-256k.Modelfile
 ollama create qwen3.5:9b-128k -f ~/backdoor/modelfiles/qwen3.5-9b-128k.Modelfile
 ```
 
@@ -152,14 +155,18 @@ All in `src/proxy/`, committed to the Screddyice/backdoor repo:
 6. **`client.py` — upstream read timeout 120s → 600s.** 120s killed any
    prefill over 2 minutes (this was the actual source of the kill/retry loop).
 
-## MCP servers are OFF by default for local runs
+## MCP defaults: ON in full mode, OFF in lean/coder/fast
 
-`qwen` launches Claude Code with `--strict-mcp-config --mcp-config ~/backdoor/empty-mcp.json`.
-Without this, this machine's global MCP servers load **~420 tools / ~148K tokens** —
-4.5× a 32K-context local model, causing truncation and ~2 min/turn. MCP servers
-also need internet, so they're useless offline. Disabling them leaves Claude
-Code's built-in tools (Read/Write/Edit/Bash/Grep/Glob/…), which is what local
-coding needs. Override with `QWEN_MCP=1 qwen` if you ever want them back.
+Full mode (`qwen`) now keeps this machine's global MCP servers — **~420 tools /
+~148K tokens** of schemas — enabled by default. This is why the default profile
+runs the 256K-ctx model tag; expect a long first-turn prefill when the schemas
+aren't in Ollama's KV cache yet. MCP servers need internet, so full mode is no
+longer true-offline; `QWEN_MCP=0 qwen` restores the offline behavior
+(`--strict-mcp-config --mcp-config ~/backdoor/empty-mcp.json`).
+
+Lean/coder/fast modes stay MCP-OFF (minimal prompt is the point, and the
+qwen2.5 coders only have 32K ctx — 4.5× too small for the schemas). Override
+with `QWEN_MCP=1`.
 
 ## Full harness is the default (lean is the speed escape hatch)
 
@@ -210,7 +217,8 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
 ### Overrides
 - `QWEN_LEAN=1 qwen` / `qwen lean` — minimal prompt, no auto hooks.
 - `QWEN_FULL=1 qwen` — force full mode (e.g. `QWEN_FULL=1 qwen coder`).
-- `QWEN_MCP=1 qwen`  — keep your global MCP servers (adds ~420 tools; needs internet).
+- `QWEN_MCP=0 qwen`  — drop global MCP servers (true-offline full mode).
+- `QWEN_MCP=1 qwen lean` — force MCP on in lean/coder/fast modes.
 
 ## Performance reality (local 9B, full harness)
 
@@ -229,6 +237,7 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
   resume state is corrupt. Fix:
   `find ~/.ollama/models/blobs/ -name '*-partial-*' -size -1000k -delete` then re-pull.
 - If responses look truncated or tool calls misbehave, check the loaded context:
-  `ollama ps` should show CONTEXT 131072 for qwen3.5:9b-128k (the Modelfile
-  num_ctx). The LaunchAgent's `OLLAMA_CONTEXT_LENGTH=32768` only applies to
-  models without a baked num_ctx (i.e. the 32B/14B coders).
+  `ollama ps` should show CONTEXT 262144 for qwen3.5:9b-256k (the Modelfile
+  num_ctx; 131072 for the -128k variant). The LaunchAgent's
+  `OLLAMA_CONTEXT_LENGTH=32768` only applies to models without a baked num_ctx
+  (i.e. the 32B/14B coders).
