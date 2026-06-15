@@ -5,7 +5,7 @@ model**, completely offline. No internet needed once the models are downloaded.
 
 ```
 Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
-   (UI +              (translates              (serves the         (Qwen3.5 4B,
+   (UI +              (translates              (serves the         (Qwen3.5 9B,
     harness)           Anthropic<->OpenAI)      open weights)        on-device)
 ```
 
@@ -15,11 +15,11 @@ Claude Code plugin — the only thing that changes is the model underneath.
 ## One command
 
 ```bash
-qwen            # FULL harness (default). Qwen3.5 4B @ 256K ctx, with
+qwen            # FULL harness (default). Qwen3.5 9B @ 64K ctx, MCP OFF, with
                 # claude-harness + claude-mem + ralph-loop hooks ACTIVE.
-                # ~50K-tok prompt. (Swapped down from 9B 2026-06-14 — the 9B
-                # left no headroom for the full harness on the 36GB M5 Max.)
-qwen lean       # Minimal (~945-tok) prompt on the 4B. Fastest; harness
+                # (Fixed 2026-06-15: was 9b-256k, which loaded ~22GB and pinned
+                # the Mac. 64K + MCP-off loads ~12GB and stays responsive.)
+qwen lean       # Minimal (~945-tok) prompt on the 9B. Fastest; harness
                 # slash-commands on demand, no auto hooks.
 qwen coder      # Qwen2.5-Coder 32B (best raw code quality; 32K ctx; lean).
 qwen fast       # Lean on the 14B coder. OPTIONAL: needs `ollama pull qwen2.5-coder:14b`.
@@ -27,14 +27,14 @@ qwen fast       # Lean on the 14B coder. OPTIONAL: needs `ollama pull qwen2.5-co
 
 (`claude-local` is a symlink alias for `qwen` if you prefer the longer name.)
 
-**Why a small Qwen3.5 beats the 32B as the default:** Qwen3.5 is 256K-native
-(no rope penalty) and has native tool-calling (no content-JSON fallback needed)
-— which is what makes the FULL harness viable. The full-harness prompt is ~50K
-tokens, which doesn't even fit the 32B's 32K window. The 4B (default since
-2026-06-14) adds the decisive win: ~2.5GB weights leave plenty of headroom to
-run the full harness + MCP alongside it, where the 9B at 256K loaded ~16GB and
-left almost none on the 36GB M5 Max. Tradeoff: a 4B is weaker than the 9B —
-scope agentic tasks tighter (see Reliability notes).
+**Why Qwen3.5 9B @ 64K (MCP off):** Qwen3.5 is 256K-native (no rope penalty)
+with native tool-calling (no content-JSON fallback) — which makes the FULL
+harness viable. The full-harness prompt is ~30-50K tokens, so it needs real
+context but NOT the 256K we ran before: at 256K the 9B's KV cache was ~16GB, the
+model loaded ~22GB on the 36GB M5 Max, and it thrashed — every request crawled.
+The fix (2026-06-15) is the same 9B at **64K** (~12GB loaded, comfortable) with
+**MCP off** so the prompt stays inside the window. The 9B is the sweet spot on
+36GB: Qwen3.5 jumps 9b → 27b, and a dense 27b is too heavy here.
 
 `qwen` makes sure the Ollama daemon is up, confirms the model is pulled,
 points backdoor at the offline profile, and launches Claude Code. Anything after
@@ -52,7 +52,7 @@ api.anthropic.com** (auth headers, SSE, compression untouched).
 shells (health-guarded: if the router is down, new shells fall back to direct
 Anthropic). So in any normal terminal Claude Code session:
 
-    /model qwen        # switch this session to the local Qwen3.5 4B
+    /model qwen        # switch this session to the local Qwen3.5 9B
     /model qwen-coder  # the 32B coder
     claude --model qwen -p "..."   # one-shot
 
@@ -69,7 +69,7 @@ Notes:
 
 ```bash
 bd list                 # show backends (* = active)
-bd switch local-qwen35  # Qwen3.5 4B @ 256K (default)
+bd switch local-qwen35  # Qwen3.5 9B @ 64K (default)
 bd switch local-coder   # 32B coder offline
 bd switch local-fast    # 14B coder offline
 bd switch modal-qwen    # back to the Modal cloud backend (needs internet)
@@ -82,26 +82,25 @@ bd stop                 # stop the proxy
 
 | Profile         | Model               | Notes                                    |
 |-----------------|---------------------|------------------------------------------|
-| `local-qwen35`  | qwen3.5:4b-256k     | ~2.5GB weights. Tools+thinking. Light enough to run alongside the full harness. **Default.** |
+| `local-qwen35`  | qwen3.5:9b-64k      | 6.6GB weights, ~12GB loaded @64K. Tools+thinking. **Default.** |
 | `local-coder`   | qwen2.5-coder:32b   | ~20GB. Best raw code quality. 32K ctx.   |
 | `local-fast`    | qwen2.5-coder:14b   | ~9GB. Faster, lighter — good on battery. |
 | `modal-qwen`    | (Modal cloud)       | Pre-existing cloud backend. Online only. |
 
-`qwen3.5:4b-256k` is a local tag built from `modelfiles/qwen3.5-4b-256k.Modelfile`
-(`FROM qwen3.5:4b` + `PARAMETER num_ctx 262144` — the full native context, kept
-for full-MCP sessions: ~50K harness + curated MCP schemas + headroom; cheap on
-the 4B). A 128K variant (`qwen3.5:4b-128k`) also exists for MCP-off use. Rebuild
+`qwen3.5:9b-64k` is a local tag built from `modelfiles/qwen3.5-9b-64k.Modelfile`
+(`FROM qwen3.5:9b` + `PARAMETER num_ctx 65536` — enough for the ~30-50K harness
+prompt + conversation, while KV stays ~5GB so the model loads ~12GB). Rebuild
 after re-pulling:
 
 ```bash
-ollama pull qwen3.5:4b
-ollama create qwen3.5:4b-256k -f ~/backdoor/modelfiles/qwen3.5-4b-256k.Modelfile
-ollama create qwen3.5:4b-128k -f ~/backdoor/modelfiles/qwen3.5-4b-128k.Modelfile
+ollama pull qwen3.5:9b
+ollama create qwen3.5:9b-64k -f ~/backdoor/modelfiles/qwen3.5-9b-64k.Modelfile
 ```
 
-The 9B variants (`qwen3.5:9b-256k` / `-128k`, built from the matching 9B
-Modelfiles) are still available if you want to switch back: re-pull `qwen3.5:9b`,
-rebuild those tags, and set `PROVIDER_MODEL=qwen3.5:9b-256k` in the profile.
+Bigger-context variants (`qwen3.5:9b-128k` / `-256k`) also exist for when you
+want MCP on (the schemas don't fit 64K) — point `PROVIDER_MODEL` at one and
+expect a heavier load. **Do not** make `-256k` the default again: at 256K the KV
+cache is ~16GB and the model pinned the 36GB Mac (this was the slowness bug).
 
 The num_ctx is baked into the model (not `OLLAMA_CONTEXT_LENGTH`) so the global
 32768 default stays right for the 32B, whose KV cache would blow 36GB at 128K.
@@ -131,7 +130,7 @@ reasoning-only finish to text so turns are never empty.
 ## Updating / adding models (needs internet)
 
 ```bash
-ollama pull qwen3.5:4b             # re-pull / update the default (then re-create the -256k/-128k tags)
+ollama pull qwen3.5:9b             # re-pull / update the default (then re-create the -64k tag)
 ollama pull qwen2.5-coder:32b      # re-pull the coder
 ollama pull <some-other-model>     # then add a profile pointing PROVIDER_MODEL at it
 ollama list                        # see what's available offline
@@ -165,26 +164,25 @@ All in `src/proxy/`, committed to the Screddyice/backdoor repo:
 6. **`client.py` — upstream read timeout 120s → 600s.** 120s killed any
    prefill over 2 minutes (this was the actual source of the kill/retry loop).
 
-## MCP defaults: ON in full mode, OFF in lean/coder/fast
+## MCP defaults: OFF in every mode
 
-Full mode (`qwen`) now keeps this machine's global MCP servers — **~420 tools /
-~148K tokens** of schemas — enabled by default. This is why the default profile
-runs the 256K-ctx model tag; expect a long first-turn prefill when the schemas
-aren't in Ollama's KV cache yet. MCP servers need internet, so full mode is no
-longer true-offline; `QWEN_MCP=0 qwen` restores the offline behavior
-(`--strict-mcp-config --mcp-config ~/backdoor/empty-mcp.json`).
+MCP tool schemas are huge — **~142K tokens** for this machine's global
+`~/.claude.json` set, and even the curated stack overflows the 64K window. That
+giant schema prefill was half of why full mode crawled, so **MCP is OFF by
+default in all modes** (`--strict-mcp-config --mcp-config ~/backdoor/empty-mcp.json`),
+which also keeps full mode truly offline.
 
-Lean/coder/fast modes stay MCP-OFF (minimal prompt is the point, and the
-qwen2.5 coders only have 32K ctx — 4.5× too small for the schemas). Override
-with `QWEN_MCP=1`.
+Opt in with `QWEN_MCP=1` — but switch `PROVIDER_MODEL` to a bigger-context tag
+first (`qwen3.5:9b-256k`), since the schemas don't fit 64K. `QWEN_MCP_SERVERS=a,b,c`
+picks which servers (default: the curated stack — Composio TMN/Cliqk/TRC + NEBOS
++ HyperCrawl).
 
 ## Full harness is the default (lean is the speed escape hatch)
 
 On the 32B, prompt size made full mode unusable (minutes/turn), so lean was the
-default. With the billing-header cache fix, full mode is fast enough on the
-small Qwen3.5 models (the 9B measured ~40s first turn / ~8s warm turns; the 4B
-default is lighter and at least as fast) — so the full harness (hooks,
-auto-memory, briefing, loop) is the default.
+default. With the billing-header cache fix and MCP off, full mode on the 9B @ 64K
+is ~40s first turn / ~8s warm turns — so the full harness (hooks, auto-memory,
+briefing, loop) is the default.
 
 `qwen lean` still launches with:
 
@@ -233,10 +231,9 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
 
 ## Performance reality (local Qwen3.5, full harness)
 
-- First turn of a session: ~40s on the 9B (prefills the session-specific parts
-  of the 50K prompt; the shared bulk is usually already in Ollama's KV cache).
-  The 4B default has fewer layers/smaller KV, so prefill is lighter.
-- Subsequent turns: ~8s on the 9B. Tool round-trips add ~2-5s each.
+- First turn of a session: ~40s (prefills the session-specific parts of the
+  prompt; the shared bulk is usually already in Ollama's KV cache).
+- Subsequent turns: ~8s. Tool round-trips add ~2-5s each.
 - `qwen lean`: ~6s/turn, full agentic Read loop ~16s.
 - If turns suddenly take minutes again, suspect a new cache-busting prompt
   prefix (see proxy patch #3) — diff two consecutive payloads.
@@ -249,7 +246,6 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
   resume state is corrupt. Fix:
   `find ~/.ollama/models/blobs/ -name '*-partial-*' -size -1000k -delete` then re-pull.
 - If responses look truncated or tool calls misbehave, check the loaded context:
-  `ollama ps` should show CONTEXT 262144 for qwen3.5:4b-256k (the Modelfile
-  num_ctx; 131072 for the -128k variant). The LaunchAgent's
-  `OLLAMA_CONTEXT_LENGTH=32768` only applies to models without a baked num_ctx
-  (i.e. the 32B/14B coders).
+  `ollama ps` should show CONTEXT 65536 for qwen3.5:9b-64k (the Modelfile
+  num_ctx). The LaunchAgent's `OLLAMA_CONTEXT_LENGTH=32768` only applies to
+  models without a baked num_ctx (i.e. the 32B/14B coders).

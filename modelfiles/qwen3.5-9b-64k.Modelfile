@@ -1,0 +1,12 @@
+# qwen3.5:9b-64k — Qwen3.5 9B with a 64K context window baked in.
+# This is the DEFAULT offline brain (2026-06-15). Qwen3.5 9B was never the
+# problem — the 256K variant was: at 256K the q8_0 KV cache is ~16GB, so the
+# model loaded ~22GB on the 36GB M5 Max, pinned GPU/RAM, thrashed, and every
+# request crawled. 64K holds the full-harness prompt (~30-50K) with headroom
+# while keeping KV ~5GB → ~12GB loaded total → comfortable and responsive.
+# Native context is 256K, so 64K incurs NO rope-scaling penalty.
+# Baked here (not via OLLAMA_CONTEXT_LENGTH) so the global 32768 default stays
+# correct for the qwen2.5 coders.
+# Build: ollama create qwen3.5:9b-64k -f modelfiles/qwen3.5-9b-64k.Modelfile
+FROM qwen3.5:9b
+PARAMETER num_ctx 65536

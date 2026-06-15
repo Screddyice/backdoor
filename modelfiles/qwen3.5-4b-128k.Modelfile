@@ -1,8 +1,0 @@
-# qwen3.5:4b-128k — Qwen3.5 4B with a 128K context window baked in.
-# Native context is 256K, so no rope-scaling penalty. Lighter KV than the 256k
-# variant; use for MCP-off / lean sessions where 128K is plenty. Baked here
-# (not via OLLAMA_CONTEXT_LENGTH) so the global 32768 default stays correct for
-# qwen2.5-coder:32b.
-# Build: ollama create qwen3.5:4b-128k -f modelfiles/qwen3.5-4b-128k.Modelfile
-FROM qwen3.5:4b
-PARAMETER num_ctx 131072
