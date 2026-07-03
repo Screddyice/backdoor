@@ -8,6 +8,8 @@
 # 256K, so 64K incurs NO rope-scaling penalty. Baked here (not via
 # OLLAMA_CONTEXT_LENGTH) so the global 32768 default stays correct for the
 # qwen2.5 coders.
-# Build: ollama create qwen3.5:4b-64k -f modelfiles/qwen3.5-4b-64k.Modelfile
+# Build: modelfiles/build.sh qwen3.5-4b-64k.Modelfile   (bakes in the shared system
+# prompt from prompts/claude-fable-5-system.md; raw ollama-create on this file
+# alone would build WITHOUT it)
 FROM qwen3.5:4b
 PARAMETER num_ctx 65536
