@@ -249,3 +249,30 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
   `ollama ps` should show CONTEXT 65536 for qwen3.5:9b-64k (the Modelfile
   num_ctx). The LaunchAgent's `OLLAMA_CONTEXT_LENGTH=32768` only applies to
   models without a baked num_ctx (i.e. the 32B/14B coders).
+
+## Default system prompt (Claude Fable 5)
+
+The four custom qwen3.5 tags ship with a baked-in default system prompt:
+the Claude Fable 5 prompt from the public `system_prompts_leaks` repo,
+stored at `prompts/claude-fable-5-system.md` (~46K tokens).
+
+Scope:
+- It applies only when a request carries no system message of its own
+  (bare `ollama run qwen3.5:4b-64k`, raw API calls).
+- Claude Code sessions through the proxy send their own system prompt,
+  which overrides the baked one. Harness behavior is unchanged (verified
+  2026-07-04 with a request-level system message).
+- Cold prefill of the prompt takes about 70s on the 4B; Ollama reuses the
+  cached prefix while the model stays loaded.
+- The qwen2.5-coder tags (32K ctx) skip it because the prompt exceeds
+  their window. The llm-jury council models (phi4, gemma3, llama3.1) skip
+  it because a persona prompt would distort their verifier role.
+
+Rebuild after editing the prompt or a Modelfile:
+
+```bash
+modelfiles/build.sh                            # all four tags
+modelfiles/build.sh qwen3.5-4b-64k.Modelfile   # one tag
+```
+
+`ollama create -f <Modelfile>` alone builds WITHOUT the system prompt.

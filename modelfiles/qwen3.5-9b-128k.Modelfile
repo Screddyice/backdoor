@@ -2,6 +2,8 @@
 # Native context is 256K, so no rope-scaling penalty (unlike qwen2.5 >32K).
 # Baked here (not via OLLAMA_CONTEXT_LENGTH) so the global 32768 default stays
 # correct for qwen2.5-coder:32b, whose KV cache would blow 36GB at 128K.
-# Build: ollama create qwen3.5:9b-128k -f modelfiles/qwen3.5-9b-128k.Modelfile
+# Build: modelfiles/build.sh qwen3.5-9b-128k.Modelfile   (bakes in the shared system
+# prompt from prompts/claude-fable-5-system.md; raw ollama-create on this file
+# alone would build WITHOUT it)
 FROM qwen3.5:9b
 PARAMETER num_ctx 131072
