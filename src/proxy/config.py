@@ -60,7 +60,6 @@ def clear_settings_cache():
 # `--model <name>`) that route to a LOCAL profile in hybrid mode.
 MODEL_ROUTES: dict[str, str] = {
     "qwen": "local-qwen35",
-    "qwen-coder": "local-coder",
     "qwen-fast": "local-fast",
 }
 

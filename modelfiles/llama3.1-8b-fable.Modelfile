@@ -1,0 +1,9 @@
+# llama3.1:8b-fable — persona variant of llama3.1:8b with the shared default
+# system prompt baked in (num_ctx 65536 so the ~43K-token prompt fits;
+# 131K-native model, no rope penalty).
+# The CANONICAL llama3.1:8b tag stays pristine ON PURPOSE: it is an llm-jury
+# council verifier, and the jury sends bare user messages at num_ctx 8192 —
+# a baked 43K system prompt would overflow every council call and break fusion.
+# Build: modelfiles/build.sh llama3.1-8b-fable.Modelfile
+FROM llama3.1:8b
+PARAMETER num_ctx 65536
