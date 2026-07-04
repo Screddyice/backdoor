@@ -95,3 +95,28 @@ def test_closed_always_allows_upstream():
     br, _ = make(clock)
     for _ in range(10):
         assert br.allow_upstream() is True
+
+
+# ── Failover ladder (size → local tier) ──────────────────────────────────────
+from src.proxy.config import pick_failover_profile, FAILOVER_LADDER
+
+
+def test_ladder_small_session_stays_on_4b():
+    assert pick_failover_profile(0) == "local-qwen35"
+    assert pick_failover_profile(52_000) == "local-qwen35"
+
+
+def test_ladder_medium_session_escalates_to_9b_128k():
+    assert pick_failover_profile(52_001) == "local-failover-128k"
+    assert pick_failover_profile(115_000) == "local-failover-128k"
+
+
+def test_ladder_large_session_escalates_to_9b_256k():
+    assert pick_failover_profile(115_001) == "local-failover-256k"
+    assert pick_failover_profile(10_000_000) == "local-failover-256k"
+
+
+def test_ladder_bounds_are_monotonic():
+    bounds = [b for b, _ in FAILOVER_LADDER]
+    assert bounds == sorted(bounds)
+    assert bounds[-1] == float("inf")

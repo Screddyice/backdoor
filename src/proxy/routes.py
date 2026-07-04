@@ -11,7 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from .config import MODEL_ROUTES, Settings, get_settings, load_profile_settings
+from .config import (
+    MODEL_ROUTES, Settings, get_settings, load_profile_settings, pick_failover_profile,
+)
 from .failover import FAILOVER_STATUSES, FailoverBreaker
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
@@ -213,10 +215,19 @@ async def create_message(
             if relay is not None:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
                 return relay
+            # Failed over: size the local tier to the session so a big session
+            # keeps its context instead of being truncated to fit the 4B.
             profile = settings.failover_profile
+            est = None
+            try:
+                fr = MessagesRequest.model_validate_json(body)
+                est = count_messages(fr.messages, fr.system, fr.tools)
+                profile = pick_failover_profile(est)
+            except Exception:
+                pass
             logger.warning(
-                "⇢ FAILOVER [%s → %s] %s (%s)",
-                model or "?", profile, request.url.path, get_breaker(settings).reason,
+                "⇢ FAILOVER [%s → %s in≈%s] %s (%s)",
+                model or "?", profile, est, request.url.path, get_breaker(settings).reason,
             )
         settings = load_profile_settings(profile)
         client = _get_profile_client(profile, settings)

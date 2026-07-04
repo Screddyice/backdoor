@@ -34,10 +34,16 @@ class Settings(BaseSettings):
     # Cloud→local failover (hybrid mode only): when the real Anthropic API is
     # unreachable / usage-limited / overloaded for `failover_threshold`
     # consecutive requests within `failover_window_seconds`, serve passthrough
-    # /v1/messages traffic from `failover_profile` instead of failing, probing
+    # /v1/messages traffic from a local profile instead of failing, probing
     # upstream every `failover_probe_seconds` until it recovers.
+    #
+    # Which local profile is picked by the session's estimated input tokens
+    # (see FAILOVER_LADDER): a small session stays on the fast 4B, a big one
+    # escalates to a 9B tier whose context window actually fits it. This is the
+    # "pick the appropriate local model for the use case" behavior — for
+    # failover the use-case dimension that matters is context size.
     failover_to_local: bool = True
-    failover_profile: str = "local-qwen35"
+    failover_profile: str = "local-qwen35"  # floor / smallest tier
     failover_threshold: int = 3
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
@@ -73,6 +79,30 @@ MODEL_ROUTES: dict[str, str] = {
     "qwen": "local-qwen35",
     "qwen-fast": "local-fast",
 }
+
+
+# Cloud→local failover ladder: pick the local profile whose context window fits
+# the failed-over session. Each entry is (max_input_tokens_inclusive, profile);
+# the first entry whose bound is >= the estimated input token count wins, else
+# the last. Bounds sit below each tag's real window to leave room for the reply.
+# Measured load at OLLAMA_NUM_PARALLEL=4 (q8_0 KV + flash attention): 4b-64k
+# ~7GB, 9b-128k ~12GB, 9b-256k ~16GB — all fit 36GB individually, and Ollama
+# evicts idle models to make room. The 9B tiers deliberately break the
+# "harness = 4B" rule: during an outage, a big session kept ALIVE on a 9B beats
+# one truncated to fit a 4B.
+FAILOVER_LADDER: list[tuple[float, str]] = [
+    (52_000, "local-qwen35"),          # qwen3.5:4b-64k   (~65K window)
+    (115_000, "local-failover-128k"),  # qwen3.5:9b-128k  (~131K window)
+    (float("inf"), "local-failover-256k"),  # qwen3.5:9b-256k (~262K window)
+]
+
+
+def pick_failover_profile(est_input_tokens: int) -> str:
+    """Choose the failover profile whose window fits this session's size."""
+    for bound, profile in FAILOVER_LADDER:
+        if est_input_tokens <= bound:
+            return profile
+    return FAILOVER_LADDER[-1][1]
 
 
 @lru_cache(maxsize=8)
