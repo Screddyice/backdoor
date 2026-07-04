@@ -44,7 +44,7 @@ the first word is passed straight to `claude` (e.g. `qwen fast --resume`).
 
 A second proxy instance runs permanently on **:8083** in `ROUTER_MODE=hybrid`
 (LaunchAgent `com.screddy.backdoor-router`, KeepAlive). It routes by requested
-model name: `qwen` / `qwen-fast` → the matching local profile;
+model name: `qwen` / `qwen-fast` / `qwen-9b` → the matching local profile;
 **every other model and endpoint passes through byte-faithfully to
 api.anthropic.com** (auth headers, SSE, compression untouched).
 
@@ -177,7 +177,19 @@ bd stop                 # stop the proxy
 |-----------------|---------------------|------------------------------------------|
 | `local-qwen35`  | qwen3.5:4b-64k      | 3.4GB weights. Tools+thinking. **Default.** |
 | `local-fast`    | qwen3.5:4b-64k      | Same model; lean profile used by `qwen fast`. |
+| `local-qwen-9b` | qwen3.5:9b-64k      | Stronger brain for subagents (`qwen-9b` route); the `fusion` agent runs on it. ~10-12GB. |
 | `modal-qwen`    | (Modal cloud)       | Pre-existing cloud backend. Online only. |
+
+The `qwen-9b` route (→ `local-qwen-9b`) is a stronger local brain for
+*subagents* that need more reasoning than the 4B — notably the **`fusion`
+agent** (`~/.claude/agents/fusion.md`), which runs on `qwen-9b` to frame a
+verifiable coding task and derive an oracle, then drives the llm-jury council
+(`llmjury solve --backend ollama --frontier …`) to return a COUNCIL-VERIFIED
+answer, escalating only the hard minority to a frontier model. The
+full-harness default stays the 4B (`qwen`) per the "harness = 4B" rule; the 9B
+is subagent-only. When the fusion agent then runs the council
+(phi4+gemma3+llama), Ollama evicts idle models to fit and reloads the 9B when
+the agent resumes.
 
 `qwen3.5:9b-64k` is a local tag built from `modelfiles/qwen3.5-9b-64k.Modelfile`
 (`FROM qwen3.5:9b` + `PARAMETER num_ctx 65536` — enough for the ~30-50K harness
