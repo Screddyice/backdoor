@@ -92,8 +92,10 @@ Notes:
     before `claude` (see "Non-terminal sessions" below). Same health guard as
     the .zshrc block — routes through :8083 when the router is up, direct
     Anthropic when it's down.
-  - **IDE extension:** launch the IDE from a terminal so it inherits the
-    guarded env; a Dock-launched IDE won't have it.
+  - **GUI apps (Dock-launched IDE, Claude Desktop's local code sessions):**
+    the `com.screddy.router-gui-env` LaunchAgent health-gates the GUI login
+    domain's `ANTHROPIC_BASE_URL` (see "GUI apps" below). Relaunch the app once
+    after install so it inherits the value.
 - Do NOT put ANTHROPIC_BASE_URL in ~/.claude/settings.json env — settings env
   OVERRIDES process env (verified), which would hijack the :8082 wrapper AND
   remove the health-guard fallback from every session (router down → all
@@ -119,6 +121,43 @@ in this repo). It curls `:8083/health` with a 0.3s timeout and exports
 worse off than direct cloud if the router is down. Nothing global changes, so
 the terminal path's fallback is preserved. (There are no such Mac cron/launchd
 `claude` jobs today — this is the ready-to-use path for when you add one.)
+
+### GUI apps — Dock-launched IDEs and the Claude Desktop app
+
+GUI apps inherit the launchd (Aqua) login environment, not `.zshrc`. The
+`com.screddy.router-gui-env` LaunchAgent (`~/.local/bin/router-gui-env.sh`,
+`RunAtLoad` + `StartInterval` 60s) health-gates that env:
+
+```
+router healthy → launchctl setenv   ANTHROPIC_BASE_URL http://127.0.0.1:8083
+router down    → launchctl unsetenv ANTHROPIC_BASE_URL   (fallback to cloud)
+```
+
+This reaches the **local Claude Code sessions the Claude Desktop app hosts**
+(the `cc*` / local-code-session features in `claude_desktop_config.json`) and
+**Dock-launched IDE Claude extensions** — their `claude` engine runs as a
+GUI-session child and inherits this var, so it gets cloud→local failover and
+`/model qwen`.
+
+Two boundaries to know:
+
+- **GUI processes freeze their env at launch.** A running app won't see a
+  toggle — **relaunch the app once** after installing the agent, and it inherits
+  whatever the router state is at launch (held for the app's lifetime). This is
+  why the terminal `.zshrc` block now also *unsets* on the down path: a terminal
+  re-checks per shell, so it never holds a stale `:8083`.
+- **The Claude Desktop app's OWN chat and Cowork are NOT redirected** — they
+  talk to claude.ai's backend and ignore `ANTHROPIC_BASE_URL`. Only the *Claude
+  Code* sessions the app hosts route through the router. There is no supported
+  way to point the consumer assistant at a local model (and TLS-intercepting it
+  would be a fragile, invasive hack — don't).
+
+Blast radius is benign: any other GUI tool that reads `ANTHROPIC_BASE_URL` and
+now hits `:8083` still works, because non-`qwen` models pass through
+byte-faithfully to the real Anthropic API.
+
+Install: `launchctl load -w ~/Library/LaunchAgents/com.screddy.router-gui-env.plist`
+(plist + script are hand-placed, not in this repo). Log: `/tmp/router-gui-env.log`.
 
 ## Manual control (the underlying `bd` CLI)
 
