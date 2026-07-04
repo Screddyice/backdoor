@@ -1,23 +1,34 @@
 #!/usr/bin/env bash
-# build.sh — build the custom qwen3.5 tags WITH the shared system prompt baked in.
+# build.sh — build the local model tags WITH the shared system prompt baked in.
 #
-# Modelfiles have no include mechanism, so instead of duplicating the ~186KB
+# Modelfiles have no include mechanism, so instead of duplicating the ~180KB
 # prompt into every Modelfile, this script assembles each one at build time:
 #   <variant>.Modelfile  +  SYSTEM """<prompts/claude-fable-5-system.md>"""
-# and runs `ollama create` on the result.
+# and runs `ollama create`. Tag = filename minus .Modelfile, first "-" -> ":"
+# (qwen3.5-4b-64k.Modelfile -> qwen3.5:4b-64k, llama3.1-8b-fable.Modelfile ->
+# llama3.1:8b-fable).
 #
-# The SYSTEM directive is the model's DEFAULT system prompt: it applies to bare
-# usage (`ollama run qwen3.5:4b-64k`, API calls with no system message). Any
-# request that carries its own system message — i.e. every Claude Code session
-# through the backdoor proxy — overrides it, so the harness is unaffected.
+# The SYSTEM directive is the model's DEFAULT system prompt (~43K tokens
+# measured): it applies to bare usage (`ollama run <tag>`, API calls with no
+# system message). Any request that carries its own system message — i.e.
+# every Claude Code session through the backdoor proxy — overrides it, so the
+# harness is unaffected.
 #
 # NOT covered here (deliberately):
-#   - qwen2.5-coder:32b / :14b — stock 32K-ctx tags; the ~46K-token prompt
-#     doesn't fit their window.
-#   - phi4 / gemma3:12b / llama3.1:8b — llm-jury council verifiers; a persona
-#     prompt would interfere with the council's task prompts.
+#   - phi4 (16K native) and qwen3:8b (41K max) — the 43K-token prompt does not
+#     fit their context windows at all.
+#   - The CANONICAL llm-jury council tags (phi4, gemma3:12b, llama3.1:8b) stay
+#     pristine: the jury sends bare user messages (no system role) at
+#     num_ctx 8192, so a baked system prompt would overflow every council call
+#     and break fusion. Persona use gets the *-fable variants instead
+#     (llama3.1:8b-fable, gemma3:12b-fable).
 #
-# Usage: ./build.sh [variant ...]     (default: all qwen3.5-*.Modelfile)
+# Loading note: tags here bake num_ctx 65536, and with OLLAMA_NUM_PARALLEL=4
+# the server allocates KV for 4 x num_ctx on load — fine for the 4B, heavy
+# (~16GB KV) for 9-12B models. The 8-12B *-fable variants are for deliberate
+# persona sessions, not background use.
+#
+# Usage: ./build.sh [variant.Modelfile ...]     (default: all *.Modelfile)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -29,12 +40,12 @@ if grep -q '"""' "$PROMPT_FILE"; then
 fi
 
 MODELFILES=("$@")
-[ ${#MODELFILES[@]} -eq 0 ] && MODELFILES=(qwen3.5-*.Modelfile)
+[ ${#MODELFILES[@]} -eq 0 ] && MODELFILES=(*.Modelfile)
 
 for mf in "${MODELFILES[@]}"; do
   [ -f "$mf" ] || { echo "ERROR: $mf not found" >&2; exit 1; }
   tag="${mf%.Modelfile}"
-  tag="${tag/qwen3.5-/qwen3.5:}"
+  tag="${tag/-/:}"
   tmp="$(mktemp)"
   {
     cat "$mf"
