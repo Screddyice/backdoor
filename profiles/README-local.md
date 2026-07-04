@@ -55,6 +55,35 @@ Anthropic). So in any normal terminal Claude Code session:
     /model qwen        # switch this session to the local Qwen3.5
     claude --model qwen -p "..."   # one-shot
 
+**Cloud→local failover (2026-07-04):** if the real Anthropic API stops working
+(network gone, usage limit hit, overloaded — 3 consecutive failures within
+2 min), the router opens a circuit breaker and serves passthrough
+`/v1/messages` traffic from a local model instead of failing, so the
+in-flight session keeps going. It probes upstream every 60s and switches
+back automatically; macOS notifications fire on both transitions. Auth
+failures (401/403) stay visible on purpose — they mean a broken credential,
+not a broken network.
+
+**Size-aware tier (the ladder).** The local model is picked by the
+failed-over session's estimated input tokens, so a big session keeps its
+context instead of being truncated to fit the 4B:
+
+| session input | tier | model | ~load @NUM_PARALLEL=4 |
+|---|---|---|---|
+| ≤ 52K | `local-qwen35` | qwen3.5:4b-64k | ~7GB |
+| ≤ 115K | `local-failover-128k` | qwen3.5:9b-128k | ~12GB |
+| > 115K | `local-failover-256k` | qwen3.5:9b-256k | ~16GB |
+
+The 9B tiers deliberately break the "harness = 4B" rule: during an outage a
+big session kept ALIVE on a 9B beats one truncated to a 4B. They're safe on
+36GB because `q8_0` KV + flash attention keep the KV small (the old 256K
+"thrash" was f16 KV / the 142K MCP prompt, not this config), and Ollama
+evicts idle models to make room. Cost: a 9B cold-prefilling a 100K+ session
+takes minutes — slow but alive. Tune via env: `FAILOVER_TO_LOCAL=0`
+disables; `FAILOVER_THRESHOLD` / `FAILOVER_PROBE_SECONDS` adjust; ladder
+bounds live in `FAILOVER_LADDER` (config.py). Code: `src/proxy/failover.py`
++ routes + profiles `local-failover-{128k,256k}.env`.
+
 Notes:
 - The offline `qwen` wrapper still pins :8082 explicitly — unaffected.
 - GUI/IDE/cron Claude Code sessions don't read .zshrc → they stay direct cloud

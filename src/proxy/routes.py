@@ -8,10 +8,13 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from .config import MODEL_ROUTES, Settings, get_settings, load_profile_settings
+from .config import (
+    MODEL_ROUTES, Settings, get_settings, load_profile_settings, pick_failover_profile,
+)
+from .failover import FAILOVER_STATUSES, FailoverBreaker
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -75,15 +78,18 @@ _HOP_HEADERS = {
 _SKIP_RESP_HEADERS = {"content-length", "transfer-encoding", "connection"}
 
 
-async def _anthropic_passthrough(request: Request, body: bytes, settings: Settings):
-    """Forward a request byte-faithfully to the real Anthropic API and stream
-    the response back untouched (auth headers, SSE framing and all)."""
+async def _upstream_send(request: Request, body: bytes, settings: Settings) -> httpx.Response:
+    """Open a byte-faithful streaming request against the real Anthropic API
+    (auth headers and all) and return it at the headers-received stage."""
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS}
     headers.setdefault("accept-encoding", "identity")
     url = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     upstream = _get_upstream(settings)
     ureq = upstream.build_request(request.method, url, content=body, headers=headers)
-    uresp = await upstream.send(ureq, stream=True)
+    return await upstream.send(ureq, stream=True)
+
+
+def _relay_upstream(uresp: httpx.Response) -> StreamingResponse:
     resp_headers = {k: v for k, v in uresp.headers.items() if k.lower() not in _SKIP_RESP_HEADERS}
     return StreamingResponse(
         uresp.aiter_raw(),
@@ -91,6 +97,58 @@ async def _anthropic_passthrough(request: Request, body: bytes, settings: Settin
         headers=resp_headers,
         background=BackgroundTask(uresp.aclose),
     )
+
+
+async def _anthropic_passthrough(request: Request, body: bytes, settings: Settings):
+    """Forward a request byte-faithfully to the real Anthropic API and stream
+    the response back untouched (auth headers, SSE framing and all)."""
+    return _relay_upstream(await _upstream_send(request, body, settings))
+
+
+# ── Cloud→local failover ─────────────────────────────────────────────────────
+# One breaker for the process (hybrid mode has a single upstream). Lazily
+# built from settings so env overrides apply.
+
+_breaker: FailoverBreaker | None = None
+
+
+def get_breaker(settings: Settings) -> FailoverBreaker:
+    global _breaker
+    if _breaker is None:
+        _breaker = FailoverBreaker(
+            threshold=settings.failover_threshold,
+            window=settings.failover_window_seconds,
+            probe_interval=settings.failover_probe_seconds,
+        )
+    return _breaker
+
+
+async def _try_upstream(request: Request, body: bytes, settings: Settings):
+    """Attempt the real Anthropic API for a /v1/messages passthrough.
+
+    Returns a response to relay, or None when the caller should serve the
+    request from the local failover profile instead. Mid-stream failures after
+    headers are NOT intercepted — the client's retry then hits the breaker."""
+    br = get_breaker(settings)
+    if not br.allow_upstream():
+        return None
+    try:
+        uresp = await _upstream_send(request, body, settings)
+    except httpx.TransportError as e:
+        if br.record_failure(type(e).__name__):
+            return None
+        raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
+    if uresp.status_code in FAILOVER_STATUSES:
+        err_body = await uresp.aread()
+        err_headers = {k: v for k, v in uresp.headers.items() if k.lower() not in _SKIP_RESP_HEADERS}
+        await uresp.aclose()
+        if br.record_failure(f"HTTP {uresp.status_code}"):
+            return None
+        # Below the threshold: relay the error verbatim so the client's own
+        # retry/backoff logic still runs (a lone 429 is normal backpressure).
+        return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
+    br.record_success()
+    return _relay_upstream(uresp)
 
 
 def _model_from_body(body: bytes) -> str:
@@ -150,8 +208,27 @@ async def create_message(
         model = _model_from_body(body)
         profile = MODEL_ROUTES.get(model)
         if profile is None:
-            logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
-            return await _anthropic_passthrough(request, body, settings)
+            if not settings.failover_to_local:
+                logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
+                return await _anthropic_passthrough(request, body, settings)
+            relay = await _try_upstream(request, body, settings)
+            if relay is not None:
+                logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
+                return relay
+            # Failed over: size the local tier to the session so a big session
+            # keeps its context instead of being truncated to fit the 4B.
+            profile = settings.failover_profile
+            est = None
+            try:
+                fr = MessagesRequest.model_validate_json(body)
+                est = count_messages(fr.messages, fr.system, fr.tools)
+                profile = pick_failover_profile(est)
+            except Exception:
+                pass
+            logger.warning(
+                "⇢ FAILOVER [%s → %s in≈%s] %s (%s)",
+                model or "?", profile, est, request.url.path, get_breaker(settings).reason,
+            )
         settings = load_profile_settings(profile)
         client = _get_profile_client(profile, settings)
 
@@ -244,7 +321,9 @@ async def _stream(
 async def count_tokens(request: Request, settings: Settings = Depends(get_settings)):
     body = await request.body()
     if settings.router_mode == "hybrid" and _model_from_body(body) not in MODEL_ROUTES:
-        return await _anthropic_passthrough(request, body, settings)
+        # While the failover breaker is open, count locally instead of failing.
+        if not (settings.failover_to_local and get_breaker(settings).open):
+            return await _anthropic_passthrough(request, body, settings)
     req = TokenCountRequest.model_validate_json(body)
     return TokenCountResponse(input_tokens=count_messages(req.messages, req.system, req.tools))
 
