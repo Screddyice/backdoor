@@ -4,6 +4,8 @@
 # KV cache at 256K (q8_0, per LaunchAgent) roughly doubles the 128K footprint —
 # fits on the 36GB M5 Max but leaves little headroom; keep the 128K variant as
 # the default for MCP-off sessions.
-# Build: ollama create qwen3.5:9b-256k -f modelfiles/qwen3.5-9b-256k.Modelfile
+# Build: modelfiles/build.sh qwen3.5-9b-256k.Modelfile   (bakes in the shared system
+# prompt from prompts/claude-fable-5-system.md; raw ollama-create on this file
+# alone would build WITHOUT it)
 FROM qwen3.5:9b
 PARAMETER num_ctx 262144

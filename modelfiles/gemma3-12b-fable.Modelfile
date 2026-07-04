@@ -1,0 +1,9 @@
+# gemma3:12b-fable — persona variant of gemma3:12b with the shared default
+# system prompt baked in (num_ctx 65536 so the ~43K-token prompt fits;
+# 131K-native model, no rope penalty).
+# The CANONICAL gemma3:12b tag stays pristine ON PURPOSE: it is an llm-jury
+# council verifier, and the jury sends bare user messages at num_ctx 8192 —
+# a baked 43K system prompt would overflow every council call and break fusion.
+# Build: modelfiles/build.sh gemma3-12b-fable.Modelfile
+FROM gemma3:12b
+PARAMETER num_ctx 65536
