@@ -86,12 +86,39 @@ bounds live in `FAILOVER_LADDER` (config.py). Code: `src/proxy/failover.py`
 
 Notes:
 - The offline `qwen` wrapper still pins :8082 explicitly — unaffected.
-- GUI/IDE/cron Claude Code sessions don't read .zshrc → they stay direct cloud
-  (no /model qwen there; launch from a terminal if you want it).
+- GUI/IDE/cron Claude Code sessions don't read .zshrc → by default they stay
+  direct cloud (no failover, no /model qwen). Two ways to opt one in:
+  - **cron / launchd / scripts:** `source ~/.local/bin/claude-router-env.sh`
+    before `claude` (see "Non-terminal sessions" below). Same health guard as
+    the .zshrc block — routes through :8083 when the router is up, direct
+    Anthropic when it's down.
+  - **IDE extension:** launch the IDE from a terminal so it inherits the
+    guarded env; a Dock-launched IDE won't have it.
 - Do NOT put ANTHROPIC_BASE_URL in ~/.claude/settings.json env — settings env
-  OVERRIDES process env (verified), which would hijack the :8082 wrapper.
+  OVERRIDES process env (verified), which would hijack the :8082 wrapper AND
+  remove the health-guard fallback from every session (router down → all
+  sessions lose Anthropic). The sourceable helper keeps the guard; settings
+  env can't.
 - Restart: `launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router`;
   log: `router.log` in the repo.
+
+### Non-terminal sessions (cron / launchd / scripts)
+
+Terminal shells get `:8083` from the health-guarded block in `~/.zshrc`.
+Anything that doesn't read `.zshrc` (a cron job, a launchd plist, a helper
+script running `claude -p`) opts in by sourcing the same guard:
+
+```bash
+source ~/.local/bin/claude-router-env.sh   # exports :8083 only if healthy
+claude -p "…"                              # now has failover + /model qwen
+```
+
+`claude-router-env.sh` is a hand-placed helper (like the `qwen` wrapper — not
+in this repo). It curls `:8083/health` with a 0.3s timeout and exports
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8083` only on success, so a job is never
+worse off than direct cloud if the router is down. Nothing global changes, so
+the terminal path's fallback is preserved. (There are no such Mac cron/launchd
+`claude` jobs today — this is the ready-to-use path for when you add one.)
 
 ## Manual control (the underlying `bd` CLI)
 
