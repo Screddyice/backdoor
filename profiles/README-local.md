@@ -55,6 +55,18 @@ Anthropic). So in any normal terminal Claude Code session:
     /model qwen        # switch this session to the local Qwen3.5
     claude --model qwen -p "..."   # one-shot
 
+**Cloud→local failover (2026-07-04):** if the real Anthropic API stops working
+(network gone, usage limit hit, overloaded — 3 consecutive failures within
+2 min), the router opens a circuit breaker and serves passthrough
+`/v1/messages` traffic from `local-qwen35` (qwen3.5:4b-64k) instead of
+failing, so the in-flight session keeps going. It probes upstream every 60s
+and switches back automatically; macOS notifications fire on both
+transitions. Auth failures (401/403) stay visible on purpose — they mean a
+broken credential, not a broken network. Sessions bigger than the 4B's 64K
+window get truncated by Ollama while failed over. Tune via env:
+`FAILOVER_TO_LOCAL=0` disables; `FAILOVER_PROFILE` / `FAILOVER_THRESHOLD` /
+`FAILOVER_PROBE_SECONDS` adjust. Code: `src/proxy/failover.py` + routes.
+
 Notes:
 - The offline `qwen` wrapper still pins :8082 explicitly — unaffected.
 - GUI/IDE/cron Claude Code sessions don't read .zshrc → they stay direct cloud

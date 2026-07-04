@@ -31,6 +31,17 @@ class Settings(BaseSettings):
     router_mode: str = "profile"
     anthropic_upstream: str = "https://api.anthropic.com"
 
+    # Cloud→local failover (hybrid mode only): when the real Anthropic API is
+    # unreachable / usage-limited / overloaded for `failover_threshold`
+    # consecutive requests within `failover_window_seconds`, serve passthrough
+    # /v1/messages traffic from `failover_profile` instead of failing, probing
+    # upstream every `failover_probe_seconds` until it recovers.
+    failover_to_local: bool = True
+    failover_profile: str = "local-qwen35"
+    failover_threshold: int = 3
+    failover_window_seconds: float = 120.0
+    failover_probe_seconds: float = 60.0
+
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True
     skip_title_generation: bool = True

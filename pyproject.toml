@@ -23,6 +23,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["."]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/proxy"]
