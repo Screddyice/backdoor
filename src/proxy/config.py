@@ -76,8 +76,9 @@ def clear_settings_cache():
 # Model names a Claude Code session can request (via `/model <name>` or
 # `--model <name>`) that route to a LOCAL profile in hybrid mode.
 MODEL_ROUTES: dict[str, str] = {
-    "qwen": "local-qwen35",
-    "qwen-fast": "local-fast",
+    "qwen": "local-qwen35",       # qwen3.5:4b-64k — full-harness default
+    "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
+    "qwen-9b": "local-qwen-9b",   # qwen3.5:9b-64k — stronger brain for subagents
 }
 
 
