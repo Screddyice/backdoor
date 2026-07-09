@@ -2,8 +2,8 @@
 # Failover escalation tier for the :8083 hybrid router (see profiles/
 # local-failover-128k.env). Switched from the 9B 2026-07-09: a 9B prefilling a
 # 70K+ token offline session ran minutes/turn and made `/model qwen` unusable.
-# The 4B is several times faster and its KV at 128K is a fraction of the 9B's,
-# so the window fits 36GB with headroom.
+# The 4B is several times faster; it loads at ~9GB at 128K (vs the 9B's ~12GB —
+# KV-dominated at this window, so the win is prefill speed), fitting 36GB.
 # 128K sits under the model's 256K native context, so no rope-scaling penalty.
 # Build: modelfiles/build.sh qwen3.5-4b-128k.Modelfile  (bakes the shared system
 # prompt from prompts/claude-fable-5-system.md; raw ollama-create would omit it).

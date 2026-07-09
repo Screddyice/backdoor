@@ -2,8 +2,8 @@
 # Top failover escalation tier for the :8083 hybrid router (see profiles/
 # local-failover-256k.env). Switched from the 9B 2026-07-09: a 9B prefilling a
 # very large offline session ran ~5 min/turn and returned HTTP 500; the 4B is
-# several times faster and its 256K KV is a fraction of the 9B's ~16GB, so it
-# fits 36GB with headroom.
+# several times faster; at 256K it loads at ~13GB (vs the 9B's ~15GB — KV
+# dominates at this window, so the win is prefill speed), fitting 36GB.
 # 256K is the model's native context, so no rope-scaling penalty.
 # Build: modelfiles/build.sh qwen3.5-4b-256k.Modelfile  (bakes the shared system
 # prompt from prompts/claude-fable-5-system.md; raw ollama-create would omit it).
