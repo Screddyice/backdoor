@@ -89,8 +89,10 @@ MODEL_ROUTES: dict[str, str] = {
 # All tiers are the 4B (switched from 9B 2026-07-09). A 9B cold-prefilling a
 # failed-over session ran 3.5+ min/turn at ~71K tokens and 500'd on ~186K,
 # which made offline `/model qwen` effectively unresponsive. The 4B prefills the
-# same context several times faster and its KV is a fraction of the 9B's, so the
-# 128K/256K windows still fit 36GB comfortably. Keeping the whole ladder on one
+# same context several times faster; memory is only modestly lower (measured
+# 4b-128k ~9GB vs 9b ~12GB, 4b-256k ~13GB vs 9b ~15GB: KV dominates at these
+# windows, so the real win is prefill speed, not memory), and both fit 36GB.
+# Keeping the whole ladder on one
 # model family also means a wrapper session (4B) and a failover session (4B)
 # never force a 9B+4B coexistence — the memory blowup that stalled the plane.
 FAILOVER_LADDER: list[tuple[float, str]] = [
