@@ -1,8 +1,8 @@
 {
   "enabledPlugins": {
-    "claude-mem@thedotmack": true,
+    "claude-mem@thedotmack": false,
     "claude-harness@claude-harness": true,
-    "ralph-loop@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": false,
     "superpowers@claude-plugins-official": false,
     "holyclaude@screddy-local": false,
     "frontend-design@claude-plugins-official": false,
