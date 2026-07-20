@@ -76,6 +76,17 @@ _HOP_HEADERS = {
     "te", "upgrade", "proxy-authorization", "proxy-authenticate",
 }
 _SKIP_RESP_HEADERS = {"content-length", "transfer-encoding", "connection"}
+# Additional headers to drop when we hand the client an ALREADY-DECODED body.
+# httpx's .aread()/.aiter_bytes() undo content-encoding, so keeping the upstream
+# content-encoding would make a gzip-negotiating client try to gunzip plaintext
+# and raise "Error -3 while decompressing data: incorrect header check".
+# content-length is already stripped above; Starlette recomputes it.
+_DECODED_SKIP_HEADERS = _SKIP_RESP_HEADERS | {"content-encoding"}
+
+
+def _decoded_relay_headers(uresp: httpx.Response) -> dict[str, str]:
+    """Response headers safe to forward alongside an already-decoded body."""
+    return {k: v for k, v in uresp.headers.items() if k.lower() not in _DECODED_SKIP_HEADERS}
 
 
 async def _upstream_send(request: Request, body: bytes, settings: Settings) -> httpx.Response:
@@ -139,8 +150,8 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
             return None
         raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
     if uresp.status_code in FAILOVER_STATUSES:
-        err_body = await uresp.aread()
-        err_headers = {k: v for k, v in uresp.headers.items() if k.lower() not in _SKIP_RESP_HEADERS}
+        err_body = await uresp.aread()  # decoded: content-encoding is undone here
+        err_headers = _decoded_relay_headers(uresp)
         await uresp.aclose()
         if br.record_failure(f"HTTP {uresp.status_code}"):
             return None
