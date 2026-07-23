@@ -353,6 +353,50 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
   num_ctx). The LaunchAgent's `OLLAMA_CONTEXT_LENGTH=32768` only applies to
   models without a baked num_ctx.
 
+## Server-side failover: TMN Hermes gateways (codex → local qwen)
+
+The same failover idea runs on the two production Hermes gateways so they keep
+answering when OpenAI Codex hits a usage/rate limit (HTTP 429). Each gateway
+uses Hermes' native `fallback_providers` chain: the agent tries the chain in
+order when the primary fails on rate-limit, 5xx, or connection errors, then
+returns to Codex on the next request. It is per-request and self-healing, so
+there is no stuck state to reset once Codex recovers.
+
+| Box | Config | Primary | Fallback |
+|---|---|---|---|
+| Hostinger (`neb-brain-hostinger`) | `~/.hermes/config.yaml` | `openai-codex/gpt-5.5` | `qwen3:4b` (only ~3.8 GiB free; `qwen3:8b` needs 5.5 GiB and will not load) |
+| GCP `hermes-tmn` | `~/.hermes/profiles/tmn/config.yaml` | `openai-codex/gpt-5.6-sol` | `qwen3.5:4b` |
+
+Both point at the box's local Ollama over its OpenAI-compatible surface:
+
+```yaml
+fallback_providers:
+- provider: custom
+  model: qwen3:4b                       # qwen3.5:4b on hermes-tmn
+  base_url: http://127.0.0.1:11434/v1
+  api_key: no-key-required
+```
+
+The provider must be `custom`, not `ollama`. `hermes fallback list` and the
+config parser both accept `provider: ollama` and display it fine, but the
+agent failover path (`try_activate_fallback` -> `resolve_provider_client`)
+does not alias `ollama`. It raises "unknown provider 'ollama'", logs "provider
+not configured", and skips the entry, so no failover happens. `provider:
+custom` with an explicit `base_url` resolves to the OpenAI-compatible client
+that reaches Ollama. That client also rejects an empty key, which is why the
+entry carries `api_key: no-key-required`.
+
+Apply and verify:
+- Edit the config, then restart the gateway so its startup snapshot reloads
+  the chain. Hostinger: `systemctl --user restart hermes-gateway.service`.
+  hermes-tmn: `systemctl --user restart hermes-gateway-tmn.service`. Both are
+  user units, so export `XDG_RUNTIME_DIR=/run/user/$(id -u)` first.
+- Confirm: `python -m hermes_cli.main [--profile tmn] fallback list` shows
+  `qwen... (via custom)`.
+- The fallback runs in qwen thinking mode, so replies are slow (one to a few
+  minutes per turn on these 2-vCPU boxes). That is fine for degraded mode and
+  beats a hard 429 failure.
+
 ## Default system prompt (Claude Fable 5)
 
 The local open-source models ship with a baked-in default system prompt:
