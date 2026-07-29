@@ -353,6 +353,121 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
   num_ctx). The LaunchAgent's `OLLAMA_CONTEXT_LENGTH=32768` only applies to
   models without a baked num_ctx.
 
+## Server-side: TMN Hermes gateways
+
+> **Updated 2026-07-29.** `REDACTED-HOST` no longer runs a local fallback. The
+> codex → qwen chain described below now applies to **Hostinger only**. See
+> "Why REDACTED-HOST has no local fallback" for the measurements behind that.
+
+| Box | Config | Primary | Fallback |
+|---|---|---|---|
+| Hostinger (`REDACTED-HOST`) | `~/.hermes/config.yaml` | `openai-codex/gpt-5.5` | `qwen3:4b` (only ~3.8 GiB free; `qwen3:8b` needs 5.5 GiB and will not load) |
+| GCP `REDACTED-HOST` | `~/.hermes/profiles/tmn/config.yaml` | `openai-codex/gpt-5.5` | **none** — `fallback_providers: []`, no local models installed |
+
+`REDACTED-HOST` additionally runs a **separate** LLM path for NEBOS: the
+`hermes-llm-proxy` service on `127.0.0.1:8220`, which NEBOS Cloud Functions call
+at `POST /llm/generate`. That path is **Claude only** (`NEBOS_LLM_BACKEND=claude`,
+`CLAUDE_MODEL=sonnet`, driving Claude Code via `claude -p` under the
+`REDACTED@example.com` Max subscription). `HERMES_LLM_FALLBACK_MODEL` is
+deliberately empty, so a Claude failure **raises** rather than silently dropping
+to a weaker model. Do not conflate the two paths — changing the gateway's model
+does not affect NEBOS, and vice versa.
+
+The Hostinger fallback points at the box's local Ollama over its
+OpenAI-compatible surface:
+
+```yaml
+fallback_providers:
+- provider: custom
+  model: qwen3:4b                       # qwen3.5:4b on REDACTED-HOST
+  base_url: http://127.0.0.1:11434/v1
+  api_key: no-key-required
+```
+
+The provider must be `custom`, not `ollama`. `hermes fallback list` and the
+config parser both accept `provider: ollama` and display it fine, but the
+agent failover path (`try_activate_fallback` -> `resolve_provider_client`)
+does not alias `ollama`. It raises "unknown provider 'ollama'", logs "provider
+not configured", and skips the entry, so no failover happens. `provider:
+custom` with an explicit `base_url` resolves to the OpenAI-compatible client
+that reaches Ollama. That client also rejects an empty key, which is why the
+entry carries `api_key: no-key-required`.
+
+Apply and verify:
+- Edit the config, then restart the gateway so its startup snapshot reloads
+  the chain. Hostinger: `systemctl --user restart hermes-gateway.service`.
+  REDACTED-HOST: `systemctl --user restart hermes-gateway-tmn.service`. Both are
+  user units, so export `XDG_RUNTIME_DIR=/run/user/$(id -u)` first.
+- Confirm: `python -m hermes_cli.main [--profile tmn] fallback list` shows
+  `qwen... (via custom)`.
+- The fallback runs in qwen thinking mode, so replies are slow (one to a few
+  minutes per turn on these 2-vCPU boxes). That is fine for degraded mode and
+  beats a hard 429 failure.
+
+### Why REDACTED-HOST has no local fallback
+
+Measured on the box 2026-07-29, not extrapolated from the Mac. **The constraint
+is the hardware, not the model** — results scale with parameter count, so
+swapping models cannot fix it:
+
+| Model | Params | `hermes -z` for a one-word reply |
+|---|---|---|
+| `granite4.1:3b` | 3.4B | ~30 min (two Ollama progress checkpoints agreed) |
+| `qwen3.5:4b` | 4.7B | **45 min — hit `timeout 2700`, never answered** |
+| `gemma4:e4b` | 8B MoE | never completed a turn |
+
+Root cause: **~6.4-7.0 tok/s prefill on 2 vCPU**, straight from Ollama's own log
+(`prompt processing, n_tokens = 2048, progress = 0.17, 6.42 tokens per second`).
+Hermes sends ~12,800 tokens even in `focus` mode, so a turn spends ~30 minutes in
+prefill before generating anything. Generation adds ~2.8 tok/s on top.
+
+Every available lever was already applied and none of it mattered:
+`OLLAMA_CONTEXT_LENGTH=16384`, `OLLAMA_KEEP_ALIVE=-1`,
+`agent.coding_context: focus` (17k → 12.8k), `agent.reasoning_effort: none`.
+
+**Measurement trap:** short (~375-token) prompts report 116-141 tok/s prefill
+because they are largely cache hits. That number is not real and it cost two
+wasted config detours. Trust Ollama's `prompt processing` log lines on a
+full-size prompt, never per-call timing on toy prompts.
+
+Also: 32k context is unaffordable here — a 3.4B model with a 32k KV cache left
+only 185 MB free on 7.9 GB. 16k is the ceiling.
+
+`e2-standard-4` does **not** qualify as a fix: doubling cores turns 30 minutes
+into ~15. Only a GPU (`g2-standard-4` + L4, ~$511-650/mo) clears the ~10s target,
+which is poor economics for a bot seeing ~1 event/week. Ollama on `REDACTED-HOST` is
+therefore **stopped and disabled**, with zero models installed.
+
+### REDACTED-HOST gotchas that cost real time
+
+- **`auth status` lies.** It reported `openai-codex: logged in` while the
+  credential pool held **0** entries and the stored token had no refresh token at
+  all. It did the same for `anthropic`. Always check **`auth list`** for a pooled
+  credential, or read `auth.json` directly.
+- **`model.default` must be provider-prefixed**: `openai-codex/gpt-5.5`. A bare
+  `gpt-5.4` fails in ~12s with only `hermes -z: no final response was produced`
+  and **nothing in errors.log**. Fast failure with no logged reason = suspect the
+  model string first. `gpt-5.6` returns *"not supported when using Codex with a
+  ChatGPT account"*.
+- **Two boxes must not share one OAuth lineage.** The July outage was Hostinger's
+  30-minute `codex-keepalive` rotating a refresh token that `REDACTED-HOST` also
+  held, invalidating tmn's copy every cycle (`refresh_token_reused`). Fixed by a
+  fresh device-code login giving tmn its own lineage. The `label` field is
+  cosmetic and read `oauth-2` on both boxes — **compare refresh-token
+  fingerprints, not labels.**
+- **The gateway reads `~/.hermes/profiles/tmn/config.yaml`** via `HERMES_HOME`,
+  not `~/.hermes/config.yaml`. A login or edit without `--profile tmn` lands in
+  the default profile the gateway never reads, and appears to do nothing.
+- **`CLAUDE_CODE_OAUTH_TOKEN` cannot authenticate Hermes.** It appears in the
+  anthropic provider's `env_vars`, and `auth status` will say `logged in`, but
+  Hermes blocklists it by design (`tests/hermes_cli/test_auth_provider_gate.py`:
+  *"set by Claude Code, not the user — must not gate"*). Inference silently
+  returns nothing.
+- **NEBOS MCP tokens** live in Firestore `api_tokens` with the **sha256 hash as
+  the doc id** (raw shown once, never recoverable). To identify which token a
+  client holds, sha256 it and match the doc id. Give each consumer its own
+  `label` so it can be revoked independently.
+
 ## Default system prompt (Claude Fable 5)
 
 The local open-source models ship with a baked-in default system prompt:
