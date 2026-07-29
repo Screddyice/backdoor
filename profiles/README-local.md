@@ -353,21 +353,28 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
   num_ctx). The LaunchAgent's `OLLAMA_CONTEXT_LENGTH=32768` only applies to
   models without a baked num_ctx.
 
-## Server-side failover: TMN Hermes gateways (codex → local qwen)
+## Server-side: TMN Hermes gateways
 
-The same failover idea runs on the two production Hermes gateways so they keep
-answering when OpenAI Codex hits a usage/rate limit (HTTP 429). Each gateway
-uses Hermes' native `fallback_providers` chain: the agent tries the chain in
-order when the primary fails on rate-limit, 5xx, or connection errors, then
-returns to Codex on the next request. It is per-request and self-healing, so
-there is no stuck state to reset once Codex recovers.
+> **Updated 2026-07-29.** `hermes-tmn` no longer runs a local fallback. The
+> codex → qwen chain described below now applies to **Hostinger only**. See
+> "Why hermes-tmn has no local fallback" for the measurements behind that.
 
 | Box | Config | Primary | Fallback |
 |---|---|---|---|
 | Hostinger (`neb-brain-hostinger`) | `~/.hermes/config.yaml` | `openai-codex/gpt-5.5` | `qwen3:4b` (only ~3.8 GiB free; `qwen3:8b` needs 5.5 GiB and will not load) |
-| GCP `hermes-tmn` | `~/.hermes/profiles/tmn/config.yaml` | `openai-codex/gpt-5.6-sol` | `qwen3.5:4b` |
+| GCP `hermes-tmn` | `~/.hermes/profiles/tmn/config.yaml` | `openai-codex/gpt-5.5` | **none** — `fallback_providers: []`, no local models installed |
 
-Both point at the box's local Ollama over its OpenAI-compatible surface:
+`hermes-tmn` additionally runs a **separate** LLM path for NEBOS: the
+`hermes-llm-proxy` service on `127.0.0.1:8220`, which NEBOS Cloud Functions call
+at `POST /llm/generate`. That path is **Claude only** (`NEBOS_LLM_BACKEND=claude`,
+`CLAUDE_MODEL=sonnet`, driving Claude Code via `claude -p` under the
+`admin@teamnebula.ai` Max subscription). `HERMES_LLM_FALLBACK_MODEL` is
+deliberately empty, so a Claude failure **raises** rather than silently dropping
+to a weaker model. Do not conflate the two paths — changing the gateway's model
+does not affect NEBOS, and vice versa.
+
+The Hostinger fallback points at the box's local Ollama over its
+OpenAI-compatible surface:
 
 ```yaml
 fallback_providers:
@@ -396,6 +403,70 @@ Apply and verify:
 - The fallback runs in qwen thinking mode, so replies are slow (one to a few
   minutes per turn on these 2-vCPU boxes). That is fine for degraded mode and
   beats a hard 429 failure.
+
+### Why hermes-tmn has no local fallback
+
+Measured on the box 2026-07-29, not extrapolated from the Mac. **The constraint
+is the hardware, not the model** — results scale with parameter count, so
+swapping models cannot fix it:
+
+| Model | Params | `hermes -z` for a one-word reply |
+|---|---|---|
+| `granite4.1:3b` | 3.4B | ~30 min (two Ollama progress checkpoints agreed) |
+| `qwen3.5:4b` | 4.7B | **45 min — hit `timeout 2700`, never answered** |
+| `gemma4:e4b` | 8B MoE | never completed a turn |
+
+Root cause: **~6.4-7.0 tok/s prefill on 2 vCPU**, straight from Ollama's own log
+(`prompt processing, n_tokens = 2048, progress = 0.17, 6.42 tokens per second`).
+Hermes sends ~12,800 tokens even in `focus` mode, so a turn spends ~30 minutes in
+prefill before generating anything. Generation adds ~2.8 tok/s on top.
+
+Every available lever was already applied and none of it mattered:
+`OLLAMA_CONTEXT_LENGTH=16384`, `OLLAMA_KEEP_ALIVE=-1`,
+`agent.coding_context: focus` (17k → 12.8k), `agent.reasoning_effort: none`.
+
+**Measurement trap:** short (~375-token) prompts report 116-141 tok/s prefill
+because they are largely cache hits. That number is not real and it cost two
+wasted config detours. Trust Ollama's `prompt processing` log lines on a
+full-size prompt, never per-call timing on toy prompts.
+
+Also: 32k context is unaffordable here — a 3.4B model with a 32k KV cache left
+only 185 MB free on 7.9 GB. 16k is the ceiling.
+
+`e2-standard-4` does **not** qualify as a fix: doubling cores turns 30 minutes
+into ~15. Only a GPU (`g2-standard-4` + L4, ~$511-650/mo) clears the ~10s target,
+which is poor economics for a bot seeing ~1 event/week. Ollama on `hermes-tmn` is
+therefore **stopped and disabled**, with zero models installed.
+
+### hermes-tmn gotchas that cost real time
+
+- **`auth status` lies.** It reported `openai-codex: logged in` while the
+  credential pool held **0** entries and the stored token had no refresh token at
+  all. It did the same for `anthropic`. Always check **`auth list`** for a pooled
+  credential, or read `auth.json` directly.
+- **`model.default` must be provider-prefixed**: `openai-codex/gpt-5.5`. A bare
+  `gpt-5.4` fails in ~12s with only `hermes -z: no final response was produced`
+  and **nothing in errors.log**. Fast failure with no logged reason = suspect the
+  model string first. `gpt-5.6` returns *"not supported when using Codex with a
+  ChatGPT account"*.
+- **Two boxes must not share one OAuth lineage.** The July outage was Hostinger's
+  30-minute `codex-keepalive` rotating a refresh token that `hermes-tmn` also
+  held, invalidating tmn's copy every cycle (`refresh_token_reused`). Fixed by a
+  fresh device-code login giving tmn its own lineage. The `label` field is
+  cosmetic and read `oauth-2` on both boxes — **compare refresh-token
+  fingerprints, not labels.**
+- **The gateway reads `~/.hermes/profiles/tmn/config.yaml`** via `HERMES_HOME`,
+  not `~/.hermes/config.yaml`. A login or edit without `--profile tmn` lands in
+  the default profile the gateway never reads, and appears to do nothing.
+- **`CLAUDE_CODE_OAUTH_TOKEN` cannot authenticate Hermes.** It appears in the
+  anthropic provider's `env_vars`, and `auth status` will say `logged in`, but
+  Hermes blocklists it by design (`tests/hermes_cli/test_auth_provider_gate.py`:
+  *"set by Claude Code, not the user — must not gate"*). Inference silently
+  returns nothing.
+- **NEBOS MCP tokens** live in Firestore `api_tokens` with the **sha256 hash as
+  the doc id** (raw shown once, never recoverable). To identify which token a
+  client holds, sha256 it and match the doc id. Give each consumer its own
+  `label` so it can be revoked independently.
 
 ## Default system prompt (Claude Fable 5)
 
