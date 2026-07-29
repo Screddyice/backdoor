@@ -154,6 +154,20 @@ The model name in `PROVIDER_MODEL` doesn't match what the provider expects. Chec
 **Responses feel slow**
 Switch to Groq — it's the fastest inference available and has a free tier.
 
+**Local model on a small CPU box takes minutes per turn**
+This is expected, and no amount of config fixes it. A coding-agent harness sends a large prompt every turn (tool schemas, system prompt, context files — commonly 12-17k tokens), and CPU-only prefill is the bottleneck.
+
+Measured on a 2-vCPU / 8 GB cloud VM with no GPU: **~6.4-7.0 tok/s prefill**, which is ~30 minutes before the model emits its first token, plus ~2.8 tok/s generation. A 3.4B model and a 4.7B model both landed there; a bigger model is strictly worse, since prefill scales with parameter count.
+
+Things that do *not* rescue it: raising `num_ctx`, keeping the model resident, disabling thinking mode, or trimming the prompt (12,800 tokens at 7 tok/s is still ~30 minutes). Doubling vCPUs only halves it.
+
+Two caveats worth knowing before you benchmark your own box:
+
+- **Short test prompts lie.** A ~375-token prompt can report 116-141 tok/s because it's largely a cache hit. Read Ollama's `prompt processing` log lines on a *full-size* prompt instead of timing a toy request.
+- **Watch RAM against your context window.** A 3.4B model with a 32k KV cache left only 185 MB free on a 7.9 GB box. 16k was the practical ceiling there.
+
+If you want a local model for interactive agent work, budget for a GPU. For CPU-only boxes, a hosted provider is the realistic answer.
+
 **Nothing is logged**
 Check `proxy.log` in the project directory. If it's empty, the proxy didn't start at all — run `uv run uvicorn server:app` directly to see the error.
 
