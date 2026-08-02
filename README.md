@@ -181,6 +181,42 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 ---
 
+## Offline failover (hybrid mode)
+
+In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
+
+**The breaker opens on exactly one condition: this machine is offline.** That is deliberately narrow, because failing over is not free — it loads a local model into Ollama, and on a machine that also runs a local council (see [llm-jury](https://github.com/Screddyice/llm-jury)) two GPU consumers at once will fight for memory.
+
+So the trigger set is tight:
+
+| Upstream behavior | Failover? | Why |
+|---|---|---|
+| Any HTTP response (`429`, `529`, `500`…) | **No** | A status code proves the request reached Anthropic and was answered. A usage limit is not a reachability problem, and hiding it behind a local model both masks a real signal and takes the GPU. The error is relayed so your client's own retry/backoff runs. |
+| Transport error, host still online | **No** | Anthropic specifically is unreachable. Relayed verbatim so a provider outage stays visible. |
+| Transport error, host offline | **Yes** | Nothing else is reachable either — local is the only way the session survives. |
+| `401` / `403` | **No** | The network is fine and a credential is broken. Masking that would hide a revoked key indefinitely. |
+
+Reaching the failure threshold is necessary but not sufficient: a TCP connectivity probe to a public address gets the final say, and it is re-taken each time (never cached), costing one probe per run of failures rather than one per request.
+
+**Coordination with other local-GPU consumers.** Every breaker transition is published atomically to `~/.backdoor/failover-state.json`:
+
+```json
+{ "failover_active": true, "reason": "ConnectError", "updated_at": 1754130000.0, "pid": 4242 }
+```
+
+llm-jury reads that file and disables itself while failover is active, so the router and the council never contend for the same VRAM. Writing is best-effort — a router that cannot write the file still routes, and a missing or unreadable file reads as "not failing over".
+
+| Setting | Default | Effect |
+|---|---|---|
+| `failover_to_local` | `true` | Master switch for hybrid-mode failover |
+| `failover_threshold` | `3` | Consecutive transport errors before the connectivity probe runs |
+| `failover_window_seconds` | `120` | Failures outside this window start a fresh run |
+| `failover_probe_seconds` | `60` | How often an open breaker retries upstream (half-open) |
+| `BACKDOOR_FAILOVER_STATUSES` | *(empty)* | Comma-separated HTTP statuses to restore as triggers, e.g. `429,529` |
+| `BACKDOOR_FAILOVER_STATE` | `~/.backdoor/failover-state.json` | Where breaker state is published |
+
+---
+
 <div align="center">
 
 **Star this if you think the best coding agent should work with any model.**

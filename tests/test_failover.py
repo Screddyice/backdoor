@@ -1,6 +1,23 @@
-"""Unit tests for the cloud→local failover breaker."""
+"""Unit tests for the cloud→local failover breaker.
 
-from src.proxy.failover import FailoverBreaker
+The breaker opens on exactly one condition: this host is offline. Tests inject
+connectivity through `online_fn` rather than touching the network, and redirect
+the published state file so a test run never writes to ~/.backdoor.
+"""
+
+import json
+import tempfile
+from pathlib import Path
+
+from src.proxy.failover import (
+    FAILOVER_STATUSES,
+    FailoverBreaker,
+    _statuses_from_env,
+    internet_reachable,
+)
+
+_STATE_DIR = Path(tempfile.mkdtemp(prefix="backdoor-failover-state-"))
+_state_seq = iter(range(1_000_000))
 
 
 class Clock:
@@ -13,13 +30,19 @@ class Clock:
 
 def make(clock, **kw):
     notes = []
+    state_path = _STATE_DIR / f"state-{next(_state_seq)}.json"
     br = FailoverBreaker(
         threshold=kw.pop("threshold", 3),
         window=kw.pop("window", 120.0),
         probe_interval=kw.pop("probe_interval", 60.0),
         now_fn=clock,
         notify_fn=lambda title, msg: notes.append(msg),
+        # Offline by default: these exercise breaker mechanics, and the breaker
+        # only has mechanics to exercise when the host has no internet.
+        online_fn=kw.pop("online_fn", lambda: False),
+        state_path=kw.pop("state_path", state_path),
     )
+    br.state_path = state_path
     return br, notes
 
 
@@ -36,10 +59,10 @@ def test_opens_after_threshold_consecutive_failures():
 def test_success_resets_consecutive_count():
     clock = Clock()
     br, _ = make(clock)
-    br.record_failure("HTTP 429")
-    br.record_failure("HTTP 429")
-    br.record_success()                                 # normal backpressure recovered
-    assert br.record_failure("HTTP 429") is False       # count restarted at 1
+    br.record_failure("ConnectError")
+    br.record_failure("ConnectError")
+    br.record_success()                                 # upstream recovered
+    assert br.record_failure("ConnectError") is False   # count restarted at 1
     assert not br.open
 
 
@@ -71,7 +94,7 @@ def test_probe_success_closes_and_notifies():
     clock = Clock()
     br, notes = make(clock)
     for _ in range(3):
-        br.record_failure("HTTP 529")
+        br.record_failure("ConnectError")
     assert br.open
     br.record_success()
     assert not br.open
@@ -95,6 +118,108 @@ def test_closed_always_allows_upstream():
     br, _ = make(clock)
     for _ in range(10):
         assert br.allow_upstream() is True
+
+
+# ── Only genuine internet loss may open the breaker ──────────────────────────
+# Opening the breaker claims the local GPU (a qwen tier, up to ~13 GB) in the
+# same Ollama server the llm-jury council needs. That is only justified when a
+# session has no other way to survive, i.e. when this host is actually offline.
+
+
+def test_does_not_open_while_this_host_is_online():
+    """Anthropic unreachable but the internet fine: relay, do not claim the GPU."""
+    clock = Clock()
+    br, notes = make(clock, online_fn=lambda: True)
+    for _ in range(10):
+        assert br.record_failure("ConnectError") is False
+    assert not br.open
+    assert notes == []                                  # no "routing to local" alert
+
+
+def test_online_refusal_resets_the_count_so_probes_are_not_per_request():
+    """Reaching the threshold while online costs one probe, not one per request."""
+    probes = []
+    clock = Clock()
+    br, _ = make(clock, online_fn=lambda: probes.append(1) or True)
+    for _ in range(9):
+        br.record_failure("ConnectError")
+    assert not br.open
+    assert len(probes) == 3                             # once per run of `threshold`
+
+
+def test_offline_after_being_online_still_opens():
+    """The connectivity verdict is re-taken, not cached from an earlier check."""
+    clock = Clock()
+    online = {"v": True}
+    br, _ = make(clock, online_fn=lambda: online["v"])
+    for _ in range(3):
+        br.record_failure("ConnectError")
+    assert not br.open
+    online["v"] = False
+    for _ in range(3):
+        br.record_failure("ConnectError")
+    assert br.open
+
+
+def test_http_statuses_are_not_triggers_by_default():
+    """A 429/529 is proof the network works — it must never arm failover."""
+    assert FAILOVER_STATUSES == set()
+
+
+def test_statuses_can_be_restored_via_env(monkeypatch):
+    monkeypatch.setenv("BACKDOOR_FAILOVER_STATUSES", "429, 529 ,junk")
+    assert _statuses_from_env() == {429, 529}
+    monkeypatch.setenv("BACKDOOR_FAILOVER_STATUSES", "")
+    assert _statuses_from_env() == set()
+
+
+def test_internet_probe_reports_offline_when_no_probe_connects():
+    # TEST-NET-1 (RFC 5737) is guaranteed unroutable, with a short timeout so a
+    # blackholing network cannot stall the suite.
+    assert internet_reachable(probes=(("192.0.2.1", 443),), timeout=0.25) is False
+
+
+# ── Published state: the handshake llm-jury reads ────────────────────────────
+
+
+def _state(br):
+    return json.loads(br.state_path.read_text(encoding="utf-8"))
+
+
+def test_state_file_starts_inactive():
+    clock = Clock()
+    br, _ = make(clock)
+    assert _state(br)["failover_active"] is False
+
+
+def test_state_file_publishes_open_then_close():
+    clock = Clock()
+    br, _ = make(clock)
+    for _ in range(3):
+        br.record_failure("ConnectError")
+    published = _state(br)
+    assert published["failover_active"] is True
+    assert published["reason"] == "ConnectError"
+    br.record_success()
+    assert _state(br)["failover_active"] is False
+
+
+def test_state_file_stays_inactive_when_online():
+    """The file tracks GPU ownership, so a non-opening failure must not set it."""
+    clock = Clock()
+    br, _ = make(clock, online_fn=lambda: True)
+    for _ in range(5):
+        br.record_failure("ConnectError")
+    assert _state(br)["failover_active"] is False
+
+
+def test_unwritable_state_path_does_not_break_the_breaker():
+    """Publishing is best-effort: a router that cannot write must still route."""
+    clock = Clock()
+    br, _ = make(clock, state_path=Path("/proc/nonexistent/state.json"))
+    for _ in range(3):
+        br.record_failure("ConnectError")
+    assert br.open
 
 
 # ── Failover ladder (size → local tier) ──────────────────────────────────────

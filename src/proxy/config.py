@@ -31,11 +31,16 @@ class Settings(BaseSettings):
     router_mode: str = "profile"
     anthropic_upstream: str = "https://api.anthropic.com"
 
-    # Cloud→local failover (hybrid mode only): when the real Anthropic API is
-    # unreachable / usage-limited / overloaded for `failover_threshold`
-    # consecutive requests within `failover_window_seconds`, serve passthrough
-    # /v1/messages traffic from a local profile instead of failing, probing
-    # upstream every `failover_probe_seconds` until it recovers.
+    # Cloud→local failover (hybrid mode only): when THIS HOST IS OFFLINE —
+    # `failover_threshold` consecutive transport errors within
+    # `failover_window_seconds`, confirmed by a connectivity probe — serve
+    # passthrough /v1/messages traffic from a local profile instead of failing,
+    # probing upstream every `failover_probe_seconds` until it recovers.
+    #
+    # Usage limits (429) and overloads (529) are deliberately NOT triggers: they
+    # arrive as HTTP responses, which prove the network works. Failing over on
+    # them loaded a qwen tier into the Ollama server the llm-jury council needs
+    # and started a fight for GPU memory. See src/proxy/failover.py.
     #
     # Which local profile is picked by the session's estimated input tokens
     # (see FAILOVER_LADDER): a small session stays on the fast 4B, a big one
