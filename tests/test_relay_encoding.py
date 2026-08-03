@@ -1,5 +1,11 @@
 """Regression tests for content-encoding handling on the failover error-relay.
 
+NOTE: ``FAILOVER_STATUSES`` is empty by default now — an HTTP status proves the
+network works, so no status triggers failover and a 429 is simply relayed by the
+streaming passthrough. These tests therefore opt the status back in (as
+``BACKDOOR_FAILOVER_STATUSES`` would) to keep covering the decoded-relay path,
+which is still reachable for anyone who restores that setting.
+
 When Anthropic returns a below-threshold FAILOVER_STATUS (e.g. a lone 429 of
 normal rate-limit backpressure), the router relays that error to the client
 verbatim so the client's own retry/backoff still runs. The upstream body is
@@ -49,9 +55,14 @@ def _gzip_429_upstream() -> httpx.AsyncClient:
 
 
 @pytest.fixture
-def app_with_gzip_429():
+def app_with_gzip_429(monkeypatch):
     """FastAPI app in hybrid mode whose upstream returns a below-threshold
-    gzip 429 (threshold=3 ⇒ a single 429 is relayed verbatim, not failed over)."""
+    gzip 429 (threshold=3 ⇒ a single 429 is relayed verbatim, not failed over).
+
+    429 is opted back into the trigger set: `routes` binds the name at import, so
+    the patch has to land on `routes`, not on `failover`.
+    """
+    monkeypatch.setattr(routes, "FAILOVER_STATUSES", {429})
     routes._upstream_client = _gzip_429_upstream()
     routes._breaker = None
     app = create_app()
