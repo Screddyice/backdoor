@@ -185,6 +185,63 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
+> **Point Claude Code at the router, or none of this runs.** Failover lives in the request path, so a session started with `ANTHROPIC_BASE_URL` unset gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the base URL first.
+
+### Bare mode: what the local model actually receives
+
+A failed-over request does not reach the local model as Claude Code sent it. Backdoor strips the harness off first, and this is the change that decides which model you can afford to run.
+
+Measure an ordinary session and the reason becomes obvious. With the usual MCP servers attached, the system prompt and tool definitions alone came to roughly 286K tokens on this machine, before a word of conversation. Two model generations of this failover ladder were shrunk to cope with that number: the tier went 9B down to 4B in July 2025 after a 9B spent about five minutes per turn prefilling a 186K-token session and then returned a 500. The context was treated as fixed and the model kept getting smaller.
+
+Bare mode attacks the other term. Before the request goes to Ollama, Backdoor drops the system prompt (replacing it with two sentences of orientation), drops tool definitions, truncates tool results in the transcript to a character budget, and replaces images with a placeholder. Your conversation stays. On a representative request that arrived carrying a full harness and an 80KB file read:
+
+```
+50,439 tokens  ->  1,196 tokens        (42x)
+answer in 3.6s on qwen3.5:27b, ending in a real tool call
+```
+
+That is what lets the default tier be a 27B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 27B in place, and you rebuild the original failure on a much larger model.
+
+**Local tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob` and `Grep` touch nothing but this disk, so they keep working while the host is offline, and keeping them means the failover model can carry on doing work instead of only talking about it. Every `mcp__*` tool is a remote integration and is dead for exactly as long as the breaker is open. That split also happens to be where the weight is: the ~286K tokens of definitions came from MCP servers, not from the dozen local tools, so dropping them removes nearly all of the cost and nearly none of the offline capability.
+
+Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai` and cannot work offline, but local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
+
+**The tier must accept tool definitions.** This is a hard pairing, not a preference. `deepseek-r1` at any runnable size does not: Ollama answers a request carrying tools with `does not support tools`, HTTP 400, killing the session failover exists to save. If you swap the tier for a model without tool support, set `failover_keep_tools=""` at the same time.
+
+### Sizing the failover tier
+
+Ollama caps residency by model count, never by bytes, and Metal allocations are wired and cannot be paged out. Over-commit and this host panics instead of raising OOM. Measure with `ollama ps`, which reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
+
+On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache:
+
+| Tier | Params | On disk | Resident | Tools | Notes |
+|---|---|---|---|---|---|
+| `qwen3.5:27b-bare` | 27.4B | 16.1 GB | **15 GB** | yes | Default, 32K window |
+| `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
+| `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
+
+The 27B costing less than the 14B is not a typo. int4 quantization plus qwen3.5's smaller KV wins on both terms, so you get roughly double the parameters, tool calling, and 5GB back. Measured by memory delta across the load: free 20.9GB to 6.0GB, wired 4.2GB to 18.7GB, agreeing with `ollama ps`.
+
+Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
+
+Headroom exists because llm-jury reads `~/.backdoor/failover-state.json` and stands down while failover is active, so nothing else holds the GPU. Ollama caps residency by model count and never by bytes, and Metal allocations are wired and cannot be paged out, so over-committing panics this host rather than raising OOM. It did, twice, on 2026-07-31.
+
+The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Verified that this does not break tool calling on qwen3.5, with both settings emitting a correct call. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+
+### Building a bare tag
+
+Build from the **registry** tag, never from a local one. `modelfiles/build.sh` appends a ~43K-token system prompt to every `*.Modelfile` it builds and defaults to building all of them, so every local `qwen3.5:*` tag carries 186,647 bytes of baked prompt. `FROM` inherits it, which makes a "bare" model that is nothing of the sort. The failure is not subtle but it is easy to miss: the first attempt here answered from the baked prompt's tool vocabulary and invented a `weather_fetch` tool the request never defined.
+
+Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` cannot glob. Check any new tag with `ollama show --system <tag>`, which must return nothing.
+
+### When `ollama pull` will not finish
+
+`scripts/fetch-ollama-model.sh <model> <tag> [jobs]` pulls a library model by fetching its blobs directly, verifying each SHA-256, and writing the manifest last so a half-downloaded model can never appear in `ollama list`.
+
+Reach for it when a pull stalls. `qwen3.5:27b-int4` is packaged as **1,193 layers**, 1,184 of them per-tensor, and `ollama pull` never finished it here: it transferred ~9MB, discarded the chunk, and restarted, twice over 15 minutes each. Neither disk (152GB free) nor bandwidth was the cause, since a ranged `curl` against the same blob sustained 20MB/s throughout. The problem is many small sequential transfers on a connection that drops, with `OLLAMA_MAX_TRANSFER_STREAMS=1` forbidding any overlap, so one stall halts everything.
+
+Concurrency is the fix, because the cost is per-request latency rather than bandwidth. The script finished the same 16.1GB in about two minutes with 12 workers. It resumes: already-present blobs are skipped, so rerun it after an interruption.
+
 **The breaker opens on exactly one condition: this machine is offline.** That is deliberately narrow, because failing over is not free — it loads a local model into Ollama, and on a machine that also runs a local council (see [llm-jury](https://github.com/Screddyice/llm-jury)) two GPU consumers at once will fight for memory.
 
 So the trigger set is tight:
@@ -209,6 +266,9 @@ llm-jury reads that file and disables itself while failover is active, so the ro
 | Setting | Default | Effect |
 |---|---|---|
 | `failover_to_local` | `true` | Master switch for hybrid-mode failover |
+| `failover_bare` | `true` | Strip the harness off a failed-over request. Turn off only together with reverting the tier to a 4B |
+| `failover_keep_tools` | `local` | What survives the tool list. `local` keeps everything not prefixed `mcp__`; add comma-separated substrings to keep specific MCP tools; empty keeps none |
+| `failover_tool_result_chars` | `2000` | Per-tool-result character budget in the stripped transcript |
 | `failover_threshold` | `3` | Consecutive transport errors before the connectivity probe runs |
 | `failover_window_seconds` | `120` | Failures outside this window start a fresh run |
 | `failover_probe_seconds` | `60` | How often an open breaker retries upstream (half-open) |

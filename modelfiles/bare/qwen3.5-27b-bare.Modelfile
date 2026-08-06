@@ -1,0 +1,38 @@
+# qwen3.5:27b-bare — the cloud→local failover brain (profiles/
+# local-failover-qwen27.env). "bare" is the whole point: NO baked system prompt,
+# 32K window, and a model that can still call tools.
+#
+# THIS DIRECTORY EXISTS TO STAY OUT OF ../build.sh's GLOB, and that is not
+# theoretical. build.sh appends prompts/claude-fable-5-system.md as a SYSTEM
+# directive to every *.Modelfile it builds and defaults to building ALL of them.
+# Measured 2026-08-06: every local qwen3.5 tag (9b, 4b, and each -64k/-128k/
+# -256k failover tier) carries 186,647 bytes — roughly 43K tokens — of baked
+# system prompt as a result. A subdirectory does not match `*.Modelfile`, so a
+# bare `./build.sh` cannot reach this file.
+#
+# BUILD FROM THE REGISTRY TAG, NEVER FROM A LOCAL ONE. `FROM` inherits the
+# base's SYSTEM directive, so `FROM qwen3.5:9b` produces a "bare" model carrying
+# all 43K tokens. That happened on the first attempt here and was not subtle:
+# the model answered from the baked prompt's tool vocabulary, inventing a
+# `weather_fetch` tool that the request never defined. qwen3.5:27b-int4 is a
+# pristine registry pull (verified: `ollama show --system` returns 0 bytes), so
+# this tag inherits nothing.
+#
+#   ollama create qwen3.5:27b-bare -f modelfiles/bare/qwen3.5-27b-bare.Modelfile
+#
+# Sizing, MEASURED on this 36GB M5 Max rather than computed — free RAM 20.9GB →
+# 6.0GB and wired 4.2GB → 18.7GB across the load, i.e. ~15GB for the model,
+# agreeing with `ollama ps`. That is 5GB LESS than deepseek-r1:14b at 20GB,
+# despite roughly double the parameters: int4 plus qwen3.5's smaller KV wins
+# twice. Against the ~27GB Metal wired ceiling it leaves real headroom, which
+# matters because wired pages cannot be evicted and over-committing them panics
+# this host instead of raising OOM (it did, twice, on 2026-07-31).
+#
+# Why 32K and not the model's native 262144: KV is charged num_ctx x
+# OLLAMA_NUM_PARALLEL, so the window is the expensive knob. Bare mode keeps the
+# prompt small enough that 32K is generous, and FAILOVER_LADDER hands anything
+# larger to the 4B 256K tier. Note `ollama ps` displays the model's native
+# context in its CONTEXT column regardless; `ollama show --parameters` is what
+# confirms num_ctx actually applied.
+FROM qwen3.5:27b-int4
+PARAMETER num_ctx 32768

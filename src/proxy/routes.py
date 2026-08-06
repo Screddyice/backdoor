@@ -14,6 +14,7 @@ from starlette.background import BackgroundTask
 from .config import (
     MODEL_ROUTES, Settings, get_settings, load_profile_settings, pick_failover_profile,
 )
+from .bare import make_bare, parse_keep
 from .failover import FAILOVER_STATUSES, FailoverBreaker
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
@@ -214,6 +215,9 @@ async def create_message(
 ):
     body = await request.body()
     client: ProviderClient | None = None
+    # Set only when the failover path successfully stripped the harness; it then
+    # replaces the parsed request below so the stripped version is what is sent.
+    bare_req: MessagesRequest | None = None
 
     if settings.router_mode == "hybrid":
         model = _model_from_body(body)
@@ -226,24 +230,39 @@ async def create_message(
             if relay is not None:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
                 return relay
-            # Failed over: size the local tier to the session so a big session
-            # keeps its context instead of being truncated to fit the 4B.
+            # Failed over. Strip the harness FIRST, then size the tier: what the
+            # local model has to prefill is the STRIPPED request, so that is what
+            # should choose the profile. Sizing on the raw body would escalate to
+            # a big-window tier for a session that, once bare, fits the default
+            # one comfortably.
             profile = settings.failover_profile
-            est = None
+            est = raw_est = None
             try:
                 fr = MessagesRequest.model_validate_json(body)
+                raw_est = count_messages(fr.messages, fr.system, fr.tools)
+                if settings.failover_bare:
+                    stripped = make_bare(
+                        fr,
+                        keep=parse_keep(settings.failover_keep_tools),
+                        tool_result_chars=settings.failover_tool_result_chars,
+                    )
+                    bare_req = stripped  # only on success: make_bare is pure
+                    fr = stripped
                 est = count_messages(fr.messages, fr.system, fr.tools)
                 profile = pick_failover_profile(est)
             except Exception:
-                pass
+                # Never let stripping break the failover itself — an unstripped
+                # answer beats no answer. The floor profile still serves it.
+                logger.exception("bare-mode/sizing failed; falling back to %s", profile)
             logger.warning(
-                "⇢ FAILOVER [%s → %s in≈%s] %s (%s)",
-                model or "?", profile, est, request.url.path, get_breaker(settings).reason,
+                "⇢ FAILOVER [%s → %s in≈%s (raw %s)] %s (%s)",
+                model or "?", profile, est, raw_est, request.url.path,
+                get_breaker(settings).reason,
             )
         settings = load_profile_settings(profile)
         client = _get_profile_client(profile, settings)
 
-    req = MessagesRequest.model_validate_json(body)
+    req = bare_req if bare_req is not None else MessagesRequest.model_validate_json(body)
 
     fast = _check_optimizations(req, settings)
     if fast:

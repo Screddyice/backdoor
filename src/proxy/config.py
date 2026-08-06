@@ -43,15 +43,28 @@ class Settings(BaseSettings):
     # and started a fight for GPU memory. See src/proxy/failover.py.
     #
     # Which local profile is picked by the session's estimated input tokens
-    # (see FAILOVER_LADDER): a small session stays on the fast 4B, a big one
-    # escalates to a 9B tier whose context window actually fits it. This is the
-    # "pick the appropriate local model for the use case" behavior — for
-    # failover the use-case dimension that matters is context size.
+    # (see FAILOVER_LADDER), measured AFTER bare-mode stripping — the size that
+    # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
-    failover_profile: str = "local-qwen35"  # floor / smallest tier
+    failover_profile: str = "local-failover-qwen27"  # default tier
     failover_threshold: int = 3
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
+
+    # Bare mode: strip the Claude Code harness (system prompt, tool definitions,
+    # tool results, images) off a failed-over request, keeping only the tools
+    # named in `failover_keep_tools`. See src/proxy/bare.py for why this is the
+    # load-bearing change — it is what lets the failover tier be a 14B instead
+    # of a 4B without repeating the 2026-07-09 prefill regression.
+    # "local" keeps every tool NOT prefixed `mcp__`: Read, Edit, Bash, Glob and
+    # Grep all work with no network, so the failover model can keep doing work,
+    # while remote MCP integrations (which are dead for as long as the breaker
+    # is open, and which are where the ~286K tokens of definitions came from)
+    # are dropped. Set to "" for a tier that cannot accept tool definitions at
+    # all — deepseek-r1 makes Ollama 400 the request. See src/proxy/bare.py.
+    failover_bare: bool = True
+    failover_keep_tools: str = "local"
+    failover_tool_result_chars: int = 2000
 
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True
@@ -91,18 +104,21 @@ MODEL_ROUTES: dict[str, str] = {
 # the failed-over session. Each entry is (max_input_tokens_inclusive, profile);
 # the first entry whose bound is >= the estimated input token count wins, else
 # the last. Bounds sit below each tag's real window to leave room for the reply.
-# All tiers are the 4B (switched from 9B 2026-07-09). A 9B cold-prefilling a
-# failed-over session ran 3.5+ min/turn at ~71K tokens and 500'd on ~186K,
-# which made offline `/model qwen` effectively unresponsive. The 4B prefills the
-# same context several times faster; memory is only modestly lower (measured
-# 4b-128k ~9GB vs 9b ~12GB, 4b-256k ~13GB vs 9b ~15GB: KV dominates at these
-# windows, so the real win is prefill speed, not memory), and both fit 36GB.
-# Keeping the whole ladder on one
-# model family also means a wrapper session (4B) and a failover session (4B)
-# never force a 9B+4B coexistence — the memory blowup that stalled the plane.
+#
+# The bounds are measured AFTER bare-mode stripping, which is what makes this
+# ladder look so different from the all-4B one it replaces. That ladder existed
+# because the harness made every failed-over session enormous: the tiers were
+# 64K/128K/256K windows on a 4B, and the model was shrunk 9B → 4B on 2026-07-09
+# purely to keep prefill tolerable at that size. Stripping the harness attacks
+# the context instead of the model, so the common case is now a small prompt on
+# a much stronger model.
+#
+# The 4B 256K tier is kept as the escape hatch. Bare mode bounds the system
+# prompt and tool traffic but NOT the conversation, and a long enough transcript
+# still overflows the 27B's 32K window — at which point a weaker model that
+# retains the session beats a stronger one that truncates it.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (52_000, "local-qwen35"),          # qwen3.5:4b-64k   (~65K window)
-    (115_000, "local-failover-128k"),  # qwen3.5:4b-128k  (~131K window)
+    (28_000, "local-failover-qwen27"),      # qwen3.5:27b-bare (32K window, tools)
     (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
 ]
 
