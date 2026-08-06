@@ -1,0 +1,27 @@
+# deepseek-r1:14b-bare — the cloud→local failover brain (profiles/
+# local-failover-deepseek.env). "bare" is the whole point: NO baked system
+# prompt, 32K window.
+#
+# THIS DIRECTORY EXISTS TO STAY OUT OF ../build.sh's GLOB. build.sh appends
+# prompts/claude-fable-5-system.md (~43K tokens) as a SYSTEM directive to every
+# *.Modelfile it builds, and defaults to building ALL of them. Baking 43K tokens
+# into a model whose entire reason for existing is a small prompt would undo
+# this change, and it would do it silently — the tag would still load and still
+# answer, just slowly and with less room for the conversation. A subdirectory
+# does not match `*.Modelfile`, so a bare `./build.sh` cannot reach this file.
+#
+# Build (raw ollama create, never build.sh):
+#   ollama create deepseek-r1:14b-bare -f modelfiles/bare/deepseek-r1-14b-bare.Modelfile
+#
+# Sizing on this 36GB M5 Max, at OLLAMA_NUM_PARALLEL=2 with flash attention and
+# a q8_0 KV cache: ~9.0GB of weights plus ~6.3GB of KV (32K x 2 slots at ~96KB
+# per token for a 48-layer/8-KV-head model) ≈ 16GB resident. That leaves real
+# headroom under the ~27GB Metal wired ceiling, which matters because wired
+# pages cannot be evicted — over-committing them panics this host rather than
+# raising OOM (it did, twice, on 2026-07-31).
+#
+# Why 32K and not more: KV is charged num_ctx x NUM_PARALLEL, so the window is
+# the expensive knob. Bare mode keeps the prompt small enough that 32K is
+# generous, and FAILOVER_LADDER hands anything larger to the 4B 256K tier.
+FROM deepseek-r1:14b
+PARAMETER num_ctx 32768

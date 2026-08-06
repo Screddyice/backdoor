@@ -185,6 +185,40 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
+> **Point Claude Code at the router, or none of this runs.** Failover lives in the request path, so a session started with `ANTHROPIC_BASE_URL` unset gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the base URL first.
+
+### Bare mode: what the local model actually receives
+
+A failed-over request does not reach the local model as Claude Code sent it. Backdoor strips the harness off first, and this is the change that decides which model you can afford to run.
+
+Measure an ordinary session and the reason becomes obvious. With the usual MCP servers attached, the system prompt and tool definitions alone came to roughly 286K tokens on this machine, before a word of conversation. Two model generations of this failover ladder were shrunk to cope with that number: the tier went 9B down to 4B in July 2025 after a 9B spent about five minutes per turn prefilling a 186K-token session and then returned a 500. The context was treated as fixed and the model kept getting smaller.
+
+Bare mode attacks the other term. Before the request goes to Ollama, Backdoor drops the system prompt (replacing it with two sentences of orientation), drops tool definitions, truncates tool results in the transcript to a character budget, and replaces images with a placeholder. Your conversation stays. On a representative request that arrived carrying a full harness and an 80KB file read:
+
+```
+50,179 tokens  ->  1,096 tokens        (45x)
+answer in 4.2s on deepseek-r1:14b
+```
+
+That is what lets the default tier be a 14B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 14B in place, and you rebuild the original failure on a larger model.
+
+**No tools reach the failover model, on purpose.** Mem0 looks like the one worth keeping, and it is the wrong answer twice over. The breaker opens only when this host is offline, so a cloud-backed memory tool cannot work in the one situation where it would be called. And `deepseek-r1:14b` makes Ollama reject any request carrying tool definitions at all (`does not support tools`, HTTP 400), which kills the session failover exists to save. Local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
+
+### Sizing the failover tier
+
+Ollama caps residency by model count, never by bytes, and Metal allocations are wired and cannot be paged out. Over-commit and this host panics instead of raising OOM. Measure with `ollama ps`, which reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
+
+On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache:
+
+| Tier | On disk | Resident | Window | Notes |
+|---|---|---|---|---|
+| `deepseek-r1:14b-bare` | 9.0 GB | **20 GB** | 32K | Default. Arithmetic predicted 16GB; the compute graph accounts for the rest, which is why the number here is measured |
+| `qwen3.5:4b-256k` | 3.4 GB | ~13 GB | 262K | Escape hatch for a transcript that overflows 32K |
+
+The ceiling on this box is the 32B class at a 16K window, around 25GB, and it sits within about 2GB of what kernel-panicked this machine twice on 2026-07-31. A 70B is not an option: 42.5GB of weights exceeds total RAM. The 20GB default is safe because llm-jury stands down while failover is active, so nothing else is holding the GPU.
+
+`deepseek-r1` is a reasoning model, so the profile sets `PROVIDER_REASONING_EFFORT=none` to suppress `<think>` traces. Treat that as load-bearing rather than cosmetic: those traces reintroduce the same latency the 9B was reverted for. Re-verify it after an Ollama upgrade.
+
 **The breaker opens on exactly one condition: this machine is offline.** That is deliberately narrow, because failing over is not free — it loads a local model into Ollama, and on a machine that also runs a local council (see [llm-jury](https://github.com/Screddyice/llm-jury)) two GPU consumers at once will fight for memory.
 
 So the trigger set is tight:
@@ -209,6 +243,9 @@ llm-jury reads that file and disables itself while failover is active, so the ro
 | Setting | Default | Effect |
 |---|---|---|
 | `failover_to_local` | `true` | Master switch for hybrid-mode failover |
+| `failover_bare` | `true` | Strip the harness off a failed-over request. Turn off only together with reverting the tier to a 4B |
+| `failover_keep_tools` | *(empty)* | Comma-separated substrings of tool names to keep. Empty means no tools reach the local model |
+| `failover_tool_result_chars` | `2000` | Per-tool-result character budget in the stripped transcript |
 | `failover_threshold` | `3` | Consecutive transport errors before the connectivity probe runs |
 | `failover_window_seconds` | `120` | Failures outside this window start a fresh run |
 | `failover_probe_seconds` | `60` | How often an open breaker retries upstream (half-open) |
