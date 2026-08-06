@@ -226,19 +226,28 @@ def test_unwritable_state_path_does_not_break_the_breaker():
 from src.proxy.config import pick_failover_profile, FAILOVER_LADDER
 
 
-def test_ladder_small_session_stays_on_4b():
-    assert pick_failover_profile(0) == "local-qwen35"
-    assert pick_failover_profile(52_000) == "local-qwen35"
+def test_ladder_normal_session_gets_the_strong_tool_capable_tier():
+    """The common case after bare-mode stripping: a small prompt, so the
+    strongest local model rather than the widest-window one."""
+    assert pick_failover_profile(0) == "local-failover-qwen27"
+    assert pick_failover_profile(28_000) == "local-failover-qwen27"
 
 
-def test_ladder_medium_session_escalates_to_9b_128k():
-    assert pick_failover_profile(52_001) == "local-failover-128k"
-    assert pick_failover_profile(115_000) == "local-failover-128k"
-
-
-def test_ladder_large_session_escalates_to_9b_256k():
-    assert pick_failover_profile(115_001) == "local-failover-256k"
+def test_ladder_oversize_session_falls_back_to_the_wide_4b():
+    """Bare mode bounds the harness but not the conversation. A transcript that
+    still overflows the 27B's 32K window must keep its context on the 256K 4B —
+    a weaker model that remembers the session beats a stronger one that
+    truncates it."""
+    assert pick_failover_profile(28_001) == "local-failover-256k"
     assert pick_failover_profile(10_000_000) == "local-failover-256k"
+
+
+def test_ladder_tiers_have_profile_files():
+    """A ladder entry naming a profile that does not exist fails only at the
+    moment of an outage, which is the worst possible time to discover it."""
+    import os
+    for _, profile in FAILOVER_LADDER:
+        assert os.path.exists(f"profiles/{profile}.env"), profile
 
 
 def test_ladder_bounds_are_monotonic():
