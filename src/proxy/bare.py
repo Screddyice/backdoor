@@ -41,31 +41,40 @@ from typing import Any, Iterable
 
 from .models import MessagesRequest, Message
 
-# Substrings matched (case-insensitively) against tool names to decide what
-# survives. EMPTY BY DEFAULT — keep no tools at all.
+# What survives from the tool list. Entries are substrings matched
+# case-insensitively against tool names, plus one special token:
 #
-# The obvious keep-list is Mem0: durable memory is the one capability worth more
-# offline than online. It is also the wrong answer, for two independent reasons
-# that both showed up the moment this was tested against a real model.
+#   "local"  keep every tool whose name is NOT prefixed `mcp__`
 #
-#   1. The Mem0 MCP tools call mcp.mem0.ai. The breaker opens on exactly one
-#      condition — this host is offline — so every one of those calls is
-#      guaranteed to fail during the only situation where the failover model
-#      runs. Keeping them buys a tool that cannot work.
-#   2. Not every local model accepts tool definitions at all. deepseek-r1:14b,
-#      the current default tier, makes Ollama reject the whole request with
-#      "does not support tools" — a 400, i.e. the failover fails outright and
-#      the session dies. The exact outcome failover exists to prevent.
+# LOCAL BY DEFAULT, and the split is the useful one. During an outage the
+# harness's own tools still work perfectly — Read, Edit, Bash, Glob and Grep
+# touch nothing but this disk — so keeping them lets the failover model carry on
+# doing work instead of only talking about it. Every `mcp__*` tool is a remote
+# integration and is dead for exactly as long as the breaker is open, since the
+# breaker opens on one condition only: this host is offline.
 #
-# Mem0 still reaches the failover model, by the path that works offline: the
-# local recall hook reads ~/.mem0-local/cache.db client-side and injects the
-# relevant memories into the prompt BEFORE the request is sent. That injection
-# is ordinary conversation text, so bare mode preserves it and the model sees it
-# whether or not it can call tools.
+# That also happens to be where the weight is. The ~286K tokens of definitions
+# measured on this machine came from MCP servers (apify, atlassian, nebos,
+# hostinger, composio), not from the dozen local tools, so dropping `mcp__*`
+# removes nearly all of the cost and nearly none of the offline capability.
 #
-# The mechanism stays configurable (`failover_keep_tools`) because a future tier
-# might be a tool-capable model with a genuinely offline tool worth keeping.
-DEFAULT_KEEP_TOOLS: tuple[str, ...] = ()
+# Mem0 is the interesting case and it belongs on the dropped side. Its MCP tools
+# call mcp.mem0.ai and cannot work offline, but local Mem0 recall still reaches
+# the model anyway: the hook reads ~/.mem0-local/cache.db client-side and
+# injects memories into the prompt BEFORE the request is sent, which bare mode
+# preserves as ordinary text.
+#
+# REQUIRED: the failover tier must accept tool definitions. deepseek-r1 does
+# not, and Ollama answers a request carrying them with HTTP 400 ("does not
+# support tools"), killing the session failover exists to save. Pair a non-empty
+# keep-list only with a tool-capable model, and set it to "" for one that is not.
+DEFAULT_KEEP_TOOLS: tuple[str, ...] = ("local",)
+
+# Tools from an MCP server carry this prefix. Everything else is harness-local.
+MCP_PREFIX = "mcp__"
+
+# The special keep-list token meaning "everything that is not an MCP tool".
+LOCAL_TOKEN = "local"
 
 # Per-tool-result character budget. Generous enough to keep a short command's
 # output intact, small enough that one `Read` of a big file cannot dominate.
@@ -82,8 +91,22 @@ DEFAULT_SYSTEM = (
 
 
 def _matches(name: str, patterns: Iterable[str]) -> bool:
+    """Does this tool name survive the keep-list?
+
+    `LOCAL_TOKEN` is checked as a prefix rule rather than a substring, so a
+    remote tool that merely contains the word (`mcp__local_files__read`) is
+    still dropped. Substring matching is fine for the explicit entries, which
+    an operator writes deliberately.
+    """
     low = (name or "").lower()
-    return any(p.lower() in low for p in patterns)
+    for p in patterns:
+        p = p.lower()
+        if p == LOCAL_TOKEN:
+            if not low.startswith(MCP_PREFIX):
+                return True
+        elif p in low:
+            return True
+    return False
 
 
 def parse_keep(raw: str | Iterable[str] | None) -> tuple[str, ...]:
@@ -173,11 +196,22 @@ def strip_message(
             else:
                 blocks.append({"type": "text", "text": f"[called {blk.get('name', 'tool')}]"})
         elif btype == "tool_result":
+            # Truncate the payload for EVERY tool, kept or not. The keep-list
+            # decides which tools the model may still CALL; it must not decide
+            # how much history they drag along. A kept tool's definition costs a
+            # few hundred tokens, while one of its past results — a Read of a
+            # large file, a verbose Bash run — can outweigh the whole
+            # conversation. Letting the keep-list govern both put the harness
+            # bloat straight back in through the transcript.
             origin = id_to_name.get(str(blk.get("tool_use_id", "")), "")
+            text = _result_text(blk.get("content"), limit)
             if origin and _matches(origin, keep):
-                blocks.append(blk)
+                # Kept tool: preserve the block's structure (the model may be
+                # mid-loop and needs the tool_use_id to line up), trimmed body.
+                trimmed = dict(blk)
+                trimmed["content"] = text
+                blocks.append(trimmed)
             else:
-                text = _result_text(blk.get("content"), limit)
                 label = f"[{origin or 'tool'} result]"
                 blocks.append({"type": "text", "text": f"{label} {text}".rstrip()})
         else:

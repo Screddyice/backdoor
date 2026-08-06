@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # (see FAILOVER_LADDER), measured AFTER bare-mode stripping — the size that
     # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
-    failover_profile: str = "local-failover-deepseek"  # default tier
+    failover_profile: str = "local-failover-qwen27"  # default tier
     failover_threshold: int = 3
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
@@ -56,13 +56,14 @@ class Settings(BaseSettings):
     # named in `failover_keep_tools`. See src/proxy/bare.py for why this is the
     # load-bearing change — it is what lets the failover tier be a 14B instead
     # of a 4B without repeating the 2026-07-09 prefill regression.
-    # Empty keep-list: no tool definitions reach the failover model. Mem0 is the
-    # tool worth keeping and it is cloud-backed, so it cannot work during the
-    # outage that triggers failover — and deepseek-r1 rejects tool definitions
-    # outright (Ollama 400s the request). Local Mem0 recall still reaches the
-    # model as injected prompt text. See src/proxy/bare.py.
+    # "local" keeps every tool NOT prefixed `mcp__`: Read, Edit, Bash, Glob and
+    # Grep all work with no network, so the failover model can keep doing work,
+    # while remote MCP integrations (which are dead for as long as the breaker
+    # is open, and which are where the ~286K tokens of definitions came from)
+    # are dropped. Set to "" for a tier that cannot accept tool definitions at
+    # all — deepseek-r1 makes Ollama 400 the request. See src/proxy/bare.py.
     failover_bare: bool = True
-    failover_keep_tools: str = ""
+    failover_keep_tools: str = "local"
     failover_tool_result_chars: int = 2000
 
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
@@ -114,10 +115,10 @@ MODEL_ROUTES: dict[str, str] = {
 #
 # The 4B 256K tier is kept as the escape hatch. Bare mode bounds the system
 # prompt and tool traffic but NOT the conversation, and a long enough transcript
-# still overflows deepseek's 32K window — at which point a weaker model that
+# still overflows the 27B's 32K window — at which point a weaker model that
 # retains the session beats a stronger one that truncates it.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (28_000, "local-failover-deepseek"),    # deepseek-r1:14b-bare (32K window)
+    (28_000, "local-failover-qwen27"),      # qwen3.5:27b-bare (32K window, tools)
     (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
 ]
 

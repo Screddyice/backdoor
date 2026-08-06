@@ -196,13 +196,17 @@ Measure an ordinary session and the reason becomes obvious. With the usual MCP s
 Bare mode attacks the other term. Before the request goes to Ollama, Backdoor drops the system prompt (replacing it with two sentences of orientation), drops tool definitions, truncates tool results in the transcript to a character budget, and replaces images with a placeholder. Your conversation stays. On a representative request that arrived carrying a full harness and an 80KB file read:
 
 ```
-50,179 tokens  ->  1,096 tokens        (45x)
-answer in 4.2s on deepseek-r1:14b
+50,439 tokens  ->  1,196 tokens        (42x)
+answer in 3.6s on qwen3.5:27b, ending in a real tool call
 ```
 
-That is what lets the default tier be a 14B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 14B in place, and you rebuild the original failure on a larger model.
+That is what lets the default tier be a 27B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 27B in place, and you rebuild the original failure on a much larger model.
 
-**No tools reach the failover model, on purpose.** Mem0 looks like the one worth keeping, and it is the wrong answer twice over. The breaker opens only when this host is offline, so a cloud-backed memory tool cannot work in the one situation where it would be called. And `deepseek-r1:14b` makes Ollama reject any request carrying tool definitions at all (`does not support tools`, HTTP 400), which kills the session failover exists to save. Local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
+**Local tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob` and `Grep` touch nothing but this disk, so they keep working while the host is offline, and keeping them means the failover model can carry on doing work instead of only talking about it. Every `mcp__*` tool is a remote integration and is dead for exactly as long as the breaker is open. That split also happens to be where the weight is: the ~286K tokens of definitions came from MCP servers, not from the dozen local tools, so dropping them removes nearly all of the cost and nearly none of the offline capability.
+
+Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai` and cannot work offline, but local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
+
+**The tier must accept tool definitions.** This is a hard pairing, not a preference. `deepseek-r1` at any runnable size does not: Ollama answers a request carrying tools with `does not support tools`, HTTP 400, killing the session failover exists to save. If you swap the tier for a model without tool support, set `failover_keep_tools=""` at the same time.
 
 ### Sizing the failover tier
 
@@ -210,14 +214,33 @@ Ollama caps residency by model count, never by bytes, and Metal allocations are 
 
 On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache:
 
-| Tier | On disk | Resident | Window | Notes |
-|---|---|---|---|---|
-| `deepseek-r1:14b-bare` | 9.0 GB | **20 GB** | 32K | Default. Arithmetic predicted 16GB; the compute graph accounts for the rest, which is why the number here is measured |
-| `qwen3.5:4b-256k` | 3.4 GB | ~13 GB | 262K | Escape hatch for a transcript that overflows 32K |
+| Tier | Params | On disk | Resident | Tools | Notes |
+|---|---|---|---|---|---|
+| `qwen3.5:27b-bare` | 27.4B | 16.1 GB | **15 GB** | yes | Default, 32K window |
+| `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
+| `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
 
-The ceiling on this box is the 32B class at a 16K window, around 25GB, and it sits within about 2GB of what kernel-panicked this machine twice on 2026-07-31. A 70B is not an option: 42.5GB of weights exceeds total RAM. The 20GB default is safe because llm-jury stands down while failover is active, so nothing else is holding the GPU.
+The 27B costing less than the 14B is not a typo. int4 quantization plus qwen3.5's smaller KV wins on both terms, so you get roughly double the parameters, tool calling, and 5GB back. Measured by memory delta across the load: free 20.9GB to 6.0GB, wired 4.2GB to 18.7GB, agreeing with `ollama ps`.
 
-`deepseek-r1` is a reasoning model, so the profile sets `PROVIDER_REASONING_EFFORT=none` to suppress `<think>` traces. Treat that as load-bearing rather than cosmetic: those traces reintroduce the same latency the 9B was reverted for. Re-verify it after an Ollama upgrade.
+Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
+
+Headroom exists because llm-jury reads `~/.backdoor/failover-state.json` and stands down while failover is active, so nothing else holds the GPU. Ollama caps residency by model count and never by bytes, and Metal allocations are wired and cannot be paged out, so over-committing panics this host rather than raising OOM. It did, twice, on 2026-07-31.
+
+The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Verified that this does not break tool calling on qwen3.5, with both settings emitting a correct call. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+
+### Building a bare tag
+
+Build from the **registry** tag, never from a local one. `modelfiles/build.sh` appends a ~43K-token system prompt to every `*.Modelfile` it builds and defaults to building all of them, so every local `qwen3.5:*` tag carries 186,647 bytes of baked prompt. `FROM` inherits it, which makes a "bare" model that is nothing of the sort. The failure is not subtle but it is easy to miss: the first attempt here answered from the baked prompt's tool vocabulary and invented a `weather_fetch` tool the request never defined.
+
+Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` cannot glob. Check any new tag with `ollama show --system <tag>`, which must return nothing.
+
+### When `ollama pull` will not finish
+
+`scripts/fetch-ollama-model.sh <model> <tag> [jobs]` pulls a library model by fetching its blobs directly, verifying each SHA-256, and writing the manifest last so a half-downloaded model can never appear in `ollama list`.
+
+Reach for it when a pull stalls. `qwen3.5:27b-int4` is packaged as **1,193 layers**, 1,184 of them per-tensor, and `ollama pull` never finished it here: it transferred ~9MB, discarded the chunk, and restarted, twice over 15 minutes each. Neither disk (152GB free) nor bandwidth was the cause, since a ranged `curl` against the same blob sustained 20MB/s throughout. The problem is many small sequential transfers on a connection that drops, with `OLLAMA_MAX_TRANSFER_STREAMS=1` forbidding any overlap, so one stall halts everything.
+
+Concurrency is the fix, because the cost is per-request latency rather than bandwidth. The script finished the same 16.1GB in about two minutes with 12 workers. It resumes: already-present blobs are skipped, so rerun it after an interruption.
 
 **The breaker opens on exactly one condition: this machine is offline.** That is deliberately narrow, because failing over is not free — it loads a local model into Ollama, and on a machine that also runs a local council (see [llm-jury](https://github.com/Screddyice/llm-jury)) two GPU consumers at once will fight for memory.
 
@@ -244,7 +267,7 @@ llm-jury reads that file and disables itself while failover is active, so the ro
 |---|---|---|
 | `failover_to_local` | `true` | Master switch for hybrid-mode failover |
 | `failover_bare` | `true` | Strip the harness off a failed-over request. Turn off only together with reverting the tier to a 4B |
-| `failover_keep_tools` | *(empty)* | Comma-separated substrings of tool names to keep. Empty means no tools reach the local model |
+| `failover_keep_tools` | `local` | What survives the tool list. `local` keeps everything not prefixed `mcp__`; add comma-separated substrings to keep specific MCP tools; empty keeps none |
 | `failover_tool_result_chars` | `2000` | Per-tool-result character budget in the stripped transcript |
 | `failover_threshold` | `3` | Consecutive transport errors before the connectivity probe runs |
 | `failover_window_seconds` | `120` | Failures outside this window start a fresh run |

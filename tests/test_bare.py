@@ -29,18 +29,56 @@ def test_parse_keep_empty_string_keeps_nothing():
     assert parse_keep(None) == DEFAULT_KEEP_TOOLS
 
 
-def test_default_keeps_no_tools():
-    """Regression lock on a failure found only by testing against a real model:
-    deepseek-r1:14b makes Ollama reject any request carrying tool definitions
-    ("does not support tools", HTTP 400), so a non-empty default keep-list turns
-    every failover into a dead session. Mem0 — the tool that would otherwise be
-    worth keeping — is cloud-backed and therefore unreachable during the only
-    condition that opens the breaker. Local Mem0 recall arrives as prompt text
-    instead, which needs no tool support.
+def test_default_keeps_local_tools_only():
+    """The default keeps harness-local tools and drops every MCP tool.
 
-    Do not reintroduce a default here without confirming the active failover
-    tier accepts tools AND that the tool functions offline."""
-    assert DEFAULT_KEEP_TOOLS == ()
+    Local tools (Read, Edit, Bash, Glob, Grep) touch nothing but this disk, so
+    they work while the host is offline — which is the only condition that opens
+    the breaker. MCP tools are remote integrations and are dead for exactly as
+    long as failover is active, and they are also where the token weight lives.
+
+    Pairing constraint: this default REQUIRES a tool-capable tier. deepseek-r1
+    makes Ollama reject any request carrying tool definitions with HTTP 400,
+    which kills the session. If the tier ever moves back to a model without tool
+    support, `failover_keep_tools` must go back to ""."""
+    assert DEFAULT_KEEP_TOOLS == ("local",)
+
+
+def test_local_token_keeps_harness_tools_and_drops_mcp():
+    out = make_bare(req(tools=[
+        Tool(name="Read"), Tool(name="Bash"), Tool(name="Grep"),
+        Tool(name="mcp__plugin_mem0_mem0__search_memories"),
+        Tool(name="mcp__apify__search-actors"),
+        Tool(name="mcp__nebos__crm_list"),
+    ]))
+    assert [t.name for t in out.tools] == ["Read", "Bash", "Grep"]
+
+
+def test_local_token_is_a_prefix_rule_not_a_substring():
+    """An MCP tool whose name merely contains "local" is still remote."""
+    out = make_bare(req(tools=[
+        Tool(name="mcp__local_files__read"),
+        Tool(name="Read"),
+    ]))
+    assert [t.name for t in out.tools] == ["Read"]
+
+
+def test_explicit_entries_compose_with_the_local_token():
+    """Add a specific MCP tool back without losing the local ones."""
+    out = make_bare(req(tools=[
+        Tool(name="Read"),
+        Tool(name="mcp__plugin_mem0_mem0__search_memories"),
+        Tool(name="mcp__apify__search-actors"),
+    ]), keep=("local", "mem0"))
+    assert [t.name for t in out.tools] == [
+        "Read", "mcp__plugin_mem0_mem0__search_memories",
+    ]
+
+
+def test_empty_keep_list_still_drops_everything():
+    """The escape hatch for a tier that cannot accept tools at all."""
+    out = make_bare(req(tools=[Tool(name="Read"), Tool(name="Bash")]), keep=())
+    assert out.tools is None
 
 
 # ── system prompt ────────────────────────────────────────────────────────────
@@ -69,10 +107,10 @@ def test_only_kept_tools_survive():
     assert [t.name for t in out.tools] == ["mcp__plugin_mem0_mem0__search_memories"]
 
 
-def test_default_strips_every_tool():
+def test_default_strips_every_mcp_tool():
     out = make_bare(req(tools=[
-        Tool(name="Bash"),
         Tool(name="mcp__plugin_mem0_mem0__search_memories"),
+        Tool(name="mcp__apify__search-actors"),
     ]))
     assert out.tools is None
 
@@ -81,7 +119,9 @@ def test_no_surviving_tools_clears_tools_and_tool_choice():
     """tools=[] with a tool_choice set is a 400 on most OpenAI-compatible
     backends, so both have to go together."""
     from src.proxy.models import ToolChoice
-    out = make_bare(req(tools=[Tool(name="Bash")], tool_choice=ToolChoice(type="auto")))
+    out = make_bare(
+        req(tools=[Tool(name="mcp__apify__x")], tool_choice=ToolChoice(type="auto"))
+    )
     assert out.tools is None
     assert out.tool_choice is None
 
@@ -103,11 +143,14 @@ def test_conversation_text_is_preserved():
     assert out.messages[1].content == "we made it fail over"
 
 
-def test_stripped_tool_result_is_truncated_to_budget():
+def test_dropped_tool_result_is_flattened_and_truncated():
+    """A dropped tool's result collapses to plain text: with the definition
+    gone, a structured block referencing a tool the model can no longer call is
+    just overhead."""
     out = make_bare(
         req(messages=[
             Message(role="assistant", content=[
-                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "t1", "name": "mcp__apify__crawl", "input": {}},
             ]),
             Message(role="user", content=[
                 {"type": "tool_result", "tool_use_id": "t1", "content": "X" * 50_000},
@@ -121,26 +164,29 @@ def test_stripped_tool_result_is_truncated_to_budget():
     assert len(body) < 400
 
 
-def test_kept_tool_result_is_not_truncated():
-    """A kept tool's output must survive intact — truncating it would defeat
-    keeping the tool at all."""
+def test_kept_tool_result_keeps_its_structure_but_is_still_truncated():
+    """The keep-list decides what the model may CALL, not how much history it
+    drags along. A kept tool's block stays structured so a mid-loop tool_use_id
+    still lines up, but its payload is trimmed like any other: one past Read of
+    a large file can outweigh the entire conversation."""
     payload = "recalled fact " * 1000
     out = make_bare(
         req(messages=[
             Message(role="assistant", content=[
-                {"type": "tool_use", "id": "m1",
-                 "name": "mcp__plugin_mem0_mem0__search_memories", "input": {}},
+                {"type": "tool_use", "id": "m1", "name": "Read", "input": {}},
             ]),
             Message(role="user", content=[
                 {"type": "tool_result", "tool_use_id": "m1", "content": payload},
             ]),
         ]),
-        keep=("mem0",),
         tool_result_chars=100,
     )
     blocks = out.messages[1].content
     assert isinstance(blocks, list)
-    assert blocks[0]["content"] == payload
+    assert blocks[0]["type"] == "tool_result"
+    assert blocks[0]["tool_use_id"] == "m1"          # structure preserved
+    assert len(blocks[0]["content"]) < 400           # payload still bounded
+    assert "omitted offline" in blocks[0]["content"]
 
 
 def test_images_are_replaced_not_forwarded():
@@ -184,7 +230,8 @@ def test_bare_mode_collapses_a_realistic_harness_request():
     alone exceeded the context window before any conversation."""
     heavy = req(
         system="CLAUDE.md and harness instructions. " * 5_000,
-        tools=[Tool(name=f"tool_{i}", description="d" * 400,
+        # MCP servers are where the measured ~286K tokens actually came from.
+        tools=[Tool(name=f"mcp__server{i}__do_thing", description="d" * 400,
                     input_schema={"properties": {"p": {"type": "string"}}})
                for i in range(60)],
         messages=[

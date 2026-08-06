@@ -116,10 +116,12 @@ async def test_failed_over_request_arrives_stripped(offline_app):
     assert "official CLI" not in sent
     # Nor the 80KB tool result.
     assert "Z" * 5000 not in sent
-    # No tool definitions at all: deepseek-r1 rejects a request carrying them
-    # ("does not support tools", HTTP 400), which would kill the very session
-    # failover exists to save.
-    assert not recorder.payload.get("tools"), recorder.payload.get("tools")
+    # Local tools survive so the model can keep working offline; every mcp__
+    # tool is dropped, since it is remote and therefore dead while the breaker
+    # is open.
+    names = [t.get("function", {}).get("name", "") for t in (recorder.payload.get("tools") or [])]
+    assert "Bash" in names and "Read" in names, names
+    assert not any(n.startswith("mcp__") for n in names), names
 
 
 async def test_the_users_actual_question_survives(offline_app):
@@ -157,4 +159,4 @@ async def test_stripped_size_picks_the_tier(offline_app):
     stripped = count_messages(bare.messages, bare.system, bare.tools)
 
     assert pick_failover_profile(raw) == "local-failover-256k"       # the 4B
-    assert pick_failover_profile(stripped) == "local-failover-deepseek"
+    assert pick_failover_profile(stripped) == "local-failover-qwen27"

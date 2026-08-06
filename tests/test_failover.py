@@ -226,16 +226,16 @@ def test_unwritable_state_path_does_not_break_the_breaker():
 from src.proxy.config import pick_failover_profile, FAILOVER_LADDER
 
 
-def test_ladder_normal_session_gets_the_deepseek_tier():
+def test_ladder_normal_session_gets_the_strong_tool_capable_tier():
     """The common case after bare-mode stripping: a small prompt, so the
     strongest local model rather than the widest-window one."""
-    assert pick_failover_profile(0) == "local-failover-deepseek"
-    assert pick_failover_profile(28_000) == "local-failover-deepseek"
+    assert pick_failover_profile(0) == "local-failover-qwen27"
+    assert pick_failover_profile(28_000) == "local-failover-qwen27"
 
 
 def test_ladder_oversize_session_falls_back_to_the_wide_4b():
     """Bare mode bounds the harness but not the conversation. A transcript that
-    still overflows deepseek's 32K window must keep its context on the 256K 4B —
+    still overflows the 27B's 32K window must keep its context on the 256K 4B —
     a weaker model that remembers the session beats a stronger one that
     truncates it."""
     assert pick_failover_profile(28_001) == "local-failover-256k"
