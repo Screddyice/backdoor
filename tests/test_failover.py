@@ -166,6 +166,22 @@ def test_http_statuses_are_not_triggers_by_default():
     assert FAILOVER_STATUSES == set()
 
 
+def test_default_threshold_is_two():
+    """A latency contract, so raising it back is a deliberate act.
+
+    Measured 2026-08-09: Claude Code retries a dead upstream persistently (9+
+    attempts over 107s), so the count is never what stops the breaker opening —
+    it only decides how long the user waits first. Three failures cost ~15-20s
+    before the connectivity probe even runs, on top of ~10s of model load.
+
+    Safety does not come from the count. `internet_reachable` gets the final
+    say, so a transient blip still cannot open the breaker at any threshold.
+    """
+    from src.proxy.config import Settings
+    assert Settings().failover_threshold == 2
+    assert FailoverBreaker().threshold == 2
+
+
 def test_statuses_can_be_restored_via_env(monkeypatch):
     monkeypatch.setenv("BACKDOOR_FAILOVER_STATUSES", "429, 529 ,junk")
     assert _statuses_from_env() == {429, 529}

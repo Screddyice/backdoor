@@ -255,6 +255,26 @@ So the trigger set is tight:
 
 Reaching the failure threshold is necessary but not sufficient: a TCP connectivity probe to a public address gets the final say, and it is re-taken each time (never cached), costing one probe per run of failures rather than one per request.
 
+### How long failover takes
+
+About 15 to 20 seconds from losing the network to the first local answer, measured 2026-08-09 against a dead upstream:
+
+| Stage | Cost |
+|---|---|
+| 2 consecutive transport errors, paced by Claude Code's own retry backoff | ~8-12s |
+| TCP probe confirming the host is offline | ~0s offline (fails instantly), up to 4s otherwise |
+| `qwen3.5:27b-bare` cold start | ~10s |
+
+Claude Code retries a dead upstream persistently — 9 or more attempts over 107 seconds in that test — so the threshold is never what prevents the breaker opening. It only sets how long you watch errors first, which is why the default is 2 rather than 3.
+
+**If nothing fails over at all, the session is almost certainly not routed.** Check `ANTHROPIC_BASE_URL` on the running process rather than the shell:
+
+```
+ps -E -o command= -p $(pgrep -x claude | head -1) | tr ' ' '\n' | grep ANTHROPIC_BASE_URL
+```
+
+Claude Code reads that variable once at startup, so a session that began unrouted can never gain failover — restarting the router or the shell will not reach it, and only relaunching does.
+
 **Coordination with other local-GPU consumers.** Every breaker transition is published atomically to `~/.backdoor/failover-state.json`:
 
 ```json
@@ -269,7 +289,7 @@ llm-jury reads that file and disables itself while failover is active, so the ro
 | `failover_bare` | `true` | Strip the harness off a failed-over request. Turn off only together with reverting the tier to a 4B |
 | `failover_keep_tools` | `local` | What survives the tool list. `local` keeps everything not prefixed `mcp__`; add comma-separated substrings to keep specific MCP tools; empty keeps none |
 | `failover_tool_result_chars` | `2000` | Per-tool-result character budget in the stripped transcript |
-| `failover_threshold` | `3` | Consecutive transport errors before the connectivity probe runs |
+| `failover_threshold` | `2` | Consecutive transport errors before the connectivity probe runs. The probe, not this count, is what stops a transient blip opening the breaker |
 | `failover_window_seconds` | `120` | Failures outside this window start a fresh run |
 | `failover_probe_seconds` | `60` | How often an open breaker retries upstream (half-open) |
 | `BACKDOOR_FAILOVER_STATUSES` | *(empty)* | Comma-separated HTTP statuses to restore as triggers, e.g. `429,529` |

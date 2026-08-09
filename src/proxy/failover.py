@@ -130,7 +130,10 @@ def _notify(title: str, message: str) -> None:
 class FailoverBreaker:
     def __init__(
         self,
-        threshold: int = 3,
+        # Keep in step with Settings.failover_threshold — see the note there for
+        # why 2 rather than 3 (the connectivity probe, not the count, is what
+        # prevents a transient blip from claiming the GPU).
+        threshold: int = 2,
         window: float = 120.0,
         probe_interval: float = 60.0,
         now_fn: Callable[[], float] = time.monotonic,
