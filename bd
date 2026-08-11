@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# bd — Backdoor control: point Claude Code at any switchable AI backend via the local proxy.
+set -euo pipefail
+BACKDOOR_DIR="${BACKDOOR_DIR:-$HOME/backdoor}"
+PROFILES_DIR="$BACKDOOR_DIR/profiles"
+ENV_FILE="$BACKDOOR_DIR/.env"
+ACTIVE_FILE="$BACKDOOR_DIR/.active"
+PID_FILE="$BACKDOOR_DIR/.proxy.pid"
+PY="$BACKDOOR_DIR/.venv/bin/python"
+LOG="$BACKDOOR_DIR/proxy.log"
+cd "$BACKDOOR_DIR"
+
+_get() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- ; }
+PORT="$(_get PORT)"; PORT="${PORT:-8082}"
+_running() { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+_health() { curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
+
+_guard_key() {
+  local k; k="$(_get PROVIDER_API_KEY)"; local a; a="$(cat "$ACTIVE_FILE" 2>/dev/null || echo '?')"
+  if [ -z "$k" ] || echo "$k" | grep -qE "REPLACE_WITH|__FILL"; then
+    echo "ERROR: profile '$a' has no real PROVIDER_API_KEY (still a placeholder)."
+    echo "Edit $PROFILES_DIR/$a.env, set the key/URL, then: bd restart"
+    return 1
+  fi
+}
+
+cmd_list() {
+  local active=""; [ -f "$ACTIVE_FILE" ] && active="$(cat "$ACTIVE_FILE")"
+  echo "Backends (* = active):"
+  for f in "$PROFILES_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    local name model url mark
+    name="$(basename "$f" .env)"
+    model="$(grep -E '^PROVIDER_MODEL=' "$f" | cut -d= -f2-)"
+    url="$(grep -E '^PROVIDER_BASE_URL=' "$f" | cut -d= -f2-)"
+    mark=" "; [ "$name" = "$active" ] && mark="*"
+    printf "  %s %-13s %-12s %s\n" "$mark" "$name" "$model" "$url"
+  done
+}
+
+cmd_start() {
+  _guard_key || exit 1
+  if _running; then echo "Already running (pid $(cat "$PID_FILE"), :$PORT)."; return 0; fi
+  echo "Starting proxy -> $(_get PROVIDER_MODEL) on :$PORT ..."
+  nohup "$PY" -m uvicorn server:app --host 127.0.0.1 --port "$PORT" --log-level warning >/dev/null 2>&1 &
+  echo $! > "$PID_FILE"
+  local i; for i in $(seq 1 60); do _health && break; sleep 0.5; done
+  if _health; then echo "Proxy up (pid $(cat "$PID_FILE"))."; else echo "ERROR: proxy unhealthy — bd log"; exit 1; fi
+}
+cmd_stop() { if _running; then kill "$(cat "$PID_FILE")" 2>/dev/null || true; fi; rm -f "$PID_FILE"; echo "Stopped."; }
+cmd_restart() { cmd_stop; cmd_start; }
+cmd_status() {
+  echo "Active profile: $(cat "$ACTIVE_FILE" 2>/dev/null || echo '?')"
+  echo "Model:          $(_get PROVIDER_MODEL)"
+  echo "Backend URL:    $(_get PROVIDER_BASE_URL)"
+  echo "Port:           $PORT"
+  if _running && _health; then echo "Proxy:          UP (pid $(cat "$PID_FILE"))"
+  elif _running; then echo "Proxy:          pid alive but /health failing — bd log"
+  else echo "Proxy:          down"; fi
+}
+cmd_switch() {
+  local name="${1:?usage: bd switch <profile>}"
+  local f="$PROFILES_DIR/$name.env"
+  [ -f "$f" ] || { echo "No such profile: $name"; cmd_list; exit 1; }
+  cp "$f" "$ENV_FILE"; echo "$name" > "$ACTIVE_FILE"
+  echo "Switched to '$name' -> $(_get PROVIDER_MODEL) @ $(_get PROVIDER_BASE_URL)"
+  if _running; then echo "Restarting proxy..."; cmd_restart; else echo "(proxy down — run 'bd start' or 'bd claude')"; fi
+}
+cmd_claude() {
+  cmd_start
+  echo "Launching Claude Code via backdoor (model: $(_get PROVIDER_MODEL))..."
+  ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" claude "$@"
+}
+cmd_log() { tail -n "${1:-40}" "$LOG" 2>/dev/null || echo "(no log yet)"; }
+
+case "${1:-}" in
+  list|ls) cmd_list ;;
+  switch|use) shift; cmd_switch "$@" ;;
+  start|up) cmd_start ;;
+  stop|down) cmd_stop ;;
+  restart) cmd_restart ;;
+  status|st) cmd_status ;;
+  claude|run) shift; cmd_claude "$@" ;;
+  log|logs) shift; cmd_log "${1:-40}" ;;
+  *) cat <<USAGE
+bd - Backdoor control (Claude Code <-> any AI backend)
+  bd list                list backends (* = active)
+  bd switch <name>       change backend (restarts proxy if running)
+  bd start|stop|restart|status
+  bd claude [args...]    launch Claude Code through the active backend
+  bd log [n]             tail proxy log
+USAGE
+  ;;
+esac
