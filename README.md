@@ -208,6 +208,40 @@ Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai
 
 **The tier must accept tool definitions.** This is a hard pairing, not a preference. `deepseek-r1` at any runnable size does not: Ollama answers a request carrying tools with `does not support tools`, HTTP 400, killing the session failover exists to save. If you swap the tier for a model without tool support, set `failover_keep_tools=""` at the same time.
 
+### Deliberate routing: `/model qwen`
+
+Failover is not the only way into a local tier. A session can ask for one by name with `/model qwen`, and that request takes a different branch. It matches `MODEL_ROUTES`, returns a profile immediately, and skips the failover block underneath. Only the failover block stripped.
+
+So `/model qwen` handed the 27B a full harness session against a 32K window, which is the pairing the section above warns about. That window is small on purpose. Bare mode is what makes it generous.
+
+Profiles whose window assumes bare mode now say so:
+
+```
+ROUTE_BARE=true
+```
+
+Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwen-9b` backs the `fusion-qwen` subagent, which needs its system prompt and its tools to do anything at all. Stripping every named route would break that quietly.
+
+| `/model` name | Profile | Model | Window | Stripped |
+|---|---|---|---|---|
+| `qwen` | `local-failover-qwen27` | `qwen3.5:27b-bare` | 32K | yes |
+| `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
+| `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
+
+Stripping reuses the `failover_*` keep-list and truncation budget, so both paths build the same request shape. A route that stripped differently from failover would be a second behaviour to keep in sync for no gain.
+
+Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at roughly 15GB and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+
+The `qwen` wrapper reaches Ollama by a third path and never reads this table. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile and nothing strips server-side. Its modes pick their own tier:
+
+| Command | Profile | Model | Why |
+|---|---|---|---|
+| `qwen`, `qwen lean` | `local-failover-qwen27` | `qwen3.5:27b-bare` | `--bare` client-side holds the prompt near 945 tokens, so 32K is roomy |
+| `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
+| `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the 27B costs more GPU than the task is worth |
+
+The wrapper prints the tier it resolved at launch. Read that line if you are unsure which model you got.
+
 ### Sizing the failover tier
 
 Ollama caps residency by model count, never by bytes, and Metal allocations are wired and cannot be paged out. Over-commit and this host panics instead of raising OOM. Measure with `ollama ps`, which reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.

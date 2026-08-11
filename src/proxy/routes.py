@@ -262,6 +262,33 @@ async def create_message(
         settings = load_profile_settings(profile)
         client = _get_profile_client(profile, settings)
 
+        # An explicit `/model <name>` hit MODEL_ROUTES and so skipped the
+        # failover branch above — the only place that stripped. Tiers whose
+        # window assumes bare mode declare ROUTE_BARE; without this a deliberate
+        # `/model qwen` sends a full harness session at a 32K window.
+        # `bare_req is None` guards the failover path, which already stripped.
+        if bare_req is None and settings.route_bare:
+            try:
+                fr = MessagesRequest.model_validate_json(body)
+                raw_est = count_messages(fr.messages, fr.system, fr.tools)
+                stripped = make_bare(
+                    fr,
+                    keep=parse_keep(settings.failover_keep_tools),
+                    tool_result_chars=settings.failover_tool_result_chars,
+                )
+                bare_req = stripped  # only on success: make_bare is pure
+                logger.info(
+                    "→ local [%s → %s] bare in≈%s (raw %s)",
+                    model, profile,
+                    count_messages(stripped.messages, stripped.system, stripped.tools),
+                    raw_est,
+                )
+            except Exception:
+                # Same rule as failover: stripping must never break the request.
+                # Unstripped may overflow the window, but that surfaces as an
+                # honest provider error rather than a request we dropped here.
+                logger.exception("route bare-mode failed; sending unstripped to %s", profile)
+
     req = bare_req if bare_req is not None else MessagesRequest.model_validate_json(body)
 
     fast = _check_optimizations(req, settings)
