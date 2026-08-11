@@ -137,6 +137,23 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in `.env` and you can tr
 
 ---
 
+## Running the tests
+
+Run them through the project venv, not the `pytest` on your PATH:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+A bare `pytest` picks up whichever interpreter comes first on PATH, and on a machine with Homebrew Python that one has none of this project's dependencies installed. It fails during collection on `fastapi` and `httpx` imports, which reads like broken tests rather than the wrong interpreter. Same suite, same machine, both ways:
+
+```
+pytest                          5 errors during collection
+.venv/bin/python -m pytest      54 passed
+```
+
+The harness verification gate in `.claude-harness/config.json` runs the venv form for the same reason.
+
 ## Troubleshooting
 
 **`Proxy failed to start`**

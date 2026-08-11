@@ -4,7 +4,7 @@
   "techStack": "Python",
   "verification": {
     "build": "",
-    "tests": "pytest",
+    "tests": ".venv/bin/python -m pytest",
     "lint": "",
     "typecheck": "",
     "acceptance": ""
@@ -34,7 +34,11 @@
   "agentTeams": {
     "enabled": false,
     "defaultTeamSize": 3,
-    "roles": ["implementer", "reviewer", "tester"],
+    "roles": [
+      "implementer",
+      "reviewer",
+      "tester"
+    ],
     "requirePlanApproval": true,
     "teammateModel": null
   },
