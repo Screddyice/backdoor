@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# qwen — launch Claude Code against a fully-offline local LLM (Qwen3.5 4B).
+# (alias: claude-local)
+#
+#   Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
+#
+# Everything runs on-device. No internet required once models are pulled.
+#
+# Modes (model per mode changed 2026-08-11 — the default is now the 27B):
+#   qwen            LEAN (default, 2026-07-09). Minimal prompt (~945 tok) on
+#                   Qwen3.5 27B @ 32K: --bare, harness slash-commands on demand,
+#                   no auto hooks, MCP off. The 27B is affordable here ONLY
+#                   because lean keeps the prompt tiny; ~15GB resident, so it
+#                   competes with the fusion council for GPU (see keep_alive
+#                   below). Full mode's ~42K harness prefill made a cold 4B take
+#                   minutes (and stall entirely under memory pressure), so lean
+#                   is the default — that offline hang is exactly why it flipped.
+#   qwen full       FULL harness — still Qwen3.5 4B @ 64K, NOT the 27B. The
+#                   harness prompt is ~29K tokens and does not fit the 27B's 32K
+#                   window with room left to converse. claude-harness hooks
+#                   ACTIVE (claude-mem + ralph-loop dropped 2026-07-09 — their
+#                   injection was the biggest chunk of the ~42K prompt).
+#                   Still a minute+ cold prefill; use when you want the harness.
+#                   MCP OFF by default (see below). 256K-native, no rope.
+#   qwen fast       Lean on Qwen3.5 4B @ 64K — the snappiest local brain, and
+#                   the escape hatch when the 27B is too heavy or too slow.
+#                   (qwen coder / qwen2.5-coder removed 2026-07-04.)
+#   qwen [args...]  Extra args pass straight through to `claude`.
+#
+# The launch banner prints the resolved model — read it if you are unsure which
+# tier you got. `/model qwen` inside a normal cloud session routes to the same
+# 27B via the :8083 hybrid router, which strips the harness server-side
+# (ROUTE_BARE); that is a separate path from this wrapper, which uses :8082.
+#
+# Env overrides:
+#   QWEN_MEM0=1  cloud Mem0 MCP only (small). Local Ollama inference + cloud memory.
+#               Needs MEM0_API_KEY + network. Prefer over full QWEN_MCP=1 on 64k.
+#   QWEN_MCP=0  (the default everywhere now) no MCP servers — true-offline,
+#               fast. MCP schemas are big (~142K tokens for the global set; even
+#               the curated stack overflows the 64K window) and were half of why
+#               full mode crawled, so MCP is OFF by default in ALL modes.
+#   QWEN_MCP=1  opt INTO MCP (any mode). Loads the curated stack
+#               (mcp-server-a/cliqk/trc + nebos + hypercrawl) — needs internet,
+#               and you'll want a bigger-context model tag (e.g. qwen3.5:9b-256k)
+#               since the schemas don't fit 64K.
+#   QWEN_MCP_SERVERS=a,b,c  override which ~/.claude.json servers to load
+#               (slimmest useful set: mcp-server-a,mcp-server-b ≈ 12 tools).
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # bd + claude live here
+
+PROFILE=""    # empty = derive from the FINAL mode below
+MODE="lean"   # default flipped full→lean 2026-07-09 (offline responsiveness)
+# Leading mode keywords (consume them; rest passes to claude).
+while :; do
+  case "${1:-}" in
+    lean) MODE="lean"; shift ;;
+    fast) PROFILE="local-fast"; MODE="lean"; shift ;;
+    full) MODE="full"; shift ;;
+    *) break ;;
+  esac
+done
+[ "${QWEN_FULL:-0}" = "1" ] && MODE="full"
+[ "${QWEN_LEAN:-0}" = "1" ] && MODE="lean"
+
+# Resolve the profile from the FINAL mode, so env overrides that flip the mode
+# (QWEN_FULL/QWEN_LEAN) cannot leave a profile that contradicts it. `fast` is
+# the one explicit pin and wins outright.
+#
+# Default/lean is the 27B as of 2026-08-11. It is only viable because lean mode
+# passes --bare: the prompt is ~945 tokens against a 32K window. Full mode's
+# ~29K harness prompt does NOT fit that window with room left to converse, so it
+# stays on the 4B @ 64K — the tier the 2026-07-09 prefill revert chose for
+# exactly this case. Do not "unify" these two onto the 27B without first giving
+# the 27B a bigger window, and read the KV sizing note in
+# modelfiles/bare/qwen3.5-27b-bare.Modelfile before you do.
+if [ -z "$PROFILE" ]; then
+  if [ "$MODE" = "full" ]; then
+    PROFILE="local-qwen35"           # qwen3.5:4b-64k  — harness needs the window
+  else
+    PROFILE="local-failover-qwen27"  # qwen3.5:27b-bare — 32K, biggest local brain
+  fi
+fi
+
+# 1. Make sure the Ollama daemon is up (LaunchAgent normally keeps it alive).
+if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  echo "Ollama daemon down — starting via LaunchAgent..."
+  launchctl kickstart -k "gui/$(id -u)/com.screddy.ollama" 2>/dev/null \
+    || launchctl load -w "$HOME/Library/LaunchAgents/com.screddy.ollama.plist" 2>/dev/null \
+    || { echo "Falling back to manual ollama serve..."; nohup ollama serve >/tmp/ollama-serve.log 2>&1 & }
+  for _ in $(seq 1 30); do
+    curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 0.5
+  done
+fi
+
+# 2. Verify the model for this profile is actually pulled (offline-ready).
+#    Query the API with a small retry — `ollama list` can race a fresh daemon.
+MODEL="$(grep -E '^PROVIDER_MODEL=' "$HOME/backdoor/profiles/$PROFILE.env" | cut -d= -f2-)"
+present=""
+for _ in 1 2 3 4 5; do
+  # match "MODEL" or "MODEL:tag" in the API's JSON name field
+  if curl -sf http://127.0.0.1:11434/api/tags 2>/dev/null | grep -qE "\"${MODEL}(:[^\"]*)?\""; then
+    present=1; break
+  fi
+  sleep 1
+done
+if [ -z "$present" ]; then
+  echo "WARNING: model '$MODEL' is not available yet."
+  echo "Pull/build it WHILE ONLINE (see profiles/README-local.md), then retry."
+  exit 1
+fi
+
+# 3. MCP defaults: OFF in every mode now. MCP tool schemas are huge (~142K
+#    tokens for the global ~/.claude.json set; even the curated stack overflows
+#    the 9b-64k window) and a giant schema prefill was half of why full mode
+#    crawled. So default to no MCP; opt in with QWEN_MCP=1 (and switch to a
+#    bigger-context tag like qwen3.5:9b-256k, since the schemas won't fit 64K).
+#    When opted in, QWEN_MCP_SERVERS picks the servers (default: our own stack
+#    — Composio routers for TMN/Cliqk/TRC + NEBOS + HyperCrawl).
+MCP_DEFAULT=0
+MCP_ARGS=()
+# Optional: cloud Mem0 only (small schema) so local Ollama still has long-term memory.
+# Inference stays local; store/search hit Mem0 Platform. Requires MEM0_API_KEY + network.
+if [ "${QWEN_MEM0:-0}" = "1" ] && [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
+  # Ensure key is available for MCP header expansion
+  if [ -z "${MEM0_API_KEY:-}" ] && [ -f "$HOME/projects/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$HOME/projects/.env"
+    set +a
+  fi
+  if [ -n "${MEM0_API_KEY:-}" ]; then
+    MEM0_MCP_CONF="$HOME/.cache/backdoor/qwen-mem0-mcp.json"
+    mkdir -p "$(dirname "$MEM0_MCP_CONF")"
+    # Expand token into a private config (mode 600) — Claude MCP may not expand ${ENV}
+    python3 - "$MEM0_MCP_CONF" <<'PY2'
+import json, os, sys
+path = sys.argv[1]
+key = os.environ.get("MEM0_API_KEY", "")
+cfg = {
+  "mcpServers": {
+    "mem0": {
+      "type": "http",
+      "url": "https://mcp.mem0.ai/mcp",
+      "headers": {"Authorization": f"Token {key}"},
+    }
+  }
+}
+json.dump(cfg, open(path, "w"), indent=2)
+PY2
+    chmod 600 "$MEM0_MCP_CONF"
+    MCP_ARGS=(--strict-mcp-config --mcp-config "$MEM0_MCP_CONF")
+    echo "qwen: Mem0 Platform MCP enabled (cloud memory, local inference)" >&2
+  else
+    echo "qwen: QWEN_MEM0=1 but MEM0_API_KEY unset — MCP empty" >&2
+    MCP_ARGS=(--strict-mcp-config --mcp-config "$HOME/backdoor/empty-mcp.json")
+  fi
+elif [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
+  MCP_ARGS=(--strict-mcp-config --mcp-config "$HOME/backdoor/empty-mcp.json")
+else
+  # Regenerated every launch from ~/.claude.json so key rotations carry over.
+  # Lives in ~/.cache (NOT the backdoor repo) because it contains API keys.
+  MCP_CONF="$HOME/.cache/backdoor/qwen-mcp.json"
+  mkdir -p "$(dirname "$MCP_CONF")"
+  QWEN_MCP_SERVERS="${QWEN_MCP_SERVERS:-mcp-server-a,mcp-server-b,mcp-server-c,nebos,hypercrawl}" \
+    python3 - "$MCP_CONF" <<'PY'
+import json, os, sys
+cfg = json.load(open(os.path.expanduser('~/.claude.json')))
+names = [n.strip() for n in os.environ['QWEN_MCP_SERVERS'].split(',') if n.strip()]
+avail = cfg.get('mcpServers', {})
+servers = {n: avail[n] for n in names if n in avail}
+missing = [n for n in names if n not in avail]
+if missing:
+    print(f"qwen: WARNING — MCP servers not in ~/.claude.json, skipped: {', '.join(missing)}", file=sys.stderr)
+json.dump({'mcpServers': servers}, open(sys.argv[1], 'w'), indent=2)
+PY
+  chmod 600 "$MCP_CONF"
+  MCP_ARGS=(--strict-mcp-config --mcp-config "$MCP_CONF")
+fi
+
+# 4. Mode-specific launch args.
+if [ "$MODE" = "full" ]; then
+  # AUTO-HOOK mode: enable harness + claude-mem + ralph-loop (and their hooks),
+  # disable the other heavy plugins so the prompt (~29K) stays manageable.
+  EXTRA_ARGS=(--settings "$HOME/backdoor/hook-mode.settings.json")
+  MODE_NOTE="full-hooks(harness)"
+else
+  # LEAN mode: --bare skips the heavy plugin/hook auto-injection (~30K tokens);
+  # --plugin-dir re-adds claude-harness so its commands stay available on demand.
+  EXTRA_ARGS=(--bare)
+  HARNESS_DIR="$(ls -dt "$HOME"/.claude/plugins/cache/claude-harness/claude-harness/*/ 2>/dev/null | head -1)"
+  [ -n "$HARNESS_DIR" ] && EXTRA_ARGS+=(--plugin-dir "$HARNESS_DIR")
+  MODE_NOTE="lean"
+fi
+
+# 5. Point backdoor at the profile, ensure the proxy is up, then exec `claude`
+#    DIRECTLY (not `bd claude`, which cd's into the backdoor repo and breaks
+#    file paths) so it runs in YOUR current directory.
+bd switch "$PROFILE" >/dev/null
+bd start >/dev/null 2>&1
+PORT="$(grep -E '^PORT=' "$HOME/backdoor/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"; PORT="${PORT:-8082}"
+# bd switch/start can restart the proxy and return before uvicorn is listening;
+# launching claude into that gap = instant "API Error: Connection error"
+# (fatal in -p mode). Wait for /health before exec.
+proxy_up=""
+for _ in $(seq 1 30); do
+  if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then proxy_up=1; break; fi
+  sleep 0.5
+done
+[ -z "$proxy_up" ] && { echo "ERROR: backdoor proxy on :$PORT never became healthy — check ~/backdoor/proxy.log"; exit 1; }
+
+# 5b. Warm the model NOW (backgrounded) so the first real turn skips the cold
+# load (~1.2s) — it finishes while Claude Code's node startup runs. The tiny
+# SYSTEM message is REQUIRED: a systemless call falls through to the baked ~46K
+# Fable-5 SYSTEM prompt and cold-prefills all of it (~60s) — the exact trap that
+# looked like an offline hang. keep_alive 30m holds it warm for the session
+# (still unloads afterward, so battery use on a plane stays bounded).
+#
+# keep_alive is shorter for the 27B on purpose. At ~15GB resident it and a
+# fusion council (~21GB) cannot both be loaded on this 36GB host — and
+# OLLAMA_MAX_LOADED_MODELS caps by model COUNT, not bytes, so nothing upstream
+# will refuse that combination. Holding a 27B warm for 30 idle minutes widens
+# the window where `llmjury solve` collides with it; 10 minutes still covers an
+# active session while giving the GPU back sooner. See the panic note in
+# modelfiles/bare/qwen3.5-27b-bare.Modelfile.
+KEEP_ALIVE="30m"
+[ "$PROFILE" = "local-failover-qwen27" ] && KEEP_ALIVE="10m"
+curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
+  -d "{\"model\":\"$MODEL\",\"keep_alive\":\"$KEEP_ALIVE\",\"options\":{\"num_predict\":1},\"messages\":[{\"role\":\"system\",\"content\":\"warmup\"},{\"role\":\"user\",\"content\":\"hi\"}]}" \
+  >/dev/null 2>&1 &
+
+if [ "${MCP_ARGS[2]:-}" = "$HOME/backdoor/empty-mcp.json" ]; then
+  MCP_NOTE="offline"
+else
+  MCP_NOTE="MCP: ${QWEN_MCP_SERVERS:-mcp-server-a,mcp-server-b,mcp-server-c,nebos,hypercrawl} (net)"
+fi
+echo "▶ Local model: $MODEL ($PROFILE, $MODE_NOTE) — $MCP_NOTE"
+# API_TIMEOUT_MS: a cold 50K-token full-harness prefill takes ~2-3 min on the
+# 9B; Claude Code's default timeout aborts + retries mid-prefill, doubling it.
+# ${arr[@]+...} guards: macOS bash 3.2 + `set -u` errors on expanding an
+# empty array; MCP_ARGS is empty whenever MCP is on.
+exec env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" \
+  API_TIMEOUT_MS=600000 \
+  claude ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} "$@"

@@ -1,0 +1,24 @@
+{
+  "version": 3,
+  "lastUpdated": "2026-06-08T05:54:38Z",
+  "currentSession": null,
+  "projectContext": {
+    "name": "backdoor",
+    "techStack": ["Python"],
+    "testingFramework": "pytest",
+    "buildCommand": "",
+    "testCommand": "pytest"
+  },
+  "architecturalDecisions": [],
+  "activeConstraints": [],
+  "sharedState": {
+    "discoveredPatterns": {},
+    "fileIndex": {
+      "components": [],
+      "apiRoutes": [],
+      "tests": [],
+      "configs": []
+    }
+  },
+  "agentResults": []
+}

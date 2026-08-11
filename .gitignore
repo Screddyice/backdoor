@@ -5,6 +5,7 @@ __pycache__/
 dist/
 *.egg-info/
 proxy.log
+router.log
 workspace/
 .DS_Store
 .supercoder/
@@ -19,3 +20,5 @@ modal/__pycache__/
 
 # Claude Code - Local settings
 .claude/settings.local.json
+.claude-harness/.setup-stamp
+.claude-harness/.verify-cache
