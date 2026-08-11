@@ -76,6 +76,19 @@ class Settings(BaseSettings):
     failover_keep_tools: str = "local"
     failover_tool_result_chars: int = 2000
 
+    # Bare mode for an EXPLICIT `/model <name>` route, not just failover.
+    # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
+    # deliberate `/model qwen` handed the full unstripped harness to whatever
+    # tier the route named. That is fine for the 64K tiers and wrong for a tier
+    # whose window assumes bare mode: qwen3.5:27b-bare is 32K, and a full
+    # harness session does not fit — the same over-window regression the
+    # profile header warns about, on a 27B instead of a 4B.
+    # Set ROUTE_BARE=true on those profiles only. Deliberately reuses the
+    # failover_* keep-list and truncation knobs so both paths strip identically;
+    # a route that strips differently from failover would be a second behaviour
+    # to keep in sync for no benefit.
+    route_bare: bool = False
+
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True
     skip_title_generation: bool = True
