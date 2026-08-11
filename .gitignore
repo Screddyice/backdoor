@@ -6,6 +6,9 @@ dist/
 *.egg-info/
 proxy.log
 router.log
+
+# Hypercrawl output. Scraped contact data does not belong in the repo.
+out/
 workspace/
 .DS_Store
 .supercoder/
