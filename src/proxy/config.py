@@ -89,6 +89,24 @@ class Settings(BaseSettings):
     # to keep in sync for no benefit.
     route_bare: bool = False
 
+    # Largest post-strip session this tier will accept on an explicit
+    # `/model <name>` route. 0 disables the check.
+    #
+    # ROUTE_BARE bounds the system prompt and tool traffic; it does NOT bound the
+    # transcript, and the transcript is the half that grows. A long-lived `qwen`
+    # session therefore walks past its own window with nothing to stop it, and
+    # because MODEL_ROUTES is a static dict it never consults FAILOVER_LADDER —
+    # the one place that would have handed it to a wider tier. Measured
+    # 2026-08-12: a `qwen` session sent 143,490 tokens at the 27B's 32K window 87
+    # times over ~17 hours, failing and retrying every 5-10 minutes, loading 23GB
+    # of a 36GB host on each attempt. The window was configured correctly; there
+    # was simply no route from "too big for this tier" to "use the wider one".
+    #
+    # Set this to the same bound the tier carries in FAILOVER_LADDER so a
+    # deliberate route and a failover size the tier identically. Over it, the
+    # request escalates through that ladder instead of failing.
+    route_max_input_tokens: int = 0
+
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True
     skip_title_generation: bool = True

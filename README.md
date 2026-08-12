@@ -263,6 +263,26 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 
 Stripping reuses the `failover_*` keep-list and truncation budget, so both paths build the same request shape. A route that stripped differently from failover would be a second behaviour to keep in sync for no gain.
 
+#### Stripping bounds the prompt, not the transcript
+
+`ROUTE_BARE` fixes the *prompt* and leaves the *conversation* alone, and the conversation is the half that grows. A long-lived `qwen` session therefore walks past its own window with nothing to stop it — and because `MODEL_ROUTES` is a static dict, it never consults `FAILOVER_LADDER`, which is the one place that would have handed it to a wider tier.
+
+Observed 2026-08-12: a `qwen` session sent **143,490 tokens at the 27B's 32K window, 87 times over ~17 hours**, failing and retrying every 5–10 minutes and loading 23GB of a 36GB host on every attempt. The window was configured correctly. There was simply no route from "too big for this tier" to "use the wider one".
+
+Tiers now declare the largest post-strip session they will take:
+
+```
+ROUTE_MAX_INPUT_TOKENS=28000
+```
+
+Set it to the same bound the tier carries in `FAILOVER_LADDER`, so a deliberate route and a failover size that tier identically. Over it, the request escalates through the same ladder rather than failing:
+
+```
+⇢ ROUTE ESCALATE [local-failover-qwen27 → local-failover-256k] in≈143490 over 28000
+```
+
+Sizing happens **after** stripping, matching the failover branch — size the raw body and a bare-able session escalates to the wide 4B tier for no reason, wasting the stronger model. `0` disables the check, which is what the unstripped 64K tiers use.
+
 Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at roughly 15GB and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
 
 The `qwen` wrapper reaches Ollama by a third path and never reads this table. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile and nothing strips server-side. Its modes pick their own tier:
