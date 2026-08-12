@@ -283,13 +283,35 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 
 | Tier | Params | On disk | Resident | Tools | Notes |
 |---|---|---|---|---|---|
-| `qwen3.5:27b-bare` | 27.4B | 16.1 GB | **15 GB** | yes | Default, 32K window |
+| `qwen3.5:27b-bare` | 27.8B | 17.4 GB | **23 GB** | yes | Default, 32K window. GGUF — see below |
 | `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
 | `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
 
-The 27B costing less than the 14B is not a typo. int4 quantization plus qwen3.5's smaller KV wins on both terms, so you get roughly double the parameters, tool calling, and 5GB back. Measured by memory delta across the load: free 20.9GB to 6.0GB, wired 4.2GB to 18.7GB, agreeing with `ollama ps`.
-
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
+
+#### The 27B tier must be GGUF, not int4/MLX
+
+This tier used to be built `FROM qwen3.5:27b-int4` and was recorded here at **15 GB**. That number was real but it was a *floor*, not a steady state, and the difference took this host down.
+
+Ollama 0.23.4 serves int4 tags on its MLX engine, and **that engine applies `num_ctx` from neither the Modelfile nor `OLLAMA_CONTEXT_LENGTH`** — it loads the model's native window and spawns its runner with no `--ctx-size` at all. So the tier ran at 262144 instead of the 32768 it was configured for, in two places, and nothing reported an error. Measured 2026-08-12 on one server with one env:
+
+| Tag | Engine | Native | `num_ctx` on tag | `OLLAMA_CONTEXT_LENGTH` | Loaded at |
+|---|---|---|---|---|---|
+| `phi4-mini:3.8b` | GGUF | 131072 | *unset* | 32768 | **32768** ✅ |
+| `qwen3.5:27b-bare` (int4) | MLX | 262144 | 32768 | 32768 | **262144** ❌ |
+| `qwen3.5:27b-bare` (GGUF) | llama.cpp | 262144 | 32768 | 32768 | **32768** ✅ |
+
+`phi4-mini` carries no `num_ctx` of its own, so its clamp can only have come from the env — which is what proves the env reaches the GGUF path and is ignored on the MLX one.
+
+MLX also allocates KV *lazily*, so the tier loaded at the advertised 15 GB and grew toward **32 GB** as a session filled its 262K window. On a 36GB host that is the whole budget. The symptom is macOS's "Your system has run out of application memory", and it is deliberately hard to attribute: a 100%-GPU Ollama daemon shows up in neither the Force Quit list nor a RAM-percentage readout, so both indicators look calm while the machine dies.
+
+The GGUF build costs **8 GB more at rest** (23 GB vs the old 15 GB floor) and that is the correct trade: 23 GB bounded beats 15 GB unbounded. The window is now enforced, so the number stops moving. Tell the formats apart from the manifest — GGUF is a single `model` layer, MLX is many small `tensor` layers:
+
+```
+curl -s https://registry.ollama.ai/v2/library/qwen3.5/manifests/27b | jq '.layers[].mediaType'
+```
+
+**Verify the window with `ollama ps`, never with `ollama show --parameters`.** `--parameters` reads the tag's stored value and answers "was `num_ctx` written", which stayed a reassuring 32768 for the entire time the model was actually running at 262144. Only `ps` reports what the running instance loaded. An earlier revision of this file had that backwards, which is why the regression went unnoticed.
 
 Headroom exists because llm-jury reads `~/.backdoor/failover-state.json` and stands down while failover is active, so nothing else holds the GPU. Ollama caps residency by model count and never by bytes, and Metal allocations are wired and cannot be paged out, so over-committing panics this host rather than raising OOM. It did, twice, on 2026-07-31.
 

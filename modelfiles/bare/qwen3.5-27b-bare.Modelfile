@@ -14,9 +14,32 @@
 # base's SYSTEM directive, so `FROM qwen3.5:9b` produces a "bare" model carrying
 # all 43K tokens. That happened on the first attempt here and was not subtle:
 # the model answered from the baked prompt's tool vocabulary, inventing a
-# `weather_fetch` tool that the request never defined. qwen3.5:27b-int4 is a
-# pristine registry pull (verified: `ollama show --system` returns 0 bytes), so
-# this tag inherits nothing.
+# `weather_fetch` tool that the request never defined. qwen3.5:27b is a pristine
+# registry pull (verified: `ollama show --system` returns 0 bytes), so this tag
+# inherits nothing.
+#
+# BUILD FROM THE GGUF TAG, NOT THE int4/MLX ONE — this is a memory-safety
+# requirement, not a preference. Ollama 0.23.4 serves int4 tags on its MLX
+# engine (`ollama runner --mlx-engine ...`), and that engine applies num_ctx
+# from NEITHER the Modelfile NOR OLLAMA_CONTEXT_LENGTH: it loads the model's
+# native window and its runner is spawned with no --ctx-size argument at all.
+# The llama.cpp engine (`--ollama-engine`, used for GGUF/Q4_K_M) applies both.
+#
+# Measured 2026-08-12 on this host, same server, same env:
+#   phi4-mini:3.8b   GGUF  native 131072  num_ctx unset  → loaded at  32768 ✅
+#   qwen3.5:27b-bare MLX   native 262144  num_ctx 32768  → loaded at 262144 ❌
+# phi4-mini carries no num_ctx of its own, so its clamp can only have come from
+# OLLAMA_CONTEXT_LENGTH — which is what proves the env reaches the GGUF path and
+# is ignored on the MLX one. Tell the formats apart from the manifest: GGUF is a
+# single `model` layer, MLX is many small `tensor` layers.
+#
+# Cost of getting this wrong, observed in production: this tag ran at a 262144
+# window on a 36GB host. MLX allocates KV lazily, so it loads at the ~15GB below
+# and GROWS toward ~32GB as a session fills the window — which is why the sizing
+# measurement in this file was honest and the machine still ran out of memory.
+# "Out of application memory" is what you get; the RAM% readout and Force Quit's
+# app list both stay innocent, because a 100%-GPU Ollama daemon appears in
+# neither.
 #
 #   ollama create qwen3.5:27b-bare -f modelfiles/bare/qwen3.5-27b-bare.Modelfile
 #
@@ -31,8 +54,18 @@
 # Why 32K and not the model's native 262144: KV is charged num_ctx x
 # OLLAMA_NUM_PARALLEL, so the window is the expensive knob. Bare mode keeps the
 # prompt small enough that 32K is generous, and FAILOVER_LADDER hands anything
-# larger to the 4B 256K tier. Note `ollama ps` displays the model's native
-# context in its CONTEXT column regardless; `ollama show --parameters` is what
-# confirms num_ctx actually applied.
-FROM qwen3.5:27b-int4
+# larger to the 4B 256K tier.
+#
+# VERIFY THE WINDOW WITH `ollama ps`, NOT `ollama show --parameters`. An earlier
+# revision of this comment had that backwards — it claimed the CONTEXT column
+# always prints the model's native window and that only `--parameters` confirms
+# num_ctx applied. Both halves are wrong, and believing them is what let the
+# 262144 regression above sit unnoticed:
+#   `ollama show --parameters` reads the TAG's stored parameter. It answers
+#     "was num_ctx written to the tag", which stayed 32768 the whole time the
+#     model was actually running at 262144. It cannot see the load at all.
+#   `ollama ps` CONTEXT reports what the running instance ACTUALLY loaded —
+#     proven above by phi4-mini printing 32768 against a 131072 native window.
+# So: --parameters checks the build, ps checks the truth. Only ps can catch this.
+FROM qwen3.5:27b
 PARAMETER num_ctx 32768
