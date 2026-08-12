@@ -260,7 +260,6 @@ async def create_message(
                 get_breaker(settings).reason,
             )
         settings = load_profile_settings(profile)
-        client = _get_profile_client(profile, settings)
 
         # An explicit `/model <name>` hit MODEL_ROUTES and so skipped the
         # failover branch above — the only place that stripped. Tiers whose
@@ -277,17 +276,36 @@ async def create_message(
                     tool_result_chars=settings.failover_tool_result_chars,
                 )
                 bare_req = stripped  # only on success: make_bare is pure
+                est = count_messages(stripped.messages, stripped.system, stripped.tools)
+
+                # Size the tier AFTER stripping, the same ordering and the same
+                # ladder the failover branch uses. Stripping bounds the prompt but
+                # not the transcript, so a long-lived route session outgrows its
+                # window; MODEL_ROUTES is static and would keep sending it there
+                # forever. Escalate instead of failing.
+                if settings.route_max_input_tokens and est > settings.route_max_input_tokens:
+                    escalated = pick_failover_profile(est)
+                    if escalated != profile:
+                        logger.warning(
+                            "⇢ ROUTE ESCALATE [%s → %s] in≈%s over %s",
+                            profile, escalated, est, settings.route_max_input_tokens,
+                        )
+                        profile = escalated
+                        settings = load_profile_settings(profile)
+
                 logger.info(
                     "→ local [%s → %s] bare in≈%s (raw %s)",
-                    model, profile,
-                    count_messages(stripped.messages, stripped.system, stripped.tools),
-                    raw_est,
+                    model, profile, est, raw_est,
                 )
             except Exception:
                 # Same rule as failover: stripping must never break the request.
                 # Unstripped may overflow the window, but that surfaces as an
                 # honest provider error rather than a request we dropped here.
                 logger.exception("route bare-mode failed; sending unstripped to %s", profile)
+
+        # Built last: the escalation above can change which profile serves this
+        # request, and the client must follow the profile actually chosen.
+        client = _get_profile_client(profile, settings)
 
     req = bare_req if bare_req is not None else MessagesRequest.model_validate_json(body)
 
