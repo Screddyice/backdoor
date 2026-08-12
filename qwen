@@ -40,11 +40,11 @@
 #               the curated stack overflows the 64K window) and were half of why
 #               full mode crawled, so MCP is OFF by default in ALL modes.
 #   QWEN_MCP=1  opt INTO MCP (any mode). Loads the curated stack
-#               (composio-tmn/cliqk/trc + nebos + hypercrawl) — needs internet,
+#               (whatever you list in QWEN_MCP_SERVERS) — needs internet,
 #               and you'll want a bigger-context model tag (e.g. qwen3.5:9b-256k)
 #               since the schemas don't fit 64K.
 #   QWEN_MCP_SERVERS=a,b,c  override which ~/.claude.json servers to load
-#               (slimmest useful set: composio-tmn,composio-cliqk ≈ 12 tools).
+#               (keep it small: two servers is often ~12 tools).
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"   # bd + claude live here
 
@@ -115,7 +115,7 @@ fi
 #    crawled. So default to no MCP; opt in with QWEN_MCP=1 (and switch to a
 #    bigger-context tag like qwen3.5:9b-256k, since the schemas won't fit 64K).
 #    When opted in, QWEN_MCP_SERVERS picks the servers (default: our own stack
-#    — Composio routers for TMN/Cliqk/TRC + NEBOS + HyperCrawl).
+#    — set QWEN_MCP_SERVERS to the ~/.claude.json servers you want).
 MCP_DEFAULT=0
 MCP_ARGS=()
 # Optional: cloud Mem0 only (small schema) so local Ollama still has long-term memory.
@@ -161,7 +161,7 @@ else
   # Lives in ~/.cache (NOT the backdoor repo) because it contains API keys.
   MCP_CONF="$HOME/.cache/backdoor/qwen-mcp.json"
   mkdir -p "$(dirname "$MCP_CONF")"
-  QWEN_MCP_SERVERS="${QWEN_MCP_SERVERS:-composio-tmn,composio-cliqk,composio-trc,nebos,hypercrawl}" \
+  QWEN_MCP_SERVERS="${QWEN_MCP_SERVERS:-}" \
     python3 - "$MCP_CONF" <<'PY'
 import json, os, sys
 cfg = json.load(open(os.path.expanduser('~/.claude.json')))
@@ -231,7 +231,7 @@ curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
 if [ "${MCP_ARGS[2]:-}" = "$HOME/backdoor/empty-mcp.json" ]; then
   MCP_NOTE="offline"
 else
-  MCP_NOTE="MCP: ${QWEN_MCP_SERVERS:-composio-tmn,composio-cliqk,composio-trc,nebos,hypercrawl} (net)"
+  MCP_NOTE="MCP: ${QWEN_MCP_SERVERS:-<none set>} (net)"
 fi
 echo "▶ Local model: $MODEL ($PROFILE, $MODE_NOTE) — $MCP_NOTE"
 # API_TIMEOUT_MS: a cold 50K-token full-harness prefill takes ~2-3 min on the

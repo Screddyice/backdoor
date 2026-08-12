@@ -49,7 +49,7 @@ def test_local_token_keeps_harness_tools_and_drops_mcp():
         Tool(name="Read"), Tool(name="Bash"), Tool(name="Grep"),
         Tool(name="mcp__plugin_mem0_mem0__search_memories"),
         Tool(name="mcp__apify__search-actors"),
-        Tool(name="mcp__nebos__crm_list"),
+        Tool(name="mcp__example__crm_list"),
     ]))
     assert [t.name for t in out.tools] == ["Read", "Bash", "Grep"]
 

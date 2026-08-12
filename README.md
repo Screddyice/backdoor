@@ -131,21 +131,6 @@ If a new AI provider launches tomorrow, you can use it with Backdoor the same da
 
 ---
 
-## Bonus: hypercrawl, a community-site contact scraper
-
-Separate from the proxy and separate from `run.sh`. It reads the public pages of a community site and writes the contact addresses it finds to a file.
-
-```bash
-./scripts/hypercrawl.py --domain lu.ma --max-pages 3
-```
-
-Public pages only, with no login and no cookie jar. It honours `robots.txt` and spaces requests two seconds apart, both by default.
-
-The interesting part is what it refuses to collect. The obvious address regex matches `logo@2x.png`, and so does every retina sprite in a `srcset`, so a naive pass over a real page returns images alongside people. The filter drops asset extensions, retina suffixes, placeholder domains, and `noreply` addresses, erring toward rejection: a false positive becomes a bounced send, while a missed address is one you never knew about.
-
-Full documentation in [HYPERCRAWL_INTEGRATION.md](./HYPERCRAWL_INTEGRATION.md).
-
----
 
 ## Bonus: control Claude Code from your phone
 
