@@ -315,13 +315,47 @@ async def create_message(
 
     if client is None:
         client = get_provider_client()
+
+    est_in = count_messages(req.messages, req.system, req.tools)
+
+    # Last-resort tier guard, deliberately placed AFTER every routing branch so
+    # no path can skip it. The hybrid branch above already sizes MODEL_ROUTES
+    # hits, but "profile" mode never enters that branch at all: it translates
+    # every request to the single active profile, with no ladder and no size
+    # check anywhere. That is the mode the `qwen` wrapper runs on :8082, and it
+    # is the mode the 2026-08-12 pile-up went through — 143,490 tokens sent at a
+    # 32K window 87 times over ~17 hours, each attempt reloading the tier.
+    # Guarding only the hybrid path fixed a real gap but not that one.
+    #
+    # Escalation is by MODEL, not profile name, so this stays correct however
+    # the tier was chosen and cannot bounce a request to a profile serving the
+    # same model. Tiers that opt out (route_max_input_tokens unset, i.e. the
+    # wide 64K/256K ones) are unaffected, which also stops a second escalation
+    # firing on top of the hybrid branch's.
+    if settings.route_max_input_tokens and est_in > settings.route_max_input_tokens:
+        try:
+            escalated = pick_failover_profile(est_in)
+            esettings = load_profile_settings(escalated)
+            if esettings.provider_model != settings.provider_model:
+                logger.warning(
+                    "⇢ TIER ESCALATE [%s → %s] in≈%s over %s",
+                    settings.provider_model, esettings.provider_model,
+                    est_in, settings.route_max_input_tokens,
+                )
+                settings = esettings
+                client = _get_profile_client(escalated, esettings)
+        except Exception:
+            # A failed escalation must never take the request with it. Sending
+            # it to the original tier reproduces the old behaviour — an honest
+            # provider error — which beats dropping it here.
+            logger.exception("tier escalation failed; staying on %s", settings.provider_model)
+
     payload = build_nim_payload(req, settings)
     msg_id = f"msg_{uuid.uuid4().hex}"
     last_user = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
     preview = (last_user if isinstance(last_user, str) else str(last_user))[:80]
     mode = "stream" if req.stream else "complete"
     provider = settings.provider_model
-    est_in = count_messages(req.messages, req.system, req.tools)
     logger.info("→ %s [%s] tools=%s in≈%s | %r", provider, mode, len(req.tools or []), est_in, preview)
 
     if req.stream:
