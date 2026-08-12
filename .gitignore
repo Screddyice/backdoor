@@ -7,7 +7,7 @@ dist/
 proxy.log
 router.log
 
-# Hypercrawl output. Scraped contact data does not belong in the repo.
+# Local run artifacts and scratch workspaces.
 out/
 workspace/
 .DS_Store

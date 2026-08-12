@@ -54,8 +54,7 @@ from .models import MessagesRequest, Message
 # breaker opens on one condition only: this host is offline.
 #
 # That also happens to be where the weight is. The ~286K tokens of definitions
-# measured on this machine came from MCP servers (apify, atlassian, nebos,
-# hostinger, composio), not from the dozen local tools, so dropping `mcp__*`
+# measured on this machine came from MCP servers, not from the dozen local tools, so dropping `mcp__*`
 # removes nearly all of the cost and nearly none of the offline capability.
 #
 # Mem0 is the interesting case and it belongs on the dropped side. Its MCP tools
