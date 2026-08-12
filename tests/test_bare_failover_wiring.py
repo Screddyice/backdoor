@@ -217,6 +217,65 @@ async def test_small_route_session_stays_on_the_27b(route_app):
     assert seen[-1] == "local-failover-qwen27", seen
 
 
+async def test_profile_mode_oversized_session_escalates(monkeypatch):
+    """The gap PR #24 left open, and the one the real incident went through.
+
+    The 2026-08-12 pile-up was a `qwen` wrapper session on :8082, which runs
+    router_mode="profile" — a mode that translates every request to the single
+    active profile and never enters the hybrid branch where #24's guard lives.
+    So the tier check never ran on the exact path that failed 87 times.
+    """
+    recorder = RecordingClient()
+    seen: list[str] = []
+
+    def _capture(profile, settings):
+        seen.append(profile)
+        return recorder
+
+    monkeypatch.setattr(routes, "_get_profile_client", _capture)
+    routes.set_provider_client(recorder)  # profile mode's default client
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_model="qwen3.5:27b-bare",
+        route_max_input_tokens=28_000,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=20))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert seen and seen[-1] == "local-failover-256k", (
+        f"profile-mode session over the tier window went to {seen or 'the same tier'}; "
+        "it must escalate instead of failing forever"
+    )
+
+
+async def test_profile_mode_normal_session_stays_put(monkeypatch):
+    """Regression guard: the guard must not pull ordinary wrapper sessions off
+    the tier the user deliberately selected."""
+    recorder = RecordingClient()
+    seen: list[str] = []
+    monkeypatch.setattr(routes, "_get_profile_client", lambda p, s: (seen.append(p), recorder)[1])
+    routes.set_provider_client(recorder)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_model="qwen3.5:27b-bare",
+        route_max_input_tokens=28_000,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=1))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert not seen, f"small session was needlessly escalated to {seen}"
+
+
 async def test_oversized_route_session_escalates_to_the_wide_tier(route_app):
     """The bug. A transcript that overflows the 27B's window has to reach the
     256K tier, exactly as the failover path would route it. Before this fix the

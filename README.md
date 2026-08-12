@@ -268,6 +268,24 @@ Set it to the same bound the tier carries in `FAILOVER_LADDER`, so a deliberate 
 
 Sizing happens **after** stripping, matching the failover branch — size the raw body and a bare-able session escalates to the wide 4B tier for no reason, wasting the stronger model. `0` disables the check, which is what the unstripped 64K tiers use.
 
+#### The guard has to sit below every routing branch
+
+The paragraph above describes the check on the **hybrid** path, and on its own it does not cover the incident it cites. That pile-up came from a `qwen` wrapper session on `:8082`, which runs `router_mode="profile"` — a mode that translates every request to the single active profile and never enters the hybrid branch at all. A guard living inside that branch cannot see the traffic that actually failed.
+
+So the tier check runs **after every routing branch has chosen**, where no path can skip it:
+
+```
+⇢ TIER ESCALATE [qwen3.5:27b-bare → qwen3.5:4b-256k] in≈143490 over 28000
+```
+
+Three properties make that placement safe:
+
+- **It escalates by model, not by profile name.** However the tier was selected — hybrid route, failover ladder, or a plain profile translation — a request is never bounced to a profile serving the model it is already on.
+- **It cannot fire twice.** The wide tiers leave `ROUTE_MAX_INPUT_TOKENS` unset, so once the hybrid branch has escalated, the backstop finds nothing to do.
+- **Escalation failure is not request failure.** If the wider profile cannot be loaded, the request continues on its original tier and surfaces an honest provider error, which is what it did before.
+
+The general lesson: `router_mode` is a real fork in this file, and a guard is only as good as the branch it sits in. Verify a fix against the mode the failure actually used, not the one you were reading when you wrote it.
+
 Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at roughly 15GB and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
 
 The `qwen` wrapper reaches Ollama by a third path and never reads this table. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile and nothing strips server-side. Its modes pick their own tier:
