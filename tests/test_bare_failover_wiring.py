@@ -160,3 +160,71 @@ async def test_stripped_size_picks_the_tier(offline_app):
 
     assert pick_failover_profile(raw) == "local-failover-256k"       # the 4B
     assert pick_failover_profile(stripped) == "local-failover-qwen27"
+
+
+# --- deliberate `/model qwen` must obey the ladder too ---------------------
+#
+# MODEL_ROUTES short-circuits the failover branch, which is the only place that
+# consulted FAILOVER_LADDER. So a deliberate route picked its tier from a static
+# dict and never sized the session at all. Observed 2026-08-12: a `qwen` session
+# sent 143,490 tokens at the 27B's 32K window 87 times over ~17 hours, failing
+# and retrying every 5-10 minutes and loading 23GB on each attempt.
+
+
+@pytest.fixture
+def route_app(monkeypatch):
+    """Online app exercising the MODEL_ROUTES path. No breaker involved: a
+    `/model qwen` never reaches the failover branch."""
+    recorder = RecordingClient()
+    seen: list[str] = []
+
+    def _capture(profile, settings):
+        seen.append(profile)
+        return recorder
+
+    monkeypatch.setattr(routes, "_get_profile_client", _capture)
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(router_mode="hybrid")
+    try:
+        yield app, recorder, seen
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _route_request(turns: int) -> dict:
+    """A `/model qwen` session whose CONVERSATION carries the weight. Bare mode
+    strips the system prompt and tool traffic but never the transcript, so this
+    is what a long-running `qwen` session actually becomes."""
+    turn = "Investigate how we can scrape the community directory. " * 400
+    return {
+        "model": "qwen",
+        "system": HARNESS_SYSTEM,
+        "tools": [{"name": "Bash", "description": "run a command", "input_schema": {}}],
+        "messages": [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": turn}
+            for i in range(turns)
+        ],
+    }
+
+
+async def test_small_route_session_stays_on_the_27b(route_app):
+    """The common case must not regress: bare mode makes 32K generous, so a
+    normal `qwen` session keeps the stronger model."""
+    app, _recorder, seen = route_app
+    resp = await _post(app, _route_request(turns=1))
+
+    assert resp.status_code == 200
+    assert seen[-1] == "local-failover-qwen27", seen
+
+
+async def test_oversized_route_session_escalates_to_the_wide_tier(route_app):
+    """The bug. A transcript that overflows the 27B's window has to reach the
+    256K tier, exactly as the failover path would route it. Before this fix the
+    static MODEL_ROUTES entry won and the request failed forever."""
+    app, _recorder, seen = route_app
+    resp = await _post(app, _route_request(turns=20))
+
+    assert resp.status_code == 200
+    assert seen[-1] == "local-failover-256k", (
+        f"oversized /model qwen session stayed on {seen[-1]}; it must escalate"
+    )
