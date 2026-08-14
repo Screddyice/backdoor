@@ -12,6 +12,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "tiktoken>=0.7",
     "python-telegram-bot>=21.0",
+    # Mints the local CA and per-host leaf certificates the CONNECT forward
+    # proxy needs to terminate TLS for api.anthropic.com. See src/proxy/ca.py.
+    "cryptography>=42.0",
 ]
 
 [dependency-groups]

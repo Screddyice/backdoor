@@ -203,7 +203,52 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
-> **Point Claude Code at the router, or none of this runs.** Failover lives in the request path, so a session started with `ANTHROPIC_BASE_URL` unset gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the base URL first.
+> **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
+
+### Forward-proxy mode: failover *and* Remote Control
+
+Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
+
+```js
+function eit(){ let e=process.env.ANTHROPIC_BASE_URL; if(!e) return true; return Oxe(e) }
+function Oxe(e){ let t=new URL(e).host; return ["api.anthropic.com"].includes(t) }
+```
+
+The allowlist is exact and there is no escape hatch — the binary states that `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` "does not apply to Remote Control". That forced an either/or: routed sessions had failover but no phone control, direct sessions had phone control but no failover.
+
+The premise was wrong. Backdoor has to be **in the path**, not **named as the endpoint** — and Claude Code honours `HTTPS_PROXY`. Enable `FORWARD_PROXY` and the router also serves an HTTP CONNECT proxy on `:8084`:
+
+```
+claude  (ANTHROPIC_BASE_URL unset  →  Remote Control offered)
+  │  HTTPS_PROXY=http://127.0.0.1:8084
+  ├── CONNECT api.anthropic.com:443 ──► TLS-terminated ──► :8083 router
+  └── CONNECT everything else       ──► opaque tunnel, untouched
+```
+
+Point a session at it:
+
+```bash
+env -u ANTHROPIC_BASE_URL \
+    HTTPS_PROXY=http://127.0.0.1:8084 \
+    NODE_EXTRA_CA_CERTS=~/.backdoor/ca/ca-cert.pem \
+    claude
+```
+
+`/model qwen` and offline failover keep working, and `claude remote-control` starts instead of refusing.
+
+**Only allowlisted hosts are inspected.** `FORWARD_MITM_HOSTS` defaults to `api.anthropic.com`; everything else — Composio, npm, your MCP servers, and the Remote Control bridge to claude.ai — is relayed as opaque bytes, so nothing else can have its TLS broken by a proxy it never asked for.
+
+**About the CA.** Reading a CONNECT tunnel means presenting a certificate for a host you do not own, so Backdoor mints one from a CA at `~/.backdoor/ca` (key `0600`). It is **never** installed into the system keychain: the only thing that trusts it is a process you hand `NODE_EXTRA_CA_CERTS` to. Every other program on the machine rejects anything it signs. Delete the directory to revoke it; it regenerates on next use.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `FORWARD_PROXY` | `false` | Enable the CONNECT proxy |
+| `FORWARD_PORT` | `8084` | Port it listens on |
+| `FORWARD_MITM_HOSTS` | `api.anthropic.com` | Hosts to intercept; all others tunnel blind |
+| `FORWARD_ROUTER_PORT` | `8083` | Where intercepted traffic is delivered |
+| `FORWARD_CA_DIR` | `~/.backdoor/ca` | CA and minted leaves |
+
+Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
 
 ### Bare mode: what the local model actually receives
 
