@@ -189,6 +189,25 @@ else
   EXTRA_ARGS=(--bare)
   HARNESS_DIR="$(ls -dt "$HOME"/.claude/plugins/cache/claude-harness/claude-harness/*/ 2>/dev/null | head -1)"
   [ -n "$HARNESS_DIR" ] && EXTRA_ARGS+=(--plugin-dir "$HARNESS_DIR")
+
+  # --bare also skips CLAUDE.md auto-discovery and EVERY hook. `claude --help`
+  # says so outright, and a SessionStart probe confirmed it on 2026-08-15: the
+  # hook fired without --bare and did not fire with it, and --settings cannot
+  # put it back.
+  #
+  # That quietly removed both halves of PR creation from local-model sessions.
+  # The model never saw the every-branch-gets-a-PR rule (it lives in CLAUDE.md),
+  # and auto-pr-push.sh never fired to do it on the model's behalf. The branch
+  # got commits, nothing opened a PR, and nothing said why.
+  #
+  # Re-inject the git/PR rules only. Loading the real CLAUDE.md set via
+  # --add-dir would work but costs ~33KB — a quarter of the 27B's 32K window,
+  # for context that is mostly irrelevant to a local coding turn. `--append-
+  # system-prompt` takes the text inline; there is no `-file` form despite what
+  # the --bare help text implies.
+  PR_RULES="$HOME/backdoor/prompts/qwen-pr-rules.md"
+  [ -f "$PR_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$(cat "$PR_RULES")")
+
   MODE_NOTE="lean"
 fi
 
@@ -238,6 +257,32 @@ echo "▶ Local model: $MODEL ($PROFILE, $MODE_NOTE) — $MCP_NOTE"
 # 9B; Claude Code's default timeout aborts + retries mid-prefill, doubling it.
 # ${arr[@]+...} guards: macOS bash 3.2 + `set -u` errors on expanding an
 # empty array; MCP_ARGS is empty whenever MCP is on.
-exec env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" \
+#
+# Not `exec`, deliberately. Replacing this shell would leave nothing to run
+# AFTER the session, and --bare disables hooks — including the Stop hook that
+# normally guarantees a branch does not end the day without a PR. Dropping exec
+# costs one idle shell and buys back that backstop (step 7).
+env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" \
   API_TIMEOUT_MS=600000 \
   claude ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} "$@"
+claude_status=$?
+
+# 7. PR backstop — the Stop hook this session never got.
+#
+# Runs the same auto-pr-push.sh the harness would have run, in the directory the
+# session worked in (this wrapper never cd's). It is safe to call unconditionally:
+# it no-ops unless the repo's origin owner is on the allowlist, the branch is off
+# trunk, has commits ahead, and has no open PR — and hook-common.sh refuses any
+# repo with `rs21` in its name outright. It backgrounds and disowns its own work,
+# so it does not delay the prompt coming back.
+#
+# stdin is /dev/null on purpose: the script reads a hook JSON payload from stdin
+# and falls back to the current directory when it gets nothing, which is exactly
+# the behaviour wanted here.
+AUTO_PR="$HOME/projects/Screddyice/claude-code-harness/scripts/hooks/auto-pr-push.sh"
+if [ -x "$AUTO_PR" ]; then
+  HARNESS_PR_OWNERS="${HARNESS_PR_OWNERS:-teamnebula-ai screddyice}" \
+    "$AUTO_PR" </dev/null >/dev/null 2>&1 || true
+fi
+
+exit "$claude_status"
