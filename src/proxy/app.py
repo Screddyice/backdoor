@@ -52,7 +52,44 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Telegram bot failed to start")
 
+    # Start the CONNECT forward proxy if configured. It shares this event loop
+    # and splices intercepted traffic back into this same uvicorn over loopback,
+    # so it needs no separate service to supervise.
+    #
+    # A failure here must not take the router down: without the forward proxy a
+    # session simply falls back to whatever ANTHROPIC_BASE_URL says, which is
+    # degraded but working. Killing the router instead would take out inference
+    # for every session on the machine.
+    forward = None
+    if settings.forward_proxy:
+        try:
+            from .ca import LocalCA
+            from .forward import ForwardProxy
+
+            forward = ForwardProxy(
+                listen_host=settings.forward_host,
+                listen_port=settings.forward_port,
+                mitm_hosts=settings.forward_mitm_hosts.split(","),
+                router_host=settings.forward_router_host,
+                router_port=settings.forward_router_port,
+                ca=LocalCA(settings.forward_ca_dir),
+            )
+            await forward.start()
+            logger.info(
+                "Forward proxy ready — HTTPS_PROXY=http://%s:%d, "
+                "NODE_EXTRA_CA_CERTS=%s",
+                settings.forward_host,
+                forward.port,
+                forward.ca.ca_cert_path,
+            )
+        except Exception:
+            logger.exception("Forward proxy failed to start; continuing without it")
+            forward = None
+
     yield
+
+    if forward:
+        await forward.stop()
 
     if tg_app:
         await tg_app.updater.stop()
