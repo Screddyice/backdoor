@@ -56,12 +56,39 @@ def test_placeholder_keys_refuse_boot(monkeypatch, value):
         require_bridge_key()
 
 
-def test_the_guard_error_never_contains_the_key(monkeypatch):
-    secret = "k" * 5
-    monkeypatch.setenv("HERMES_MCP_KEY", secret)
+@pytest.mark.parametrize("case, key", [
+    ("missing", None),
+    ("short", "9f2c1a7d"),
+    ("entropy", "a" * 32),
+    ("placeholder", "replace_with_key"),
+])
+def test_the_guard_error_never_contains_the_key(monkeypatch, case, key):
+    """Parametrized across all three raise sites in require_bridge_key(), so a
+    debugging aid added to any single branch's message would still be caught
+    here rather than slipping past an assertion that only ever exercised one
+    branch.
+
+    - missing: HERMES_MCP_KEY unset -> the "is unset" branch. There is no
+      value to leak; the assertion is that the message still names the
+      variable.
+    - short: "9f2c1a7d" is 8 high-entropy characters, below MIN_KEY_LEN (16)
+      -> the length branch, before the placeholder/entropy check ever runs.
+    - entropy: "a" * 32 clears MIN_KEY_LEN but has a character set of size 1
+      -> the placeholder branch, via its `len(set(lowered)) <= 2` arm.
+    - placeholder: "replace_with_key" is exactly MIN_KEY_LEN (16) characters
+      and a literal member of PLACEHOLDERS -> the same branch as "entropy",
+      but via its `lowered in PLACEHOLDERS` arm instead.
+    """
+    if key is None:
+        monkeypatch.delenv("HERMES_MCP_KEY", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_MCP_KEY", key)
     with pytest.raises(KeyGuardError) as e:
         require_bridge_key()
-    assert secret not in str(e.value)
+    message = str(e.value)
+    assert "HERMES_MCP_KEY" in message
+    if key is not None:
+        assert key not in message
 
 
 async def test_build_server_registers_every_expected_tool(monkeypatch):

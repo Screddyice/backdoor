@@ -1,14 +1,16 @@
-"""FastMCP server exposing Hermes gateways over streamable HTTP.
+"""MCPServer app exposing Hermes gateways over streamable HTTP.
 
 Two auth boundaries, deliberately distinct. Callers authenticate to the bridge
 with HERMES_MCP_KEY. The bridge authenticates to each gateway with that
 gateway's own key, named by the registry and read from the environment. A
 caller never holds a gateway key.
 
-The boot guard mirrors the one Hermes applies to its own API server, and for a
-stronger reason: that one is loopback-only by default, this one is reachable
-from outside the host. A bridge that boots with a weak key and rejects requests
-later is a bridge someone eventually "fixes" by turning the auth off.
+The boot guard mirrors the one Hermes applies to its own API server. This
+process binds loopback too, but a tunnel publishes it beyond the host, while
+the gateway API servers it fronts are never exposed at all — so a weak key
+here is the one weak key that actually reaches the network. A bridge that
+boots with a weak key and rejects requests later is a bridge someone
+eventually "fixes" by turning the auth off.
 
 Note: the installed mcp SDK (mcp==2.0.0) renamed FastMCP to MCPServer and
 dropped `mcp.server.fastmcp`; MCPServer is used here in its place. Its public
@@ -28,8 +30,8 @@ from .tools import register_tools
 
 logger = logging.getLogger(__name__)
 
-MIN_KEY_LEN = 16
-PLACEHOLDERS = frozenset(
+MIN_KEY_LEN: int = 16
+PLACEHOLDERS: frozenset[str] = frozenset(
     {"changeme", "change-me", "your-key-here", "replace_with_key",
      "replace-with-key", "secret", "password", "test", "example"}
 )
@@ -57,7 +59,7 @@ def require_bridge_key() -> str:
 
 
 def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
-    """Build the FastMCP app. Applies the boot guard before registering anything."""
+    """Build the MCPServer app. Applies the boot guard before registering anything."""
     require_bridge_key()
     if registry is None:
         registry = load_registry()
