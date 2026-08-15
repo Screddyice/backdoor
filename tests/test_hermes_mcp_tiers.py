@@ -14,7 +14,7 @@ without adding it to CHAT_TOOLS would silently open control_only profiles to it.
 import pytest
 
 from src.hermes_mcp.registry import Profile
-from src.hermes_mcp.tools import CHAT_TOOLS, check_tier, resolve
+from src.hermes_mcp.tools import CHAT_TOOLS, check_tier, register_tools, resolve
 
 FULL = Profile(name="alpha", tier="full", port=9001, key_env="A", unit="a.service")
 LOCKED = Profile(name="prod", tier="control_only", port=9002, key_env="B", unit="b.service")
@@ -87,9 +87,6 @@ def test_unrecognised_tier_is_refused(tool):
     )
 
 
-from src.hermes_mcp.tools import register_tools
-
-
 class _MCP:
     def __init__(self):
         self.tools = {}
@@ -129,6 +126,17 @@ async def test_chat_reaches_a_full_profile():
     assert got["ok"] is True
     name, method, path, body = _Client.calls[-1]
     assert (name, method) == ("alpha", "POST")
+    assert body["input"] == "hello"
+    assert "session_id" not in body, "session_id must be omitted when not provided"
+
+
+async def test_chat_with_session_id_includes_it():
+    """When session_id is provided, it must appear in the request body."""
+    t = _tools()
+    got = await t["hermes_chat"](profile="alpha", message="hello", session_id="s-1")
+    assert got["ok"] is True
+    name, method, path, body = _Client.calls[-1]
+    assert body["session_id"] == "s-1"
     assert body["input"] == "hello"
 
 
