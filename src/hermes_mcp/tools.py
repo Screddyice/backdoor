@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from .client import GatewayClient, MissingKey, state
 from .registry import Profile
@@ -17,11 +18,32 @@ logger = logging.getLogger(__name__)
 
 #: Tools that hold a conversation with an agent. Refused for control_only.
 #: This set is pinned by tests/test_hermes_mcp_tiers.py to detect if an existing
-#: member is removed or renamed. It does NOT detect if a new conversational tool
-#: is added without being added to this set; verifying the tool surface requires
-#: the tool definitions themselves, which arrive in a later task.
+#: member is removed or renamed. Paired with NON_CHAT_TOOLS below, whose union
+#: against every tool actually registered on the MCP instance is what catches a
+#: new conversational tool added without being added here.
 CHAT_TOOLS = frozenset(
     {"hermes_chat", "hermes_run_status", "hermes_run_stop", "hermes_run_approve"}
+)
+
+#: Every registered tool that is not conversational. Together with CHAT_TOOLS,
+#: this pins the full tool surface: tests/test_hermes_mcp_tiers.py asserts that
+#: the set of tool names actually registered on the MCP instance equals
+#: CHAT_TOOLS | NON_CHAT_TOOLS, so a tool added to neither set fails immediately.
+NON_CHAT_TOOLS = frozenset(
+    {
+        "hermes_list",
+        "hermes_status",
+        "hermes_sessions",
+        "hermes_session_messages",
+        "hermes_models",
+        "hermes_skills",
+        "hermes_toolsets",
+        "hermes_jobs",
+        "hermes_start",
+        "hermes_stop",
+        "hermes_restart",
+        "hermes_logs",
+    }
 )
 
 
@@ -65,12 +87,21 @@ def resolve(registry: dict[str, Profile], name: str) -> tuple[Profile | None, di
     )
 
 
-def register_tools(mcp, registry: dict[str, Profile], *, client_factory=GatewayClient) -> None:
+def register_tools(
+    mcp,
+    registry: dict[str, Profile],
+    *,
+    client_factory=GatewayClient,
+    runner=None,
+) -> None:
     """Register every bridge tool against *mcp*.
 
     client_factory is injectable so tests can supply a fake without patching
-    module globals.
+    module globals. runner is injectable the same way for the lifecycle tools,
+    which shell out to `systemctl --user` instead of going through client_factory.
     """
+    if runner is None:
+        runner = asyncio.create_subprocess_exec
 
     async def _probe(profile: Profile) -> dict:
         """Probe one profile. Never raises: hermes_list fans out over these.
@@ -193,3 +224,76 @@ def register_tools(mcp, registry: dict[str, Profile], *, client_factory=GatewayC
             profile, "hermes_run_approve", "POST",
             f"/v1/runs/{run_id}/approval", {"approved": approved},
         )
+
+    async def _systemctl(profile_name: str, verb: str) -> dict:
+        profile, refusal = resolve(registry, profile_name)
+        if refusal is not None:
+            return refusal
+        refusal = check_tier(profile, f"hermes_{verb}")
+        if refusal is not None:
+            return refusal
+        if not profile.unit:
+            return state(
+                profile.name, "stopped",
+                reason="no systemd unit is registered for this profile",
+                next="run `hermes gateway install` for it, then add unit to the registry",
+            )
+        proc = await runner(
+            "systemctl", "--user", verb, profile.unit,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            return state(
+                profile.name, "unreachable",
+                reason=(err or out).decode("utf-8", "replace").strip()
+                or f"systemctl {verb} exited {proc.returncode}",
+                next="check `systemctl --user status` for the unit",
+            )
+        return state(profile.name, "ok", reason=f"systemctl {verb} succeeded")
+
+    @mcp.tool()
+    async def hermes_start(profile: str) -> dict:
+        """Start a profile's gateway. Requires a registered systemd unit."""
+        return await _systemctl(profile, "start")
+
+    @mcp.tool()
+    async def hermes_stop(profile: str) -> dict:
+        """Stop a profile's gateway."""
+        return await _systemctl(profile, "stop")
+
+    @mcp.tool()
+    async def hermes_restart(profile: str) -> dict:
+        """Restart a profile's gateway.
+
+        This resumes its messaging-platform connections, so side effects that
+        were paused while it was down resume too.
+        """
+        return await _systemctl(profile, "restart")
+
+    @mcp.tool()
+    async def hermes_logs(profile: str, lines: int = 50) -> dict:
+        """Tail a profile's gateway log."""
+        p, refusal = resolve(registry, profile)
+        if refusal is not None:
+            return refusal
+        refusal = check_tier(p, "hermes_logs")
+        if refusal is not None:
+            return refusal
+        if not p.home:
+            return state(
+                p.name, "unconfigured",
+                reason="no home is registered for this profile, so its log path is unknown",
+                next="add home to the registry entry",
+            )
+        path = Path(p.home) / "logs" / "gateway.log"
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return state(
+                p.name, "unreachable",
+                reason=f"cannot read {path}: {type(exc).__name__}",
+                next="check the profile home and whether the gateway has ever started",
+            )
+        tail = content.splitlines()[-lines:] if lines > 0 else []
+        return {"profile": p.name, "state": "ok", "lines": tail}
