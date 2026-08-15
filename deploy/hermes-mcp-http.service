@@ -22,11 +22,15 @@
 #     top — the allowlist only widens, DNS-rebinding protection stays on.
 #     Needed when the bridge runs behind a tunnel that forwards a public
 #     hostname in the Host header; without it such a request is rejected with
-#     421 before auth even runs. See README.md for the full contract.
+#     421 before auth even runs. Required, not optional, whenever
+#     HERMES_MCP_HOST is non-loopback. See README.md for the full contract.
 #   HERMES_MCP_HOST=<address to bind>
 #     Optional. Defaults to 127.0.0.1. A non-loopback address turns OFF the
-#     SDK's automatic loopback-only DNS-rebinding protection, so set
-#     HERMES_MCP_ALLOWED_HOSTS alongside it.
+#     SDK's automatic loopback-only DNS-rebinding protection, so
+#     HERMES_MCP_ALLOWED_HOSTS is REQUIRED with one: boot is refused on a
+#     non-loopback bind with an empty allowlist rather than serving with no
+#     protection at all. Loopback (127.0.0.1, localhost, ::1) needs no
+#     allowlist and is unaffected.
 #   HERMES_MCP_PORT=<port to bind>
 #     Optional. Defaults to 8000. A non-integer or out-of-range value is
 #     refused at boot, not left to fail later as a bind error.

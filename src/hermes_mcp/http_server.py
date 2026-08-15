@@ -60,6 +60,12 @@ DEFAULT_HOST: str = "127.0.0.1"
 DEFAULT_PORT: int = 8000
 MCP_PATH: str = "/mcp"
 
+# The exact three the SDK treats as loopback when it decides whether to
+# auto-enable DNS-rebinding protection. Matched here rather than re-derived, so
+# the boot guard below agrees with the behaviour it is guarding: any host
+# outside this set means the SDK's automatic protection does not apply.
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
+
 
 class KeyGuardError(RuntimeError):
     """The bridge key is missing, too short, or a placeholder."""
@@ -67,6 +73,10 @@ class KeyGuardError(RuntimeError):
 
 class PortGuardError(RuntimeError):
     """HERMES_MCP_PORT is not an integer, or is outside 1-65535."""
+
+
+class HostGuardError(RuntimeError):
+    """HERMES_MCP_HOST is non-loopback with no HERMES_MCP_ALLOWED_HOSTS set."""
 
 
 def require_bridge_key() -> str:
@@ -189,11 +199,41 @@ def _host_from_env() -> str:
 
     Note the interaction with HERMES_MCP_ALLOWED_HOSTS: the SDK auto-enables
     DNS-rebinding protection only when the host is loopback and no
-    transport_security is supplied. Setting this to a non-loopback address
-    without also setting HERMES_MCP_ALLOWED_HOSTS therefore leaves that
-    protection off, which is why the README documents the pair together.
+    transport_security is supplied. A non-loopback address without an allowlist
+    would therefore serve with that protection absent, so the pair is enforced
+    at boot by require_host_allowlist() rather than merely documented.
     """
     return os.environ.get("HERMES_MCP_HOST", "").strip() or DEFAULT_HOST
+
+
+def require_host_allowlist(host: str) -> None:
+    """Refuse to boot on a non-loopback bind that has no Host allowlist.
+
+    Making the bind configurable created this gap; it did not exist while the
+    host was always the SDK default. The SDK auto-enables DNS-rebinding
+    protection only for a loopback host with no transport_security, and
+    _transport_security() returns None when HERMES_MCP_ALLOWED_HOSTS is empty.
+    That combination binds a public address with the protection absent
+    altogether, which is the one configuration a caller cannot detect and an
+    operator did not ask for.
+
+    Fails closed instead, the same way this file already refuses a missing or
+    weak key and an unusable port. The alternative -- quietly enabling
+    protection with only the loopback entries -- would bind publicly and then
+    reject every real request, which reads as a network fault rather than as
+    the misconfiguration it is.
+    """
+    if host in _LOOPBACK_HOSTS:
+        return
+    if _allowed_hosts_from_env():
+        return
+    raise HostGuardError(
+        f"HERMES_MCP_HOST is set to a non-loopback address ({host!r}) but "
+        "HERMES_MCP_ALLOWED_HOSTS is empty; a non-loopback bind requires the "
+        "Host allowlist, or DNS-rebinding protection would not be applied at "
+        "all. Set HERMES_MCP_ALLOWED_HOSTS, or bind a loopback address. "
+        "Refusing to start"
+    )
 
 
 def _port_from_env() -> int:
@@ -222,6 +262,7 @@ def _port_from_env() -> int:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     host, port = _host_from_env(), _port_from_env()
+    require_host_allowlist(host)
     server = build_server()
     logger.info("hermes-mcp: serving MCP at http://%s:%d%s", host, port, MCP_PATH)
     server.run(

@@ -25,6 +25,7 @@ from src.hermes_mcp.http_server import (
     DEFAULT_PORT,
     MCP_PATH,
     MIN_KEY_LEN,
+    HostGuardError,
     KeyGuardError,
     PortGuardError,
     _allowed_hosts_from_env,
@@ -35,6 +36,7 @@ from src.hermes_mcp.http_server import (
     build_server,
     main,
     require_bridge_key,
+    require_host_allowlist,
 )
 from src.hermes_mcp.registry import Profile
 from src.hermes_mcp.tools import CHAT_TOOLS, NON_CHAT_TOOLS
@@ -314,7 +316,9 @@ def test_main_threads_the_configured_bind_into_run(monkeypatch):
     Without host= and port= the SDK defaults silently win, which is the state
     this replaces."""
     monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
-    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    # The allowlist is required for a non-loopback bind, so a test that binds
+    # one has to satisfy the boot guard rather than work around it.
+    monkeypatch.setenv("HERMES_MCP_ALLOWED_HOSTS", "bridge.example.com:443")
     monkeypatch.setenv("HERMES_MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("HERMES_MCP_PORT", "12345")
     captured = {}
@@ -361,6 +365,116 @@ def test_main_refuses_to_start_on_a_bad_port(monkeypatch):
     with pytest.raises(PortGuardError):
         main()
     assert started["n"] == 0, "the server ran despite an unusable port"
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_a_loopback_bind_needs_no_allowlist(monkeypatch, host):
+    """The default path, and the one that must not regress: loopback with no
+    allowlist is exactly how the bridge runs today, and the SDK applies its own
+    loopback-only protection to it."""
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    require_host_allowlist(host)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "bridge.example.com", "10.0.0.5"])
+def test_a_non_loopback_bind_without_an_allowlist_refuses_boot(monkeypatch, host):
+    """Binding a non-loopback address with no allowlist leaves DNS-rebinding
+    protection off entirely: _transport_security() returns None, and the SDK
+    auto-enables its own protection only for a loopback host. Fail closed, and
+    name both settings so the operator knows which pair is at fault."""
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    with pytest.raises(HostGuardError) as e:
+        require_host_allowlist(host)
+    message = str(e.value)
+    assert "HERMES_MCP_HOST" in message
+    assert "HERMES_MCP_ALLOWED_HOSTS" in message
+
+
+def test_an_allowlist_of_only_separators_does_not_satisfy_the_guard(monkeypatch):
+    """_allowed_hosts_from_env() parses this to [], which yields no
+    transport_security, so it must not count as an allowlist here either."""
+    monkeypatch.setenv("HERMES_MCP_ALLOWED_HOSTS", " , , ")
+    with pytest.raises(HostGuardError):
+        require_host_allowlist("0.0.0.0")
+
+
+def test_a_non_loopback_bind_with_an_allowlist_is_allowed(monkeypatch):
+    monkeypatch.setenv("HERMES_MCP_ALLOWED_HOSTS", "bridge.example.com:443")
+    require_host_allowlist("0.0.0.0")
+
+
+def test_main_refuses_a_non_loopback_bind_with_no_allowlist(monkeypatch):
+    """Enforced at boot, before the server is built or run -- a bridge that
+    starts and then serves unprotected is the failure this prevents."""
+    monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
+    monkeypatch.setenv("HERMES_MCP_HOST", "0.0.0.0")
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    started = {"n": 0}
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            started["n"] += 1
+
+    monkeypatch.setattr(http_server, "build_server", lambda: _FakeServer())
+    with pytest.raises(HostGuardError):
+        main()
+    assert started["n"] == 0, "the bridge served a public bind with no Host allowlist"
+
+
+def test_main_serves_a_non_loopback_bind_once_the_allowlist_is_set(monkeypatch):
+    """The guard must not make a legitimate tunnel deployment impossible: with
+    the allowlist set, the same bind boots and the protection is on."""
+    monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
+    monkeypatch.setenv("HERMES_MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("HERMES_MCP_ALLOWED_HOSTS", "bridge.example.com:443")
+    monkeypatch.delenv("HERMES_MCP_PORT", raising=False)
+    captured = {}
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_server, "build_server", lambda: _FakeServer())
+    main()
+
+    assert captured["host"] == "0.0.0.0"
+    settings = captured["transport_security"]
+    assert settings.enable_dns_rebinding_protection is True
+    assert "bridge.example.com:443" in settings.allowed_hosts
+
+
+def test_main_still_serves_the_loopback_default_with_no_allowlist(monkeypatch):
+    """The unconfigured path, asserted end to end through main(): it must boot,
+    bind the defaults, and pass no transport_security, exactly as before the
+    bind became configurable."""
+    monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
+    _clear_bind_env(monkeypatch)
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    captured = {}
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_server, "build_server", lambda: _FakeServer())
+    main()
+
+    assert (captured["host"], captured["port"]) == (DEFAULT_HOST, DEFAULT_PORT)
+    assert captured["transport_security"] is None
+
+
+def test_the_guard_matches_the_hosts_the_sdk_treats_as_loopback():
+    """The guard's loopback set has to be the SDK's, or it either refuses a
+    bind the SDK would have protected or permits one it would not."""
+    import inspect
+
+    from mcp.server.lowlevel.server import Server
+
+    source = inspect.getsource(Server.streamable_http_app)
+    for host in http_server._LOOPBACK_HOSTS:
+        assert repr(host) in source or f'"{host}"' in source, (
+            f"the SDK no longer treats {host!r} as loopback"
+        )
 
 
 def test_the_run_signature_accepts_the_bind_parameters():
