@@ -379,6 +379,22 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 The wrapper prints the tier it resolved at launch. Read that line if you are unsure which model you got.
 
+#### What `--bare` takes away, and what lean mode puts back
+
+Client-side `--bare` is what keeps the lean prompt near 945 tokens, but it is blunter than the name suggests. Per `claude --help` it skips *"hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and CLAUDE.md auto-discovery"*. Two of those matter more than the token saving:
+
+- **Hooks do not run.** Not reduced — off. A `SessionStart` probe fired without `--bare` and stayed silent with it, and `--settings` does not put it back.
+- **CLAUDE.md is not loaded.** The session gets none of the repo or machine conventions it would normally start with.
+
+Together those quietly removed pull requests from local-model sessions. The convention that every branch gets a PR lives in CLAUDE.md, so the model never saw it; the hook that opens the PR anyway is a hook, so it never ran. Branches accumulated commits, no PR appeared, and nothing reported a failure — the two mechanisms that would each have caught the other were disabled by the same flag.
+
+Lean mode now restores both, narrowly:
+
+- `--append-system-prompt` injects `prompts/qwen-pr-rules.md` (~600 tokens): branch naming, open the draft PR on the first commit, update the README, check `gh repo set-default` when the repo has an `upstream` remote, and leave RS21 alone. Loading real CLAUDE.md files with `--add-dir` would also work, but at ~33KB it would spend a quarter of the 27B's window on context that is mostly irrelevant to a coding turn.
+- The wrapper runs `auto-pr-push.sh` after the session exits, which is why it no longer `exec`s. That is the same script the Stop hook would have run; it no-ops unless the branch is off trunk, has commits ahead, has no open PR, and belongs to an allowlisted owner, and it refuses any repo with `rs21` in the name.
+
+If you write your own wrapper around `--bare`, assume nothing in `.claude/` applies to that session.
+
 ### Sizing the failover tier
 
 Ollama caps residency by model count, never by bytes, and Metal allocations are wired and cannot be paged out. Over-commit and this host panics instead of raising OOM. Measure with `ollama ps`, which reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
