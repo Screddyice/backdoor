@@ -85,3 +85,77 @@ def test_unrecognised_tier_is_refused(tool):
     assert "control-only" in refusal["reason"], (
         "the reason must name the unrecognised tier"
     )
+
+
+from src.hermes_mcp.tools import register_tools
+
+
+class _MCP:
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self, *_a, **_k):
+        def deco(fn):
+            self.tools[fn.__name__] = fn
+            return fn
+        return deco
+
+
+class _Client:
+    calls = []
+
+    def __init__(self, profile, **_kw):
+        self.profile = profile
+
+    async def request(self, method, path, json=None):
+        _Client.calls.append((self.profile.name, method, path, json))
+        return {"ok": True, "data": {"run_id": "r-1"}}
+
+    async def probe(self):
+        return {"profile": self.profile.name, "state": "ok", "reason": None, "next": None}
+
+
+def _tools():
+    mcp = _MCP()
+    register_tools(mcp, {"alpha": FULL, "prod": LOCKED, "ghost": GHOST},
+                   client_factory=_Client)
+    _Client.calls = []
+    return mcp.tools
+
+
+async def test_chat_reaches_a_full_profile():
+    t = _tools()
+    got = await t["hermes_chat"](profile="alpha", message="hello")
+    assert got["ok"] is True
+    name, method, path, body = _Client.calls[-1]
+    assert (name, method) == ("alpha", "POST")
+    assert body["input"] == "hello"
+
+
+async def test_chat_against_control_only_never_reaches_the_gateway():
+    """The refusal must happen before any request. A gateway that answered
+    would mean the tier is advisory, which is not what it is for."""
+    t = _tools()
+    got = await t["hermes_chat"](profile="prod", message="hello")
+    assert got["state"] == "control_only"
+    assert _Client.calls == [], "a request was sent to a control_only profile"
+
+
+async def test_run_approve_posts_the_decision():
+    t = _tools()
+    await t["hermes_run_approve"](profile="alpha", run_id="r-9", approved=True)
+    name, method, path, body = _Client.calls[-1]
+    assert path == "/v1/runs/r-9/approval"
+    assert body == {"approved": True}
+
+
+async def test_run_stop_posts_to_the_run():
+    t = _tools()
+    await t["hermes_run_stop"](profile="alpha", run_id="r-9")
+    assert _Client.calls[-1][2] == "/v1/runs/r-9/stop"
+
+
+async def test_run_status_reads_the_run():
+    t = _tools()
+    await t["hermes_run_status"](profile="alpha", run_id="r-9")
+    assert _Client.calls[-1][1:3] == ("GET", "/v1/runs/r-9")

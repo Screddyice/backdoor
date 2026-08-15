@@ -161,3 +161,35 @@ def register_tools(mcp, registry: dict[str, Profile], *, client_factory=GatewayC
     async def hermes_jobs(profile: str) -> dict:
         """Scheduled jobs on a profile."""
         return await _call(profile, "hermes_jobs", "GET", "/api/jobs")
+
+    @mcp.tool()
+    async def hermes_chat(profile: str, message: str, session_id: str | None = None) -> dict:
+        """Send a prompt to an agent and return its reply.
+
+        Refused for control_only profiles. Hermes applies its own approval
+        layer; approvals raised inside the resulting run are answerable with
+        hermes_run_approve, but approvals from chat-platform-initiated turns
+        still surface on that platform, not here.
+        """
+        body: dict = {"input": message}
+        if session_id:
+            body["session_id"] = session_id
+        return await _call(profile, "hermes_chat", "POST", "/v1/runs", body)
+
+    @mcp.tool()
+    async def hermes_run_status(profile: str, run_id: str) -> dict:
+        """Current status of a run started through this bridge."""
+        return await _call(profile, "hermes_run_status", "GET", f"/v1/runs/{run_id}")
+
+    @mcp.tool()
+    async def hermes_run_stop(profile: str, run_id: str) -> dict:
+        """Stop an in-flight run."""
+        return await _call(profile, "hermes_run_stop", "POST", f"/v1/runs/{run_id}/stop")
+
+    @mcp.tool()
+    async def hermes_run_approve(profile: str, run_id: str, approved: bool) -> dict:
+        """Answer an approval request raised inside a run."""
+        return await _call(
+            profile, "hermes_run_approve", "POST",
+            f"/v1/runs/{run_id}/approval", {"approved": approved},
+        )
