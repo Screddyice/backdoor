@@ -27,6 +27,7 @@ import os
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .registry import Profile, load_registry
 from .tools import register_tools
@@ -37,6 +38,16 @@ MIN_KEY_LEN: int = 16
 PLACEHOLDERS: frozenset[str] = frozenset(
     {"changeme", "change-me", "your-key-here", "replace_with_key",
      "replace-with-key", "secret", "password", "test", "example"}
+)
+
+# The SDK's own loopback-only default (mcp.server.lowlevel.server.Server.
+# streamable_http_app, auto-applied when host is 127.0.0.1/localhost/::1 and
+# no transport_security is given). Reused, not duplicated, when
+# HERMES_MCP_ALLOWED_HOSTS adds extra hosts, so the loopback allowance never
+# regresses -- only widens.
+_DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+_DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = (
+    "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
 )
 
 
@@ -68,13 +79,23 @@ class _BridgeTokenVerifier(TokenVerifier):
     already validated — never re-read from the environment per request.
     Comparison uses hmac.compare_digest, not ==, so a wrong guess cannot be
     timed apart from a right one character by character.
+
+    hmac.compare_digest raises TypeError if either str argument contains a
+    non-ASCII character. Header values arrive as str (Starlette decodes them
+    latin-1, and h11 permits obs-text), so a non-ASCII bearer token would
+    otherwise reach compare_digest and raise -- surfacing as an unauthenticated
+    500 rather than a 401, since Starlette's AuthenticationMiddleware only
+    catches AuthenticationError. Comparing encoded bytes instead sidesteps
+    compare_digest's str-only restriction entirely, so no input can raise.
     """
 
     def __init__(self, key: str) -> None:
         self._key = key
+        self._key_bytes = key.encode("utf-8")
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        if hmac.compare_digest(token, self._key):
+        token_bytes = token.encode("utf-8", errors="surrogateescape")
+        if hmac.compare_digest(token_bytes, self._key_bytes):
             return AccessToken(token=token, client_id="hermes-mcp-caller", scopes=[])
         return None
 
@@ -106,9 +127,41 @@ def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
     return mcp
 
 
+def _allowed_hosts_from_env() -> list[str]:
+    """Parse HERMES_MCP_ALLOWED_HOSTS: comma-separated, whitespace-tolerant,
+    empty entries ignored. Returns [] when unset or empty."""
+    raw = os.environ.get("HERMES_MCP_ALLOWED_HOSTS", "")
+    return [host.strip() for host in raw.split(",") if host.strip()]
+
+
+def _transport_security() -> TransportSecuritySettings | None:
+    """Build the DNS-rebinding Host allowlist for the streamable-HTTP transport,
+    threaded into MCPServer.run() as its transport_security parameter (the
+    same parameter mcp.server.lowlevel.server.Server.streamable_http_app
+    passes to StreamableHTTPSessionManager as security_settings).
+
+    HERMES_MCP_ALLOWED_HOSTS unset or empty -> None, so the SDK's own
+    loopback-only default applies exactly as it does today (host defaults to
+    "127.0.0.1", which auto-enables protection scoped to
+    127.0.0.1/localhost/::1). Set -> the same loopback defaults plus the
+    configured hosts, so a tunnel forwarding a public hostname in the Host
+    header is accepted without disabling the protection.
+    """
+    extra = _allowed_hosts_from_env()
+    if not extra:
+        return None
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[*_DEFAULT_ALLOWED_HOSTS, *extra],
+        allowed_origins=[*_DEFAULT_ALLOWED_ORIGINS],
+    )
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    build_server().run(transport="streamable-http")
+    build_server().run(
+        transport="streamable-http", transport_security=_transport_security()
+    )
 
 
 if __name__ == "__main__":

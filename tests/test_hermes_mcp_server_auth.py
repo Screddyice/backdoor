@@ -16,13 +16,18 @@ parse an SSE stream, which is not part of what is under test here.
 """
 
 import pytest
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.testclient import TestClient
 
+from src.hermes_mcp import http_server
 from src.hermes_mcp.http_server import (
     MIN_KEY_LEN,
     KeyGuardError,
+    _allowed_hosts_from_env,
     _BridgeTokenVerifier,
+    _transport_security,
     build_server,
+    main,
     require_bridge_key,
 )
 from src.hermes_mcp.registry import Profile
@@ -144,6 +149,80 @@ async def test_bridge_token_verifier_rejects_the_wrong_token():
     assert result is None
 
 
+async def test_bridge_token_verifier_rejects_a_non_ascii_token_without_raising():
+    """hmac.compare_digest raises TypeError on a non-ASCII str argument. A
+    caller-controlled bearer token reaches verify_token as a str (Starlette
+    decodes headers latin-1), so this must reject cleanly rather than raise --
+    unit-level coverage that verify_token itself never raises, independent of
+    whatever the HTTP layer around it does with the exception."""
+    verifier = _BridgeTokenVerifier(STRONG_KEY)
+    result = await verifier.verify_token("\xff\xfe not ascii")
+    assert result is None
+
+
+def test_allowed_hosts_from_env_is_empty_when_unset(monkeypatch):
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    assert _allowed_hosts_from_env() == []
+
+
+def test_allowed_hosts_from_env_strips_whitespace_and_drops_empty_entries(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_MCP_ALLOWED_HOSTS", " bridge.example.com:443 , , other.example.com:*  ,"
+    )
+    assert _allowed_hosts_from_env() == ["bridge.example.com:443", "other.example.com:*"]
+
+
+def test_transport_security_is_none_when_unset(monkeypatch):
+    """Unset HERMES_MCP_ALLOWED_HOSTS -> None, so main() passes nothing extra
+    to MCPServer.run() and the SDK's own loopback-only default applies
+    exactly as it did before this change."""
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    assert _transport_security() is None
+
+
+def test_transport_security_is_none_when_set_to_only_whitespace_and_commas(monkeypatch):
+    monkeypatch.setenv("HERMES_MCP_ALLOWED_HOSTS", " , , ")
+    assert _transport_security() is None
+
+
+def test_transport_security_threads_configured_hosts_into_the_sdk_parameter(monkeypatch):
+    """When set, the parsed hosts land in TransportSecuritySettings.allowed_hosts
+    -- the same parameter mcp.server.lowlevel.server.Server.streamable_http_app
+    passes to StreamableHTTPSessionManager as security_settings -- alongside
+    the SDK's own loopback defaults, so local access is never revoked, only
+    widened."""
+    monkeypatch.setenv("HERMES_MCP_ALLOWED_HOSTS", "bridge.example.com:443")
+    settings = _transport_security()
+    assert isinstance(settings, TransportSecuritySettings)
+    assert settings.enable_dns_rebinding_protection is True
+    assert "bridge.example.com:443" in settings.allowed_hosts
+    assert "127.0.0.1:*" in settings.allowed_hosts
+    assert "localhost:*" in settings.allowed_hosts
+    assert "[::1]:*" in settings.allowed_hosts
+
+
+def test_main_threads_transport_security_into_run(monkeypatch):
+    """main() must actually pass _transport_security()'s result to
+    MCPServer.run(transport="streamable-http", ...) -- not just compute it.
+    build_server() is stubbed out here so this exercises only that wiring,
+    not a real server start."""
+    monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
+    monkeypatch.setenv("HERMES_MCP_ALLOWED_HOSTS", "bridge.example.com:443")
+    captured = {}
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_server, "build_server", lambda: _FakeServer())
+    main()
+
+    assert captured["transport"] == "streamable-http"
+    settings = captured["transport_security"]
+    assert isinstance(settings, TransportSecuritySettings)
+    assert "bridge.example.com:443" in settings.allowed_hosts
+
+
 #: Presented on the wrong-token path below. Not a member of PLACEHOLDERS and
 #: not STRONG_KEY -- just some other string a caller might guess.
 WRONG_TOKEN = "0123456789abcdef0123456789abcdef"
@@ -199,6 +278,33 @@ def test_wrong_token_is_rejected(http_client):
     assert response.status_code == 401
 
 
+def test_non_ascii_bearer_token_is_rejected_not_500(http_client):
+    """hmac.compare_digest raises TypeError on a non-ASCII str, and Starlette's
+    AuthenticationMiddleware only catches AuthenticationError -- so before the
+    fix, this token reached compare_digest and the TypeError escaped as an
+    unauthenticated 500 instead of a 401. Header keys/values are passed as
+    bytes here (not str) so httpx's own default ascii header encoding doesn't
+    reject the request client-side before it ever reaches the app; h11
+    permits this obs-text on the wire, same as the finding describes.
+
+    Asserted against the wrong-token response, not a bare status check, so a
+    regression that makes the two paths distinguishable (a different body,
+    a different status) also fails this test, not just a 500-specific one.
+    """
+    wrong_headers = {**ACCEPT_HEADERS, "Authorization": f"Bearer {WRONG_TOKEN}"}
+    wrong = http_client.post("/mcp", json=INITIALIZE_BODY, headers=wrong_headers)
+
+    non_ascii_headers = {
+        b"Accept": ACCEPT_HEADERS["Accept"].encode(),
+        b"Authorization": b"Bearer \xff",
+    }
+    non_ascii = http_client.post("/mcp", json=INITIALIZE_BODY, headers=non_ascii_headers)
+
+    assert non_ascii.status_code == 401
+    assert non_ascii.status_code == wrong.status_code
+    assert non_ascii.text == wrong.text
+
+
 @pytest.mark.parametrize(
     "headers",
     [ACCEPT_HEADERS, {**ACCEPT_HEADERS, "Authorization": f"Bearer {WRONG_TOKEN}"}],
@@ -209,6 +315,21 @@ def test_rejection_responses_never_contain_the_key_or_the_presented_token(http_c
     assert response.status_code == 401
     assert STRONG_KEY not in response.text
     assert WRONG_TOKEN not in response.text
+
+
+def test_missing_header_and_wrong_token_responses_are_indistinguishable(http_client):
+    """A future change that makes the missing-token and wrong-token rejection
+    paths diverge (different status, different body, a header leak) should
+    fail here -- the parametrized test above only asserts each response in
+    isolation, so it would pass even if the two became distinguishable from
+    each other."""
+    missing = http_client.post("/mcp", json=INITIALIZE_BODY, headers=ACCEPT_HEADERS)
+    wrong_headers = {**ACCEPT_HEADERS, "Authorization": f"Bearer {WRONG_TOKEN}"}
+    wrong = http_client.post("/mcp", json=INITIALIZE_BODY, headers=wrong_headers)
+
+    assert missing.status_code == wrong.status_code
+    assert missing.text == wrong.text
+    assert missing.headers == wrong.headers
 
 
 def test_correct_token_is_accepted_and_a_tool_call_proceeds(http_client):
