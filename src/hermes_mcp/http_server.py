@@ -50,9 +50,23 @@ _DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
 )
 
+# The SDK's own defaults for MCPServer.run(transport="streamable-http"), which
+# is what applied while main() passed neither. Restated here so the bind is
+# explicit and documentable rather than implied, and kept identical so an
+# unset environment binds exactly where it binds today. The endpoint path is
+# the SDK default too and is not configurable here: a reverse proxy needs one
+# unambiguous route, and /mcp is what the README and the unit document.
+DEFAULT_HOST: str = "127.0.0.1"
+DEFAULT_PORT: int = 8000
+MCP_PATH: str = "/mcp"
+
 
 class KeyGuardError(RuntimeError):
     """The bridge key is missing, too short, or a placeholder."""
+
+
+class PortGuardError(RuntimeError):
+    """HERMES_MCP_PORT is not an integer, or is outside 1-65535."""
 
 
 def require_bridge_key() -> str:
@@ -97,7 +111,9 @@ class _BridgeTokenVerifier(TokenVerifier):
     """
 
     def __init__(self, key: str) -> None:
-        self._key = key
+        # Only the encoded form is kept. verify_token compares bytes, so a
+        # plaintext str copy would be retained for the process's whole life,
+        # readable through vars() or a repr, and never read.
         self._key_bytes = key.encode("utf-8")
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -167,10 +183,52 @@ def _transport_security() -> TransportSecuritySettings | None:
     )
 
 
+def _host_from_env() -> str:
+    """Parse HERMES_MCP_HOST: whitespace-tolerant, empty means unset. Returns
+    DEFAULT_HOST when unset or empty, so the bind is unchanged by default.
+
+    Note the interaction with HERMES_MCP_ALLOWED_HOSTS: the SDK auto-enables
+    DNS-rebinding protection only when the host is loopback and no
+    transport_security is supplied. Setting this to a non-loopback address
+    without also setting HERMES_MCP_ALLOWED_HOSTS therefore leaves that
+    protection off, which is why the README documents the pair together.
+    """
+    return os.environ.get("HERMES_MCP_HOST", "").strip() or DEFAULT_HOST
+
+
+def _port_from_env() -> int:
+    """Parse HERMES_MCP_PORT the same way. Returns DEFAULT_PORT when unset.
+
+    Rejected at boot rather than passed through: an unusable value handed to
+    the server surfaces much later, as a bind failure or a silently wrong port,
+    and the operator has no line telling them which setting was at fault.
+    """
+    raw = os.environ.get("HERMES_MCP_PORT", "").strip()
+    if not raw:
+        return DEFAULT_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        raise PortGuardError(
+            f"HERMES_MCP_PORT is not an integer ({raw!r}); refusing to start"
+        ) from None
+    if not 1 <= port <= 65535:
+        raise PortGuardError(
+            f"HERMES_MCP_PORT is outside 1-65535 ({port}); refusing to start"
+        )
+    return port
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    build_server().run(
-        transport="streamable-http", transport_security=_transport_security()
+    host, port = _host_from_env(), _port_from_env()
+    server = build_server()
+    logger.info("hermes-mcp: serving MCP at http://%s:%d%s", host, port, MCP_PATH)
+    server.run(
+        transport="streamable-http",
+        host=host,
+        port=port,
+        transport_security=_transport_security(),
     )
 
 

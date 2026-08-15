@@ -447,12 +447,17 @@ rather than being attached by default. MCP stays off by default in every tier fo
 documented above: the global schema set costs roughly 142K tokens, which is most of what bare mode
 exists to remove.
 
+The MCP endpoint is served at path **`/mcp`** on whatever host and port the bridge binds, so a
+reverse proxy in front of it routes `/mcp` and nothing else.
+
 **Environment.** Set at deploy time, never committed:
 
 | Setting | Required | Effect |
 | --- | --- | --- |
 | `HERMES_MCP_KEY` | Yes | Bearer key callers must present. Boot refuses on a missing, short (under 16 characters), or placeholder-looking value |
 | `HERMES_MCP_REGISTRY` | No | Path to the profile registry TOML. Defaults to `~/.config/hermes-mcp/registry.toml` |
+| `HERMES_MCP_HOST` | No | Address the bridge binds. Defaults to `127.0.0.1`. Setting a non-loopback address turns **off** the SDK's automatic loopback-only DNS-rebinding protection, so set `HERMES_MCP_ALLOWED_HOSTS` alongside it |
+| `HERMES_MCP_PORT` | No | Port the bridge binds. Defaults to `8000`. A non-integer or out-of-range value is refused at boot rather than surfacing later as a bind failure |
 | `HERMES_MCP_ALLOWED_HOSTS` | No | Comma-separated, whitespace-tolerant extra `Host` values for the streamable-HTTP transport's DNS-rebinding allowlist, e.g. `bridge.example.com:443`. Unset or empty leaves today's behavior unchanged — the SDK's own loopback-only default applies (`127.0.0.1:*`, `localhost:*`, `[::1]:*`). Set it and those loopback defaults stay, with the configured hosts added on top; DNS-rebinding protection stays on, the allowlist only widens. Needed when the bridge runs behind a tunnel that forwards a public hostname in the `Host` header — without it such a request is rejected with **421 before auth even runs** |
 
 ---

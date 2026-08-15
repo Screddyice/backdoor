@@ -21,10 +21,16 @@ from starlette.testclient import TestClient
 
 from src.hermes_mcp import http_server
 from src.hermes_mcp.http_server import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    MCP_PATH,
     MIN_KEY_LEN,
     KeyGuardError,
+    PortGuardError,
     _allowed_hosts_from_env,
     _BridgeTokenVerifier,
+    _host_from_env,
+    _port_from_env,
     _transport_security,
     build_server,
     main,
@@ -248,6 +254,128 @@ def test_main_threads_transport_security_into_run(monkeypatch):
     settings = captured["transport_security"]
     assert isinstance(settings, TransportSecuritySettings)
     assert "bridge.example.com:443" in settings.allowed_hosts
+
+
+def _clear_bind_env(monkeypatch):
+    monkeypatch.delenv("HERMES_MCP_HOST", raising=False)
+    monkeypatch.delenv("HERMES_MCP_PORT", raising=False)
+
+
+def test_bind_defaults_are_unchanged_when_unset(monkeypatch):
+    """Unset means bind exactly where the bridge binds today, which is the SDK's
+    own default for streamable HTTP. Making the bind configurable must not move
+    it for anyone who does not configure it."""
+    _clear_bind_env(monkeypatch)
+    assert (_host_from_env(), _port_from_env()) == (DEFAULT_HOST, DEFAULT_PORT)
+    assert (DEFAULT_HOST, DEFAULT_PORT, MCP_PATH) == ("127.0.0.1", 8000, "/mcp")
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_an_empty_bind_setting_is_treated_as_unset(monkeypatch, raw):
+    monkeypatch.setenv("HERMES_MCP_HOST", raw)
+    monkeypatch.setenv("HERMES_MCP_PORT", raw)
+    assert (_host_from_env(), _port_from_env()) == (DEFAULT_HOST, DEFAULT_PORT)
+
+
+def test_bind_settings_are_whitespace_tolerant(monkeypatch):
+    """Same tolerance HERMES_MCP_ALLOWED_HOSTS already gives: a stray space in
+    an EnvironmentFile line is a typo, not a different value."""
+    monkeypatch.setenv("HERMES_MCP_HOST", "  0.0.0.0  ")
+    monkeypatch.setenv("HERMES_MCP_PORT", "  12345  ")
+    assert (_host_from_env(), _port_from_env()) == ("0.0.0.0", 12345)
+
+
+@pytest.mark.parametrize("raw", ["eighty", "80.5", " 12 34 ", "0x1f90", "80,443"])
+def test_a_non_integer_port_refuses_boot(monkeypatch, raw):
+    """Rejected at boot, named in the message. Passing it through would surface
+    much later as a bind failure with nothing pointing at the setting."""
+    monkeypatch.setenv("HERMES_MCP_PORT", raw)
+    with pytest.raises(PortGuardError) as e:
+        _port_from_env()
+    assert "HERMES_MCP_PORT" in str(e.value)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "65536", "99999"])
+def test_an_out_of_range_port_refuses_boot(monkeypatch, raw):
+    monkeypatch.setenv("HERMES_MCP_PORT", raw)
+    with pytest.raises(PortGuardError) as e:
+        _port_from_env()
+    assert "HERMES_MCP_PORT" in str(e.value)
+
+
+@pytest.mark.parametrize("raw", ["1", "65535"])
+def test_the_range_boundaries_are_accepted(monkeypatch, raw):
+    monkeypatch.setenv("HERMES_MCP_PORT", raw)
+    assert _port_from_env() == int(raw)
+
+
+def test_main_threads_the_configured_bind_into_run(monkeypatch):
+    """Configuring the bind is only useful if main() actually passes it on.
+    Without host= and port= the SDK defaults silently win, which is the state
+    this replaces."""
+    monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setenv("HERMES_MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("HERMES_MCP_PORT", "12345")
+    captured = {}
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_server, "build_server", lambda: _FakeServer())
+    main()
+
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 12345
+
+
+def test_main_binds_the_defaults_when_the_bind_is_unset(monkeypatch):
+    monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
+    monkeypatch.delenv("HERMES_MCP_ALLOWED_HOSTS", raising=False)
+    _clear_bind_env(monkeypatch)
+    captured = {}
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_server, "build_server", lambda: _FakeServer())
+    main()
+
+    assert (captured["host"], captured["port"]) == (DEFAULT_HOST, DEFAULT_PORT)
+
+
+def test_main_refuses_to_start_on_a_bad_port(monkeypatch):
+    """The guard has to fire before the server is built and run, or it is not a
+    boot guard."""
+    monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
+    monkeypatch.setenv("HERMES_MCP_PORT", "not-a-port")
+    started = {"n": 0}
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            started["n"] += 1
+
+    monkeypatch.setattr(http_server, "build_server", lambda: _FakeServer())
+    with pytest.raises(PortGuardError):
+        main()
+    assert started["n"] == 0, "the server ran despite an unusable port"
+
+
+def test_the_run_signature_accepts_the_bind_parameters():
+    """host=, port= and transport_security= are forwarded by MCPServer.run()
+    into run_streamable_http_async(). Pinned because they are **kwargs on run(),
+    so a rename upstream would otherwise fail silently at runtime rather than
+    here."""
+    import inspect
+
+    from mcp.server.mcpserver import MCPServer
+
+    params = inspect.signature(MCPServer.run_streamable_http_async).parameters
+    for name in ("host", "port", "transport_security"):
+        assert name in params, f"MCPServer no longer accepts {name}"
+    assert params["streamable_http_path"].default == MCP_PATH
 
 
 #: Presented on the wrong-token path below. Not a member of PLACEHOLDERS and

@@ -23,8 +23,18 @@
 #     Needed when the bridge runs behind a tunnel that forwards a public
 #     hostname in the Host header; without it such a request is rejected with
 #     421 before auth even runs. See README.md for the full contract.
+#   HERMES_MCP_HOST=<address to bind>
+#     Optional. Defaults to 127.0.0.1. A non-loopback address turns OFF the
+#     SDK's automatic loopback-only DNS-rebinding protection, so set
+#     HERMES_MCP_ALLOWED_HOSTS alongside it.
+#   HERMES_MCP_PORT=<port to bind>
+#     Optional. Defaults to 8000. A non-integer or out-of-range value is
+#     refused at boot, not left to fail later as a bind error.
 #   Per-profile gateway keys, one per profile's key_env field in the registry
 #     (deploy/registry.example.toml shows the shape).
+#
+# The MCP endpoint is served at path /mcp on that host and port, so a reverse
+# proxy or tunnel in front of this unit routes /mcp and nothing else.
 
 [Unit]
 Description=Hermes MCP bridge — HTTP MCP surface for Hermes gateways
