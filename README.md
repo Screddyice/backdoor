@@ -415,7 +415,16 @@ Larger changes get written down before they get built. Specs live in [`docs/spec
 
 | Spec | Status | What it covers |
 | --- | --- | --- |
-| [Hermes MCP Bridge](docs/specs/hermes-mcp-bridge.md) | Approved, not yet implemented | An HTTP MCP surface for [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateways, so an MCP client can list and control them, converse with an agent, read its history, and answer its run approvals |
+| [Hermes MCP Bridge](docs/specs/hermes-mcp-bridge.md) | Approved, planned, not yet implemented | An HTTP MCP surface for [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateways, so an MCP client can list and control them, converse with an agent, read its history, and answer its run approvals |
+
+Approved specs get an implementation plan before any code, in
+[`docs/superpowers/plans/`](docs/superpowers/plans/). A plan is task-by-task and test-first, with
+the actual test and implementation code in each step rather than a description of it, so it can be
+executed by someone — or something — with no prior context on this repo.
+
+| Plan | Tasks | For |
+| --- | --- | --- |
+| [Hermes MCP Bridge](docs/superpowers/plans/2026-08-15-hermes-mcp-bridge.md) | 9 | [the spec above](docs/specs/hermes-mcp-bridge.md) |
 
 The Hermes bridge is worth a note here because it changes what this repo is. Backdoor has been one
 thing so far: a proxy that makes Claude Code talk to any model. The bridge adds a second, separate
