@@ -506,6 +506,30 @@ llm-jury reads that file and disables itself while failover is active, so the ro
 
 ---
 
+## Design specs
+
+Larger changes get written down before they get built. Specs live in [`docs/specs/`](docs/specs/).
+
+| Spec | Status | What it covers |
+| --- | --- | --- |
+| [Hermes MCP Bridge](docs/specs/hermes-mcp-bridge.md) | Approved, not yet implemented | An HTTP MCP surface for [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateways, so an MCP client can list and control them, converse with an agent, read its history, and answer its run approvals |
+
+The Hermes bridge is worth a note here because it changes what this repo is. Backdoor has been one
+thing so far: a proxy that makes Claude Code talk to any model. The bridge adds a second, separate
+concern that does not touch `src/proxy/` at all, and brings two conventions with it.
+
+**Deployment identifiers stay out of the repo.** Hostnames, agent profile names, port assignments
+and keys are supplied at deploy time, the same way `profiles/*.env` is already gitignored. A spec
+in `docs/specs/` describes a design, never an environment.
+
+**It ships with `bd` and `qwen` wiring.** The bridge gets a `bd hermes` subcommand for local
+operator use, and rides the existing opt-in MCP mechanism in the `qwen` wrapper (`QWEN_HERMES=1`)
+rather than being attached by default. MCP stays off by default in every tier for the reason
+documented above: the global schema set costs roughly 142K tokens, which is most of what bare mode
+exists to remove.
+
+---
+
 <div align="center">
 
 **Star this if you think the best coding agent should work with any model.**
