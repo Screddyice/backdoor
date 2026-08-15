@@ -367,6 +367,24 @@ def test_main_refuses_to_start_on_a_bad_port(monkeypatch):
     assert started["n"] == 0, "the server ran despite an unusable port"
 
 
+def test_the_verifier_retains_no_plaintext_copy_of_the_key():
+    """verify_token compares the encoded form, so a str copy of the key beside
+    it is a plaintext secret retained for the life of the process, reachable
+    through vars() or a repr, and read by nothing. Asserted rather than left to
+    review: re-adding the assignment is a one-line regression that no other
+    test in this file notices."""
+    verifier = _BridgeTokenVerifier(STRONG_KEY)
+    attrs = vars(verifier)
+    leaked = sorted(
+        name for name, value in attrs.items()
+        if isinstance(value, str) and STRONG_KEY in value
+    )
+    assert leaked == [], f"the verifier retains the key in plaintext at: {leaked}"
+    assert attrs.get("_key_bytes") == STRONG_KEY.encode("utf-8"), (
+        "the encoded form is the one thing that should be kept"
+    )
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
 def test_a_loopback_bind_needs_no_allowlist(monkeypatch, host):
     """The default path, and the one that must not regress: loopback with no

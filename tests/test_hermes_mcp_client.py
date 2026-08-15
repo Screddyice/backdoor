@@ -88,6 +88,13 @@ def _raiser(build):
 #: would. Keyed by name so a failure names the case.
 _LEAK_CASES = {
     "200-json": lambda r: httpx.Response(200, json={"echo": f"Bearer {SECRET}"}),
+    # The key in a dict-KEY position, not a value. JSON object keys are strings,
+    # so a gateway keying a map by the credential it received produces exactly
+    # this, and redaction that walks values only would return it verbatim.
+    "200-json-dict-key": lambda r: httpx.Response(200, json={SECRET: "seen"}),
+    "200-json-dict-key-nested": lambda r: httpx.Response(
+        200, json={"outer": [{f"prefix-{SECRET}": {SECRET: 1}}]}
+    ),
     "200-json-nested": lambda r: httpx.Response(
         200, json={"outer": {"inner": [{"echo": SECRET}]}}
     ),
@@ -218,6 +225,71 @@ async def test_a_non_ascii_gateway_key_yields_state_and_discloses_nothing(
     assert ALPHA.key_env in got["next"], "the env var NAME is the safe thing to name"
 
 
+async def test_the_key_is_redacted_in_a_dict_key_position(monkeypatch):
+    """Positive form of the case above: the map still arrives, keyed by the
+    placeholder. Asserted directly so redaction of dict keys cannot be dropped
+    while the absence-of-the-key assertions keep passing."""
+    c = _client(monkeypatch, lambda r: httpx.Response(200, json={SECRET: "seen"}))
+    got = await c.request("GET", "/health")
+    assert got["data"] == {REDACTED: "seen"}
+
+
+#: An all-digit key. Legal, and long enough to clear the bridge's own strength
+#: guard, so a gateway echoing it as a JSON *number* is reachable rather than
+#: theoretical -- and a number is not a str, which is where redaction by value
+#: stops looking unless it is told not to.
+NUMERIC_KEY = "8" + "137942065318" * 3
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param(lambda k: {"echo": int(k)}, id="number"),
+    pytest.param(lambda k: {"echo": [int(k)]}, id="number-in-list"),
+    pytest.param(lambda k: {"echo": str(k)}, id="string-control"),
+])
+async def test_a_numeric_key_echoed_as_a_number_is_still_redacted(monkeypatch, body):
+    c = _client(
+        monkeypatch,
+        lambda r: httpx.Response(200, json=body(NUMERIC_KEY)),
+        key=NUMERIC_KEY,
+    )
+    got = await c.request("GET", "/health")
+    assert NUMERIC_KEY not in repr(got)
+    assert REDACTED in repr(got), "the leaf must be replaced, not silently dropped"
+
+
+async def test_a_number_that_does_not_hold_the_key_is_left_alone(monkeypatch):
+    """Redacting by value must not turn every number into a placeholder."""
+    c = _client(monkeypatch, lambda r: httpx.Response(
+        200, json={"count": 42, "ratio": 1.5, "flag": True, "nothing": None}
+    ), key=NUMERIC_KEY)
+    got = await c.request("GET", "/health")
+    assert got["data"] == {"count": 42, "ratio": 1.5, "flag": True, "nothing": None}
+
+
+@pytest.mark.parametrize("layer", ["client", "tool"])
+async def test_a_body_too_deeply_nested_to_walk_returns_state(monkeypatch, layer):
+    """Response handling can raise as surely as the exchange can. A body nested
+    past the recursion limit overflows in json.loads or in redaction's own
+    recursion, and RecursionError is not an httpx error -- so it used to escape
+    request(), escape tools._call(), and reach the caller. It is one gateway
+    sending a pathological body, which is exactly what structured state is for.
+    """
+    depth = 20_000
+    deep = "[" * depth + "]" * depth
+    handler = lambda r: httpx.Response(  # noqa: E731
+        200, content=deep, headers={"content-type": "application/json"}
+    )
+
+    if layer == "client":
+        got = await _client(monkeypatch, handler).request("GET", "/health")
+    else:
+        got = await _tool_surface(monkeypatch, handler)["hermes_status"](profile="alpha")
+
+    assert got["state"] == "unreachable", "a pathological body must not raise"
+    assert got["reason"] and got["next"]
+    assert SECRET not in repr(got)
+
+
 async def test_internal_failures_are_indistinguishable_to_the_caller(monkeypatch):
     """A reason derived from the exception would let a caller probe for which
     internal failure occurred, and would reintroduce the leak the moment a new
@@ -230,7 +302,14 @@ async def test_internal_failures_are_indistinguishable_to_the_caller(monkeypatch
     value = await _client(
         monkeypatch, _raiser(lambda r: ValueError("different boom"))
     ).request("GET", "/health")
-    assert encode == runtime == value
+    deep = "[" * 20_000 + "]" * 20_000
+    nested = await _client(monkeypatch, lambda r: httpx.Response(
+        200, content=deep, headers={"content-type": "application/json"}
+    )).request("GET", "/health")
+    assert encode == runtime == value == nested, (
+        "a failure before the exchange, during it, and after it must all look "
+        "the same to a caller"
+    )
 
 
 async def test_missing_key_raises_before_any_request(monkeypatch):

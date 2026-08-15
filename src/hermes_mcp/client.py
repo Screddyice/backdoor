@@ -5,6 +5,11 @@ gateway that is simply down. Transport and auth failures come back as
 structured state with a reason and a next action; only a programming error
 (a missing key in the environment) raises.
 
+That contract covers the whole of request(), not only the HTTP exchange:
+handling a response can fail too, and a failure there is still one gateway's
+problem rather than every profile's. request() is therefore total by
+construction, wrapping the attempt instead of guarding chosen spots inside it.
+
 The gateway key is read from the environment at call time, never stored on the
 instance and never echoed into a response.
 """
@@ -34,9 +39,15 @@ def _redact(value: Any, key: str) -> Any:
     """Return *value* with every occurrence of *key* replaced by REDACTED.
 
     Recurses through the containers json.loads can produce, so a key echoed in a
-    nested field is caught as surely as one at the top level, and rebuilds the
-    structure rather than stringifying it: a caller still receives real JSON
-    types. Non-str leaves cannot contain the key and are returned untouched.
+    nested field is caught as surely as one at the top level, and in a dict key
+    as surely as in a value. Containers are rebuilt rather than stringified, so a
+    caller still receives real JSON types.
+
+    A non-str leaf is checked against its own string form, not skipped. An
+    all-digit key is a legal key -- 32 digits clears the bridge's strength guard
+    -- and a gateway echoing it as a JSON *number* would otherwise sail through
+    untouched. Such a leaf comes back as the placeholder string, changing its
+    JSON type: a leaked key is worse than a number arriving as a string.
     """
     if not key:
         return value
@@ -48,7 +59,7 @@ def _redact(value: Any, key: str) -> Any:
         return [_redact(item, key) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact(item, key) for item in value)
-    return value
+    return REDACTED if key in str(value) else value
 
 
 class MissingKey(RuntimeError):
@@ -78,7 +89,57 @@ class GatewayClient:
             )
         return value
 
+    def _opaque_failure(self, exc: BaseException) -> dict[str, Any]:
+        """The one state returned for any internal failure, whatever it was.
+
+        Fixed text on purpose. Deriving it from type(exc) would let a caller
+        probe for which internal failure occurred, and anything derived from
+        str(exc) can carry key material -- a UnicodeEncodeError from encoding
+        "Bearer <key>" names a character of the key and its offset. Only the
+        type is logged; the message never is.
+        """
+        p = self.profile
+        logger.error(
+            "request to profile %s failed with %s; "
+            "check the value of %s (message withheld: it can echo the key)",
+            p.name, type(exc).__name__, p.key_env,
+        )
+        return state(
+            p.name, "unreachable",
+            reason="the bridge could not issue the request to this gateway",
+            next=f"check {p.key_env} in the bridge environment, then the bridge logs",
+        )
+
     async def request(
+        self, method: str, path: str, json: dict | None = None
+    ) -> dict[str, Any]:
+        """Total, except for MissingKey. Never raises for anything a gateway did.
+
+        Tools fan out across every profile, so this contract is what stops one
+        gateway from failing a whole listing. It has to hold for the *whole*
+        call, not just the httpx exchange: response handling raises too. A body
+        nested deeply enough overflows the stack in json.loads or in _redact's
+        recursion, and RecursionError is not an httpx error, so before this
+        wrapper existed it escaped here, escaped tools._call() -- which catches
+        MissingKey only -- and surfaced to the MCP caller.
+
+        _issue() keeps the httpx-specific handling, which distinguishes a
+        stopped gateway from a wedged one and is worth reporting precisely.
+        This wrapper is the backstop for everything else, on every path, and
+        answers with one indistinguishable state.
+
+        MissingKey is re-raised deliberately: it is a bridge misconfiguration,
+        not a gateway failure, and tools._call() turns it into its own
+        'unconfigured' state naming the env var an operator has to set.
+        """
+        try:
+            return await self._issue(method, path, json)
+        except MissingKey:
+            raise
+        except Exception as exc:
+            return self._opaque_failure(exc)
+
+    async def _issue(
         self, method: str, path: str, json: dict | None = None
     ) -> dict[str, Any]:
         p = self.profile
@@ -119,34 +180,11 @@ class GatewayClient:
                 reason=f"transport error: {type(exc).__name__}",
                 next="check the gateway process and the registered port",
             )
-        except Exception as exc:
-            # Anything outside httpx's own error hierarchy is assumed to carry
-            # key material and is never described to the caller.
-            #
-            # The live case: httpx encodes header values as ASCII, so a gateway
-            # key holding a non-ASCII character raises UnicodeEncodeError while
-            # building "Bearer <key>". Its message names the offending character
-            # and its offset in that header -- a character of the key, and where
-            # in the key it sits. UnicodeEncodeError is not an httpx.HTTPError,
-            # so without this clause it escapes request(), escapes tools._call()
-            # (which catches MissingKey only) and reaches the caller as tool
-            # error text.
-            #
-            # Catching broadly, and returning one fixed reason, is the point.
-            # Naming UnicodeEncodeError alone would leave the next non-HTTPError
-            # type as the same disclosure, and deriving the text from type(exc)
-            # would let a caller tell which internal failure occurred. Only the
-            # type is logged: the message is the part that holds key material.
-            logger.error(
-                "request to profile %s failed with %s; "
-                "check the value of %s (message withheld: it can echo the key)",
-                p.name, type(exc).__name__, p.key_env,
-            )
-            return state(
-                p.name, "unreachable",
-                reason="the bridge could not issue the request to this gateway",
-                next=f"check {p.key_env} in the bridge environment, then the bridge logs",
-            )
+        # No catch-all here. Anything outside httpx's hierarchy -- the
+        # UnicodeEncodeError from ASCII-encoding a non-ASCII key into
+        # "Bearer <key>" being the live case -- is caught by request(), which
+        # wraps this whole method rather than just the exchange above. One
+        # catch-all, one reason, so no path can answer differently from another.
 
         if resp.status_code in (401, 403):
             # Deliberately does not include the response body: a gateway is
