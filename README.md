@@ -245,9 +245,18 @@ Claude Code applies its own `env` block to every session, so the proxy can live 
   "env": {
     "HTTPS_PROXY": "http://127.0.0.1:8084",
     "NODE_EXTRA_CA_CERTS": "/Users/you/.backdoor/ca/ca-cert.pem",
-    "NO_PROXY": "localhost,127.0.0.1,::1"
+    "NO_PROXY": "localhost,127.0.0.1,::1,github.com,.github.com,githubusercontent.com,.githubusercontent.com",
+    "no_proxy": "localhost,127.0.0.1,::1,github.com,.github.com,githubusercontent.com,.githubusercontent.com"
   }
 }
+```
+
+**Exempt GitHub.** Every command a session runs inherits that `env`, so `git` and `gh` tunnel through `:8084` as well. They gain nothing from it, and they pay for the extra hop: a dropped tunnel surfaces as `CONNECT tunnel failed` from `git push`, or `POST https://api.github.com/graphql: Bad Gateway` from `gh pr merge`. A 502 there is ambiguous, because a merge that fails that way may still have landed. The `NO_PROXY` entries above route GitHub straight out. Both cases are listed because curl reads the lowercase name first, and `githubusercontent.com` is a separate apex that covers release assets, LFS objects, and raw fetches.
+
+For `git` specifically, a per-URL override holds even when the environment does not:
+
+```bash
+git config --global http.https://github.com.proxy ""
 ```
 
 This is usually what you want, for two reasons. It reaches GUI surfaces — the Claude Desktop app and IDE extensions never source your shell profile, so an exported variable never gets to them. And it stays scoped to Claude Code, unlike a login-wide `launchctl setenv HTTPS_PROXY`, which would put this proxy in front of every other application's HTTPS traffic.
@@ -272,6 +281,41 @@ Settings `env` has no health gate of its own, so pair it with a wrapper that che
 | `FORWARD_CA_DIR` | `~/.backdoor/ca` | CA and minted leaves |
 
 Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
+
+#### Do not run the service from your dev checkout
+
+Once a launchd job or systemd unit points `WorkingDirectory` at the clone you develop in, the service inherits whatever branch you happen to have checked out. Check out a branch that predates `src/proxy/forward.py` and the next restart silently drops the forward proxy.
+
+It fails quietly by design. `app.py` imports `forward` and `ca` inside the lifespan, wrapped in `try/except`, so the router keeps serving `:8083` rather than taking down inference for every session on the machine:
+
+```
+Forward proxy failed to start; continuing without it
+```
+
+The router looks healthy. `:8084` never listens. Any session pointed at it by `settings.json` now fails every request against a dead port, and a GUI surface has no shell wrapper to fall back on.
+
+Give the service its own checkout. A detached worktree pinned to `main` keeps your dev tree free to sit on any branch:
+
+```bash
+git worktree add --detach ../backdoor-service main
+cd ../backdoor-service
+uv sync --frozen
+ln -s ../backdoor/.env .env                                 # gitignored, loaded relative to cwd
+ln -s ../../backdoor/profiles/modal-qwen.env profiles/      # gitignored profile, if you use it
+```
+
+Detached rather than a checked-out branch, so `git checkout main` still works in the dev tree. Symlink the config instead of copying it, so the two never drift apart. Then point the service at `backdoor-service` and deploy on purpose:
+
+```bash
+git -C ../backdoor-service fetch origin main
+git -C ../backdoor-service checkout --detach origin/main
+(cd ../backdoor-service && uv sync --frozen)
+launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
+```
+
+The tradeoff is that editing code in your clone no longer deploys. That is the point: a restart can no longer pick up half-finished work, and the router's logs move to the service checkout with it.
+
+One launchd wrinkle if you script that swap: `launchctl bootout` returns before teardown finishes, so an immediate `bootstrap` fails with `Bootstrap failed: 5: Input/output error`. Poll `launchctl print gui/$(id -u)/<label>` until it errors, then bootstrap.
 
 ### Bare mode: what the local model actually receives
 
