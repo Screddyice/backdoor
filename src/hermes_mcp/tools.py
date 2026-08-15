@@ -11,8 +11,10 @@ from .client import state
 from .registry import Profile
 
 #: Tools that hold a conversation with an agent. Refused for control_only.
-#: A new conversational tool MUST be added here or control_only profiles are
-#: silently opened to it; tests/test_hermes_mcp_tiers.py pins the membership.
+#: This set is pinned by tests/test_hermes_mcp_tiers.py to detect if an existing
+#: member is removed or renamed. It does NOT detect if a new conversational tool
+#: is added without being added to this set; verifying the tool surface requires
+#: the tool definitions themselves, which arrive in a later task.
 CHAT_TOOLS = frozenset(
     {"hermes_chat", "hermes_run_status", "hermes_run_stop", "hermes_run_approve"}
 )
@@ -35,6 +37,12 @@ def check_tier(profile: Profile, tool: str) -> dict | None:
                 "general agent"
             ),
             next="use a profile registered as full, or change the tier deliberately",
+        )
+    if profile.tier not in ("full", "control_only", "unconfigured"):
+        return state(
+            profile.name, "unconfigured",
+            reason=f"unrecognised tier {profile.tier!r}; valid tiers are 'full', 'control_only', 'unconfigured'",
+            next="check the profile tier, or update the profile definition",
         )
     return None
 

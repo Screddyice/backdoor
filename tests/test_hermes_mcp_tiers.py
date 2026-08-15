@@ -46,11 +46,14 @@ def test_unconfigured_refuses_everything(tool):
     refusal = check_tier(GHOST, tool)
     assert refusal is not None
     assert refusal["state"] == "unconfigured"
+    assert refusal["reason"], "refusal must explain why, so caller does not retry"
 
 
-def test_chat_tools_covers_every_conversational_tool():
-    """Pin the membership. A new conversational tool that is not added here
-    would be allowed against a control_only profile."""
+def test_chat_tools_membership_is_pinned():
+    """Pin the membership to detect removal or renaming of members. This test
+    does NOT detect if a new conversational tool is added without being added
+    to CHAT_TOOLS; verifying the tool surface requires the tool definitions,
+    which arrive in a later task."""
     assert CHAT_TOOLS == frozenset(
         {"hermes_chat", "hermes_run_status", "hermes_run_stop", "hermes_run_approve"}
     )
@@ -68,4 +71,17 @@ def test_resolve_reports_an_unknown_profile_with_the_known_names():
     assert profile is None
     assert "alpha" in err["reason"] and "prod" in err["reason"], (
         "an unknown profile should list what is available"
+    )
+
+
+@pytest.mark.parametrize("tool", ["hermes_chat", "hermes_logs"])
+def test_unrecognised_tier_is_refused(tool):
+    """A profile with a typo'd or unrecognised tier (e.g. 'control-only' with a
+    hyphen) must be refused. Security gates fail closed."""
+    bogus = Profile(name="typo", tier="control-only", port=9003, key_env="C", unit="c.service")
+    refusal = check_tier(bogus, tool)
+    assert refusal is not None
+    assert refusal["state"] == "unconfigured"
+    assert "control-only" in refusal["reason"], (
+        "the reason must name the unrecognised tier"
     )
