@@ -12,7 +12,10 @@ dependencies = [
     "python-dotenv>=1.0",
     "tiktoken>=0.7",
     "python-telegram-bot>=21.0",
-    "mcp>=1.2",
+    # 2.0 is the floor, not a preference: src/hermes_mcp/http_server.py imports
+    # mcp.server.mcpserver.MCPServer, which 2.0 introduced when it renamed
+    # FastMCP. Any resolve below it is a ModuleNotFoundError at import.
+    "mcp>=2.0",
 ]
 
 [dependency-groups]
