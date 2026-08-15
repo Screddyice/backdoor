@@ -286,7 +286,20 @@ Three properties make that placement safe:
 
 The general lesson: `router_mode` is a real fork in this file, and a guard is only as good as the branch it sits in. Verify a fix against the mode the failure actually used, not the one you were reading when you wrote it.
 
-Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at roughly 15GB and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at **23GB** and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+
+### Keeping the 27B warm without starving the council
+
+The wrapper warms its tier at launch so the first turn skips the cold load, then holds it with `keep_alive`. That hold is shorter on the 27B, and the reason is the 44GB in the paragraph above:
+
+| Profile | `keep_alive` |
+|---|---|
+| `local-failover-qwen27` | **10m** |
+| every other profile | 30m |
+
+Thirty idle minutes of a resident 27B is thirty minutes in which `llmjury solve` can collide with it, and neither side will refuse: Ollama counts models, not bytes. Ten minutes still spans an active session and returns the GPU sooner. Failover has a stronger interlock and does not need this — llm-jury reads `~/.backdoor/failover-state.json` and stands down while the breaker is open — but a deliberate `qwen` session writes no such file, so the shorter hold is the only thing bounding the overlap.
+
+The warm-up call **must** carry a system message. A systemless request falls through to the baked ~46K-token Fable-5 SYSTEM prompt on the `*-64k/128k/256k` tags and cold-prefills all of it, which takes about a minute and looks exactly like an offline hang.
 
 The `qwen` wrapper reaches Ollama by a third path and never reads this table. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile and nothing strips server-side. Its modes pick their own tier:
 

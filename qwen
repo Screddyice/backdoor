@@ -10,9 +10,9 @@
 #   qwen            LEAN (default, 2026-07-09). Minimal prompt (~945 tok) on
 #                   Qwen3.5 27B @ 32K: --bare, harness slash-commands on demand,
 #                   no auto hooks, MCP off. The 27B is affordable here ONLY
-#                   because lean keeps the prompt tiny; ~15GB resident, so it
-#                   competes with the fusion council for GPU (see keep_alive
-#                   below). Full mode's ~42K harness prefill made a cold 4B take
+#                   because lean keeps the prompt tiny; 23GB resident, so it
+#                   cannot co-reside with the fusion council (~21GB) on this
+#                   36GB host (see keep_alive below). Full mode's ~42K harness prefill made a cold 4B take
 #                   minutes (and stall entirely under memory pressure), so lean
 #                   is the default — that offline hang is exactly why it flipped.
 #   qwen full       FULL harness — still Qwen3.5 4B @ 64K, NOT the 27B. The
@@ -215,12 +215,15 @@ done
 # looked like an offline hang. keep_alive 30m holds it warm for the session
 # (still unloads afterward, so battery use on a plane stays bounded).
 #
-# keep_alive is shorter for the 27B on purpose. At ~15GB resident it and a
-# fusion council (~21GB) cannot both be loaded on this 36GB host — and
-# OLLAMA_MAX_LOADED_MODELS caps by model COUNT, not bytes, so nothing upstream
-# will refuse that combination. Holding a 27B warm for 30 idle minutes widens
-# the window where `llmjury solve` collides with it; 10 minutes still covers an
-# active session while giving the GPU back sooner. See the panic note in
+# keep_alive is shorter for the 27B on purpose. At **23GB resident** it and a
+# fusion council (~21GB) cannot both be loaded on this 36GB host — 44GB against
+# a ~27GB Metal wired ceiling — and OLLAMA_MAX_LOADED_MODELS caps by model
+# COUNT, not bytes, so nothing upstream will refuse that combination. Holding a
+# 27B warm for 30 idle minutes widens the window where `llmjury solve` collides
+# with it; 10 minutes still covers an active session while giving the GPU back
+# sooner. This comment said ~15GB until 2026-08-14, which was the int4 build's
+# lazily-allocated floor; the GGUF rebuild (PR #23) made the real number 23GB
+# and the collision correspondingly worse. See the panic note in
 # modelfiles/bare/qwen3.5-27b-bare.Modelfile.
 KEEP_ALIVE="30m"
 [ "$PROFILE" = "local-failover-qwen27" ] && KEEP_ALIVE="10m"
