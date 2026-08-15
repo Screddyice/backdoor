@@ -203,7 +203,75 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
-> **Point Claude Code at the router, or none of this runs.** Failover lives in the request path, so a session started with `ANTHROPIC_BASE_URL` unset gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the base URL first.
+> **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
+
+### Forward-proxy mode: failover *and* Remote Control
+
+Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
+
+```js
+function eit(){ let e=process.env.ANTHROPIC_BASE_URL; if(!e) return true; return Oxe(e) }
+function Oxe(e){ let t=new URL(e).host; return ["api.anthropic.com"].includes(t) }
+```
+
+The allowlist is exact and there is no escape hatch — the binary states that `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` "does not apply to Remote Control". That forced an either/or: routed sessions had failover but no phone control, direct sessions had phone control but no failover.
+
+The premise was wrong. Backdoor has to be **in the path**, not **named as the endpoint** — and Claude Code honours `HTTPS_PROXY`. Enable `FORWARD_PROXY` and the router also serves an HTTP CONNECT proxy on `:8084`:
+
+```
+claude  (ANTHROPIC_BASE_URL unset  →  Remote Control offered)
+  │  HTTPS_PROXY=http://127.0.0.1:8084
+  ├── CONNECT api.anthropic.com:443 ──► TLS-terminated ──► :8083 router
+  └── CONNECT everything else       ──► opaque tunnel, untouched
+```
+
+Point a session at it:
+
+```bash
+env -u ANTHROPIC_BASE_URL \
+    HTTPS_PROXY=http://127.0.0.1:8084 \
+    NODE_EXTRA_CA_CERTS=~/.backdoor/ca/ca-cert.pem \
+    claude
+```
+
+`/model qwen` and offline failover keep working, and `claude remote-control` starts instead of refusing.
+
+#### Wiring it without touching the environment
+
+Claude Code applies its own `env` block to every session, so the proxy can live in `~/.claude/settings.json` instead of a shell profile:
+
+```json
+{
+  "env": {
+    "HTTPS_PROXY": "http://127.0.0.1:8084",
+    "NODE_EXTRA_CA_CERTS": "/Users/you/.backdoor/ca/ca-cert.pem",
+    "NO_PROXY": "localhost,127.0.0.1,::1"
+  }
+}
+```
+
+This is usually what you want, for two reasons. It reaches GUI surfaces — the Claude Desktop app and IDE extensions never source your shell profile, so an exported variable never gets to them. And it stays scoped to Claude Code, unlike a login-wide `launchctl setenv HTTPS_PROXY`, which would put this proxy in front of every other application's HTTPS traffic.
+
+Two behaviours are worth knowing before you rely on it:
+
+- **A settings `env` value beats an empty process variable.** Clearing `HTTPS_PROXY` in the shell does *not* opt a session out; settings.json fills it back in.
+- **`NO_PROXY=*` is the opt-out.** It bypasses the proxy for every host, which is what a "go direct" launcher wants. Useful for a health-gated wrapper: if `:8084` is unreachable, export `NO_PROXY=*` so the session degrades to a plain cloud session instead of failing every request against a dead proxy.
+
+Settings `env` has no health gate of its own, so pair it with a wrapper that checks the port when you care about that degradation path.
+
+**Only allowlisted hosts are inspected.** `FORWARD_MITM_HOSTS` defaults to `api.anthropic.com`; everything else — Composio, npm, your MCP servers, and the Remote Control bridge to claude.ai — is relayed as opaque bytes, so nothing else can have its TLS broken by a proxy it never asked for.
+
+**About the CA.** Reading a CONNECT tunnel means presenting a certificate for a host you do not own, so Backdoor mints one from a CA at `~/.backdoor/ca` (key `0600`). It is **never** installed into the system keychain: the only thing that trusts it is a process you hand `NODE_EXTRA_CA_CERTS` to. Every other program on the machine rejects anything it signs. Delete the directory to revoke it; it regenerates on next use.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `FORWARD_PROXY` | `false` | Enable the CONNECT proxy |
+| `FORWARD_PORT` | `8084` | Port it listens on |
+| `FORWARD_MITM_HOSTS` | `api.anthropic.com` | Hosts to intercept; all others tunnel blind |
+| `FORWARD_ROUTER_PORT` | `8083` | Where intercepted traffic is delivered |
+| `FORWARD_CA_DIR` | `~/.backdoor/ca` | CA and minted leaves |
+
+Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
 
 ### Bare mode: what the local model actually receives
 
@@ -286,7 +354,20 @@ Three properties make that placement safe:
 
 The general lesson: `router_mode` is a real fork in this file, and a guard is only as good as the branch it sits in. Verify a fix against the mode the failure actually used, not the one you were reading when you wrote it.
 
-Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at roughly 15GB and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at **23GB** and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+
+### Keeping the 27B warm without starving the council
+
+The wrapper warms its tier at launch so the first turn skips the cold load, then holds it with `keep_alive`. That hold is shorter on the 27B, and the reason is the 44GB in the paragraph above:
+
+| Profile | `keep_alive` |
+|---|---|
+| `local-failover-qwen27` | **10m** |
+| every other profile | 30m |
+
+Thirty idle minutes of a resident 27B is thirty minutes in which `llmjury solve` can collide with it, and neither side will refuse: Ollama counts models, not bytes. Ten minutes still spans an active session and returns the GPU sooner. Failover has a stronger interlock and does not need this — llm-jury reads `~/.backdoor/failover-state.json` and stands down while the breaker is open — but a deliberate `qwen` session writes no such file, so the shorter hold is the only thing bounding the overlap.
+
+The warm-up call **must** carry a system message. A systemless request falls through to the baked ~46K-token Fable-5 SYSTEM prompt on the `*-64k/128k/256k` tags and cold-prefills all of it, which takes about a minute and looks exactly like an offline hang.
 
 The `qwen` wrapper reaches Ollama by a third path and never reads this table. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile and nothing strips server-side. Its modes pick their own tier:
 
@@ -297,6 +378,22 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 | `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the 27B costs more GPU than the task is worth |
 
 The wrapper prints the tier it resolved at launch. Read that line if you are unsure which model you got.
+
+#### What `--bare` takes away, and what lean mode puts back
+
+Client-side `--bare` is what keeps the lean prompt near 945 tokens, but it is blunter than the name suggests. Per `claude --help` it skips *"hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and CLAUDE.md auto-discovery"*. Two of those matter more than the token saving:
+
+- **Hooks do not run.** Not reduced — off. A `SessionStart` probe fired without `--bare` and stayed silent with it, and `--settings` does not put it back.
+- **CLAUDE.md is not loaded.** The session gets none of the repo or machine conventions it would normally start with.
+
+Together those quietly removed pull requests from local-model sessions. The convention that every branch gets a PR lives in CLAUDE.md, so the model never saw it; the hook that opens the PR anyway is a hook, so it never ran. Branches accumulated commits, no PR appeared, and nothing reported a failure — the two mechanisms that would each have caught the other were disabled by the same flag.
+
+Lean mode now restores both, narrowly:
+
+- `--append-system-prompt` injects `prompts/qwen-pr-rules.md` (~600 tokens): branch naming, open the draft PR on the first commit, update the README, check `gh repo set-default` when the repo has an `upstream` remote, and leave RS21 alone. Loading real CLAUDE.md files with `--add-dir` would also work, but at ~33KB it would spend a quarter of the 27B's window on context that is mostly irrelevant to a coding turn.
+- The wrapper runs `auto-pr-push.sh` after the session exits, which is why it no longer `exec`s. That is the same script the Stop hook would have run; it no-ops unless the branch is off trunk, has commits ahead, has no open PR, and belongs to an allowlisted owner, and it refuses any repo with `rs21` in the name.
+
+If you write your own wrapper around `--bare`, assume nothing in `.claude/` applies to that session.
 
 ### Sizing the failover tier
 

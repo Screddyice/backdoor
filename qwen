@@ -10,9 +10,9 @@
 #   qwen            LEAN (default, 2026-07-09). Minimal prompt (~945 tok) on
 #                   Qwen3.5 27B @ 32K: --bare, harness slash-commands on demand,
 #                   no auto hooks, MCP off. The 27B is affordable here ONLY
-#                   because lean keeps the prompt tiny; ~15GB resident, so it
-#                   competes with the fusion council for GPU (see keep_alive
-#                   below). Full mode's ~42K harness prefill made a cold 4B take
+#                   because lean keeps the prompt tiny; 23GB resident, so it
+#                   cannot co-reside with the fusion council (~21GB) on this
+#                   36GB host (see keep_alive below). Full mode's ~42K harness prefill made a cold 4B take
 #                   minutes (and stall entirely under memory pressure), so lean
 #                   is the default — that offline hang is exactly why it flipped.
 #   qwen full       FULL harness — still Qwen3.5 4B @ 64K, NOT the 27B. The
@@ -189,6 +189,25 @@ else
   EXTRA_ARGS=(--bare)
   HARNESS_DIR="$(ls -dt "$HOME"/.claude/plugins/cache/claude-harness/claude-harness/*/ 2>/dev/null | head -1)"
   [ -n "$HARNESS_DIR" ] && EXTRA_ARGS+=(--plugin-dir "$HARNESS_DIR")
+
+  # --bare also skips CLAUDE.md auto-discovery and EVERY hook. `claude --help`
+  # says so outright, and a SessionStart probe confirmed it on 2026-08-15: the
+  # hook fired without --bare and did not fire with it, and --settings cannot
+  # put it back.
+  #
+  # That quietly removed both halves of PR creation from local-model sessions.
+  # The model never saw the every-branch-gets-a-PR rule (it lives in CLAUDE.md),
+  # and auto-pr-push.sh never fired to do it on the model's behalf. The branch
+  # got commits, nothing opened a PR, and nothing said why.
+  #
+  # Re-inject the git/PR rules only. Loading the real CLAUDE.md set via
+  # --add-dir would work but costs ~33KB — a quarter of the 27B's 32K window,
+  # for context that is mostly irrelevant to a local coding turn. `--append-
+  # system-prompt` takes the text inline; there is no `-file` form despite what
+  # the --bare help text implies.
+  PR_RULES="$HOME/backdoor/prompts/qwen-pr-rules.md"
+  [ -f "$PR_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$(cat "$PR_RULES")")
+
   MODE_NOTE="lean"
 fi
 
@@ -215,12 +234,15 @@ done
 # looked like an offline hang. keep_alive 30m holds it warm for the session
 # (still unloads afterward, so battery use on a plane stays bounded).
 #
-# keep_alive is shorter for the 27B on purpose. At ~15GB resident it and a
-# fusion council (~21GB) cannot both be loaded on this 36GB host — and
-# OLLAMA_MAX_LOADED_MODELS caps by model COUNT, not bytes, so nothing upstream
-# will refuse that combination. Holding a 27B warm for 30 idle minutes widens
-# the window where `llmjury solve` collides with it; 10 minutes still covers an
-# active session while giving the GPU back sooner. See the panic note in
+# keep_alive is shorter for the 27B on purpose. At **23GB resident** it and a
+# fusion council (~21GB) cannot both be loaded on this 36GB host — 44GB against
+# a ~27GB Metal wired ceiling — and OLLAMA_MAX_LOADED_MODELS caps by model
+# COUNT, not bytes, so nothing upstream will refuse that combination. Holding a
+# 27B warm for 30 idle minutes widens the window where `llmjury solve` collides
+# with it; 10 minutes still covers an active session while giving the GPU back
+# sooner. This comment said ~15GB until 2026-08-14, which was the int4 build's
+# lazily-allocated floor; the GGUF rebuild (PR #23) made the real number 23GB
+# and the collision correspondingly worse. See the panic note in
 # modelfiles/bare/qwen3.5-27b-bare.Modelfile.
 KEEP_ALIVE="30m"
 [ "$PROFILE" = "local-failover-qwen27" ] && KEEP_ALIVE="10m"
@@ -238,6 +260,32 @@ echo "▶ Local model: $MODEL ($PROFILE, $MODE_NOTE) — $MCP_NOTE"
 # 9B; Claude Code's default timeout aborts + retries mid-prefill, doubling it.
 # ${arr[@]+...} guards: macOS bash 3.2 + `set -u` errors on expanding an
 # empty array; MCP_ARGS is empty whenever MCP is on.
-exec env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" \
+#
+# Not `exec`, deliberately. Replacing this shell would leave nothing to run
+# AFTER the session, and --bare disables hooks — including the Stop hook that
+# normally guarantees a branch does not end the day without a PR. Dropping exec
+# costs one idle shell and buys back that backstop (step 7).
+env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" \
   API_TIMEOUT_MS=600000 \
   claude ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} "$@"
+claude_status=$?
+
+# 7. PR backstop — the Stop hook this session never got.
+#
+# Runs the same auto-pr-push.sh the harness would have run, in the directory the
+# session worked in (this wrapper never cd's). It is safe to call unconditionally:
+# it no-ops unless the repo's origin owner is on the allowlist, the branch is off
+# trunk, has commits ahead, and has no open PR — and hook-common.sh refuses any
+# repo with `rs21` in its name outright. It backgrounds and disowns its own work,
+# so it does not delay the prompt coming back.
+#
+# stdin is /dev/null on purpose: the script reads a hook JSON payload from stdin
+# and falls back to the current directory when it gets nothing, which is exactly
+# the behaviour wanted here.
+AUTO_PR="$HOME/projects/Screddyice/claude-code-harness/scripts/hooks/auto-pr-push.sh"
+if [ -x "$AUTO_PR" ]; then
+  HARNESS_PR_OWNERS="${HARNESS_PR_OWNERS:-teamnebula-ai screddyice}" \
+    "$AUTO_PR" </dev/null >/dev/null 2>&1 || true
+fi
+
+exit "$claude_status"
