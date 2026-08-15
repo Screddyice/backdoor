@@ -7,6 +7,8 @@ gateways are separate processes on one host, and two profiles claiming a port
 means one of them is silently unreachable or, worse, answering for the other.
 """
 
+import os
+
 import pytest
 
 from src.hermes_mcp.registry import (
@@ -110,8 +112,6 @@ def test_the_real_registry_on_disk_is_loadable_and_consistent():
     an env var that is actually set, or the bridge 401s that profile at runtime
     with everything looking correctly configured.
     """
-    import os
-
     path = registry_path()
     if not path.exists():
         pytest.skip(f"no registry deployed at {path}")
