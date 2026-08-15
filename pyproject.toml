@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "tiktoken>=0.7",
     "python-telegram-bot>=21.0",
+    "mcp>=1.2",
 ]
 
 [dependency-groups]
@@ -26,7 +27,7 @@ asyncio_mode = "auto"
 pythonpath = ["."]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/proxy"]
+packages = ["src/proxy", "src/hermes_mcp"]
 
 [build-system]
 requires = ["hatchling"]
