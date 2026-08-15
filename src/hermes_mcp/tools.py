@@ -8,6 +8,7 @@ it first.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 from pathlib import Path
 
@@ -238,11 +239,19 @@ def register_tools(
                 reason="no systemd unit is registered for this profile",
                 next="run `hermes gateway install` for it, then add unit to the registry",
             )
-        proc = await runner(
-            "systemctl", "--user", verb, profile.unit,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await proc.communicate()
+        try:
+            proc = await runner(
+                "systemctl", "--user", verb, profile.unit,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+        except OSError as exc:
+            return state(
+                profile.name, "unreachable",
+                reason=f"cannot run systemctl: {type(exc).__name__}",
+                next="systemctl is not available on this host; the bridge must run "
+                     "on the same host as the gateways, under systemd",
+            )
         if proc.returncode != 0:
             return state(
                 profile.name, "unreachable",
@@ -287,13 +296,19 @@ def register_tools(
                 next="add home to the registry entry",
             )
         path = Path(p.home) / "logs" / "gateway.log"
+        # A co-located gateway log can be hundreds of megabytes between
+        # rotations. Reading the whole file to return a handful of lines would
+        # block the event loop and spike memory, so bound both the read (a
+        # deque over an open file handle keeps only the tail in memory) and
+        # the request itself (a caller cannot ask for the whole file back).
+        cap = max(0, min(lines, 1000))
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                tail = [line.rstrip("\n") for line in deque(f, maxlen=cap)]
         except OSError as exc:
             return state(
                 p.name, "unreachable",
                 reason=f"cannot read {path}: {type(exc).__name__}",
                 next="check the profile home and whether the gateway has ever started",
             )
-        tail = content.splitlines()[-lines:] if lines > 0 else []
-        return {"profile": p.name, "state": "ok", "lines": tail}
+        return {**state(p.name, "ok"), "lines": tail}

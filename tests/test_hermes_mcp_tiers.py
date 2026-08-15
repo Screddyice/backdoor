@@ -109,7 +109,11 @@ class _MCP:
 
     def tool(self, *_a, **_k):
         def deco(fn):
-            self.tools[fn.__name__] = fn
+            # Real FastMCP supports @mcp.tool(name="...") registering a
+            # differently-named function under an explicit name. Keying on
+            # fn.__name__ alone would let the classification guard below pin
+            # the function name while the real exposed surface has another.
+            self.tools[_k.get("name", fn.__name__)] = fn
             return fn
         return deco
 
