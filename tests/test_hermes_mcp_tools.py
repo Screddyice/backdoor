@@ -125,6 +125,25 @@ async def test_config_tools_hit_the_documented_endpoint(tool, path):
     assert seen["path"] == path
 
 
+async def test_chat_hits_the_documented_endpoint():
+    """hermes_chat cannot join the parametrized case above because it takes a
+    required message argument, and being outside it left the chat endpoint --
+    the one tool that starts work on an agent -- as the single path in the tool
+    surface no test asserted."""
+    seen = {}
+
+    class Recording(FakeClient):
+        async def request(self, method, p, json=None):
+            seen.update(method=method, path=p, json=json)
+            return {"ok": True, "data": {}}
+
+    mcp = FakeMCP()
+    register_tools(mcp, REGISTRY, client_factory=Recording)
+    await mcp.tools["hermes_chat"](profile="alpha", message="hello")
+    assert (seen["method"], seen["path"]) == ("POST", "/v1/runs")
+    assert seen["json"] == {"input": "hello"}
+
+
 async def test_session_messages_uses_the_session_id():
     seen = {}
 

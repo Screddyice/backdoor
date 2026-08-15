@@ -145,7 +145,7 @@ async def test_chat_reaches_a_full_profile():
     got = await t["hermes_chat"](profile="alpha", message="hello")
     assert got["ok"] is True
     name, method, path, body = _Client.calls[-1]
-    assert (name, method) == ("alpha", "POST")
+    assert (name, method, path) == ("alpha", "POST", "/v1/runs")
     assert body["input"] == "hello"
     assert "session_id" not in body, "session_id must be omitted when not provided"
 
@@ -156,6 +156,7 @@ async def test_chat_with_session_id_includes_it():
     got = await t["hermes_chat"](profile="alpha", message="hello", session_id="s-1")
     assert got["ok"] is True
     name, method, path, body = _Client.calls[-1]
+    assert path == "/v1/runs", "continuity rides the body session_id on this path"
     assert body["session_id"] == "s-1"
     assert body["input"] == "hello"
 
