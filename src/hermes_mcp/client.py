@@ -11,6 +11,7 @@ instance and never echoed into a response.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -18,9 +19,36 @@ import httpx
 
 from .registry import Profile
 
+logger = logging.getLogger(__name__)
+
 STATES = frozenset(
     {"ok", "stopped", "unconfigured", "control_only", "unreachable", "unauthorized"}
 )
+
+#: Stands in for the gateway key wherever a gateway echoed it back to us. Fixed
+#: text, so it discloses neither the key's length nor where in the body it sat.
+REDACTED = "[redacted: gateway key]"
+
+
+def _redact(value: Any, key: str) -> Any:
+    """Return *value* with every occurrence of *key* replaced by REDACTED.
+
+    Recurses through the containers json.loads can produce, so a key echoed in a
+    nested field is caught as surely as one at the top level, and rebuilds the
+    structure rather than stringifying it: a caller still receives real JSON
+    types. Non-str leaves cannot contain the key and are returned untouched.
+    """
+    if not key:
+        return value
+    if isinstance(value, str):
+        return value.replace(key, REDACTED)
+    if isinstance(value, dict):
+        return {_redact(k, key): _redact(v, key) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(item, key) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact(item, key) for item in value)
+    return value
 
 
 class MissingKey(RuntimeError):
@@ -91,6 +119,34 @@ class GatewayClient:
                 reason=f"transport error: {type(exc).__name__}",
                 next="check the gateway process and the registered port",
             )
+        except Exception as exc:
+            # Anything outside httpx's own error hierarchy is assumed to carry
+            # key material and is never described to the caller.
+            #
+            # The live case: httpx encodes header values as ASCII, so a gateway
+            # key holding a non-ASCII character raises UnicodeEncodeError while
+            # building "Bearer <key>". Its message names the offending character
+            # and its offset in that header -- a character of the key, and where
+            # in the key it sits. UnicodeEncodeError is not an httpx.HTTPError,
+            # so without this clause it escapes request(), escapes tools._call()
+            # (which catches MissingKey only) and reaches the caller as tool
+            # error text.
+            #
+            # Catching broadly, and returning one fixed reason, is the point.
+            # Naming UnicodeEncodeError alone would leave the next non-HTTPError
+            # type as the same disclosure, and deriving the text from type(exc)
+            # would let a caller tell which internal failure occurred. Only the
+            # type is logged: the message is the part that holds key material.
+            logger.error(
+                "request to profile %s failed with %s; "
+                "check the value of %s (message withheld: it can echo the key)",
+                p.name, type(exc).__name__, p.key_env,
+            )
+            return state(
+                p.name, "unreachable",
+                reason="the bridge could not issue the request to this gateway",
+                next=f"check {p.key_env} in the bridge environment, then the bridge logs",
+            )
 
         if resp.status_code in (401, 403):
             # Deliberately does not include the response body: a gateway is
@@ -111,7 +167,13 @@ class GatewayClient:
             data = resp.json()
         except ValueError:
             data = {"text": resp.text}
-        return {"ok": True, "data": data}
+        # A 2xx body is gateway-supplied content, and the reasoning applied to
+        # 401/403 above holds here too: a gateway is free to echo the key it was
+        # sent, on any status code. Arbitrary content cannot be filtered, but the
+        # one string that must not pass is known exactly, so redact by value.
+        # This sits on the single return that carries a body, so the JSON branch
+        # and the plain-text fallback are both covered by construction.
+        return _redact({"ok": True, "data": data}, key)
 
     async def probe(self) -> dict[str, Any]:
         got = await self.request("GET", "/health")
