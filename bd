@@ -81,7 +81,7 @@ cmd_log() { tail -n "${1:-40}" "$LOG" 2>/dev/null || echo "(no log yet)"; }
 # an existing session, so it is what 'ping' actually sends; 'list'/'status'/
 # 'logs' need a real MCP client that can hold a session, not curl.
 cmd_hermes() {
-  local sub="${1:-list}"; shift || true
+  local sub="${1:-ping}"; shift || true
   local url="${HERMES_MCP_URL:-}"
   local key="${HERMES_MCP_KEY:-}"
   if [ -z "$url" ]; then
@@ -92,6 +92,8 @@ cmd_hermes() {
   fi
   case "$sub" in
     ping)
+      # The Authorization header is visible in `ps` output for the lifetime
+      # of this curl invocation. Accepted here for a sub-second CLI call.
       curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$url" \
         -H "Authorization: Bearer $key" \
         -H 'content-type: application/json' \

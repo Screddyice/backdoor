@@ -131,8 +131,12 @@ if [ "${QWEN_MEM0:-0}" = "1" ] && [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
   if [ -n "${MEM0_API_KEY:-}" ]; then
     MEM0_MCP_CONF="$HOME/.cache/backdoor/qwen-mem0-mcp.json"
     mkdir -p "$(dirname "$MEM0_MCP_CONF")"
-    # Expand token into a private config (mode 600) — Claude MCP may not expand ${ENV}
-    python3 - "$MEM0_MCP_CONF" <<'PY2'
+    # Expand token into a private config (mode 600) — Claude MCP may not expand ${ENV}.
+    # umask 077 so the file is created 600 from its first byte, rather than
+    # briefly world-readable and then tightened by the chmod below.
+    (
+      umask 077
+      python3 - "$MEM0_MCP_CONF" <<'PY2'
 import json, os, sys
 path = sys.argv[1]
 key = os.environ.get("MEM0_API_KEY", "")
@@ -147,6 +151,10 @@ cfg = {
 }
 json.dump(cfg, open(path, "w"), indent=2)
 PY2
+    )
+    # Backstop, not redundant: umask only governs new-file creation, so if a
+    # prior run left this path at a wider mode, `open(path, "w")` truncates
+    # its content but does not narrow its existing permissions.
     chmod 600 "$MEM0_MCP_CONF"
     MCP_ARGS=(--strict-mcp-config --mcp-config "$MEM0_MCP_CONF")
     echo "qwen: Mem0 Platform MCP enabled (cloud memory, local inference)" >&2
@@ -161,8 +169,12 @@ else
   # Lives in ~/.cache (NOT the backdoor repo) because it contains API keys.
   MCP_CONF="$HOME/.cache/backdoor/qwen-mcp.json"
   mkdir -p "$(dirname "$MCP_CONF")"
-  QWEN_MCP_SERVERS="${QWEN_MCP_SERVERS:-}" \
-    python3 - "$MCP_CONF" <<'PY'
+  # umask 077 so the file is created 600 from its first byte (see the Mem0
+  # branch above for why the chmod below stays as a backstop, not a duplicate).
+  (
+    umask 077
+    QWEN_MCP_SERVERS="${QWEN_MCP_SERVERS:-}" \
+      python3 - "$MCP_CONF" <<'PY'
 import json, os, sys
 cfg = json.load(open(os.path.expanduser('~/.claude.json')))
 names = [n.strip() for n in os.environ['QWEN_MCP_SERVERS'].split(',') if n.strip()]
@@ -173,6 +185,7 @@ if missing:
     print(f"qwen: WARNING — MCP servers not in ~/.claude.json, skipped: {', '.join(missing)}", file=sys.stderr)
 json.dump({'mcpServers': servers}, open(sys.argv[1], 'w'), indent=2)
 PY
+  )
   chmod 600 "$MCP_CONF"
   MCP_ARGS=(--strict-mcp-config --mcp-config "$MCP_CONF")
 fi
@@ -189,8 +202,12 @@ if [ "${QWEN_HERMES:-0}" = "1" ]; then
     HERMES_CFG="$HOME/.cache/backdoor/qwen-hermes-mcp.json"
     mkdir -p "$(dirname "$HERMES_CFG")"
     # Expand env into a private config (mode 600) — Claude Code's MCP config
-    # may not expand ${ENV} references at load time.
-    python3 - "$HERMES_CFG" <<'PY3'
+    # may not expand ${ENV} references at load time. umask 077 so the file
+    # is created 600 from its first byte (chmod below stays as a backstop —
+    # see the Mem0 branch above for why it isn't redundant).
+    (
+      umask 077
+      python3 - "$HERMES_CFG" <<'PY3'
 import json, os, sys
 cfg = {"mcpServers": {"hermes-mcp": {
     "type": "http",
@@ -199,6 +216,7 @@ cfg = {"mcpServers": {"hermes-mcp": {
 }}}
 json.dump(cfg, open(sys.argv[1], "w"), indent=2)
 PY3
+    )
     chmod 600 "$HERMES_CFG"
     MCP_ARGS=(--strict-mcp-config --mcp-config "$HERMES_CFG")
     echo "qwen: Hermes MCP bridge enabled" >&2
