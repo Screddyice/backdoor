@@ -9,6 +9,9 @@ path from nothing. The log path is always built from the registry-controlled
 name is not reachable in the first place and is not separately tested here.
 """
 
+import threading
+from pathlib import Path
+
 import pytest
 
 from src.hermes_mcp.registry import Profile
@@ -158,6 +161,42 @@ async def test_logs_cap_the_requested_lines_at_a_ceiling(tmp_path):
     assert len(got["lines"]) == 1000
     assert got["lines"][0] == "line5"
     assert got["lines"][-1] == "line1004"
+
+
+async def test_logs_are_not_read_on_the_event_loop(tmp_path, monkeypatch):
+    """Bounding memory with a deque does not stop a synchronous full-file walk
+    from stalling the loop. This bridge is one process fronting every profile,
+    so a read that blocks the loop blocks every other profile's tools too, and
+    the per-profile isolation the tool surface promises stops being true on the
+    large log the cap exists for. Asserted by observing the thread the file is
+    actually opened on rather than by naming the call that moves it there."""
+    home = tmp_path / "alpha"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "gateway.log").write_text("line1\nline2\n", encoding="utf-8")
+
+    loop_thread = threading.get_ident()
+    opened_on: list[int] = []
+    real_open = Path.open
+
+    def spy_open(self, *args, **kwargs):
+        if self.name == "gateway.log":
+            opened_on.append(threading.get_ident())
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+
+    profile = Profile(name="alpha", tier="full", port=9001, key_env="A",
+                      unit="a.service", home=str(home))
+    mcp = _MCP()
+    register_tools(mcp, {"alpha": profile}, client_factory=lambda p, **k: None,
+                   runner=None)
+    got = await mcp.tools["hermes_logs"](profile="alpha", lines=2)
+
+    assert got["lines"] == ["line1", "line2"], "moving the read must not change it"
+    assert opened_on, "the log file was never opened"
+    assert all(t != loop_thread for t in opened_on), (
+        "the log was read on the event loop thread"
+    )
 
 
 async def test_logs_refuse_a_profile_with_no_home():

@@ -302,9 +302,20 @@ def register_tools(
         # deque over an open file handle keeps only the tail in memory) and
         # the request itself (a caller cannot ask for the whole file back).
         cap = max(0, min(lines, 1000))
-        try:
+
+        def _read_tail() -> list[str]:
             with path.open("r", encoding="utf-8", errors="replace") as f:
-                tail = [line.rstrip("\n") for line in deque(f, maxlen=cap)]
+                return [line.rstrip("\n") for line in deque(f, maxlen=cap)]
+
+        try:
+            # The deque bounds memory, but the read itself is synchronous and
+            # walks the whole file, so on the large log described above it would
+            # stall this single-process bridge for every profile, not just this
+            # one. Off the event loop it stalls a worker thread instead, and the
+            # per-profile isolation the tool surface promises holds. OSError
+            # still propagates out of the thread, so the handling below is
+            # unchanged.
+            tail = await asyncio.to_thread(_read_tail)
         except OSError as exc:
             return state(
                 p.name, "unreachable",
