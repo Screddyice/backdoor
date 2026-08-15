@@ -177,6 +177,34 @@ PY
   MCP_ARGS=(--strict-mcp-config --mcp-config "$MCP_CONF")
 fi
 
+# Optional: reach the Hermes MCP bridge from this local model. Independent of
+# QWEN_MEM0/QWEN_MCP above — when set it takes over MCP_ARGS with just the
+# hermes-mcp server. Regenerated every launch (mode 600, under ~/.cache, not
+# the repo) so key rotations carry over; a missing URL/key degrades to a
+# warning rather than a failed launch.
+if [ "${QWEN_HERMES:-0}" = "1" ]; then
+  if [ -z "${HERMES_MCP_URL:-}" ] || [ -z "${HERMES_MCP_KEY:-}" ]; then
+    echo "qwen: QWEN_HERMES=1 but HERMES_MCP_URL/HERMES_MCP_KEY are unset — MCP stays off" >&2
+  else
+    HERMES_CFG="$HOME/.cache/backdoor/qwen-hermes-mcp.json"
+    mkdir -p "$(dirname "$HERMES_CFG")"
+    # Expand env into a private config (mode 600) — Claude Code's MCP config
+    # may not expand ${ENV} references at load time.
+    python3 - "$HERMES_CFG" <<'PY3'
+import json, os, sys
+cfg = {"mcpServers": {"hermes-mcp": {
+    "type": "http",
+    "url": os.environ["HERMES_MCP_URL"],
+    "headers": {"Authorization": "Bearer " + os.environ["HERMES_MCP_KEY"]},
+}}}
+json.dump(cfg, open(sys.argv[1], "w"), indent=2)
+PY3
+    chmod 600 "$HERMES_CFG"
+    MCP_ARGS=(--strict-mcp-config --mcp-config "$HERMES_CFG")
+    echo "qwen: Hermes MCP bridge enabled" >&2
+  fi
+fi
+
 # 4. Mode-specific launch args.
 if [ "$MODE" = "full" ]; then
   # AUTO-HOOK mode: enable harness + claude-mem + ralph-loop (and their hooks),
