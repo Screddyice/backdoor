@@ -16,6 +16,10 @@ FULL = Profile(name="alpha", tier="full", port=9001, key_env="A",
                unit="a.service", home="/srv/gw/alpha")
 NO_UNIT = Profile(name="nounit", tier="full", port=9003, key_env="C", home="/srv/gw/nounit")
 NO_HOME = Profile(name="nohome", tier="full", port=9004, key_env="D", unit="d.service")
+# unit is deliberately set here: if check_tier's unconfigured refusal were ever
+# removed from _systemctl, this profile would fall through to the unit check,
+# pass it, and reach the runner -- which is exactly the escape this guards.
+UNCONFIGURED = Profile(name="ghost", tier="unconfigured", unit="e.service")
 
 
 class _MCP:
@@ -42,7 +46,7 @@ def _tools(runner):
     mcp = _MCP()
     register_tools(
         mcp,
-        {"alpha": FULL, "nounit": NO_UNIT, "nohome": NO_HOME},
+        {"alpha": FULL, "nounit": NO_UNIT, "nohome": NO_HOME, "ghost": UNCONFIGURED},
         client_factory=lambda p, **k: None,
         runner=runner,
     )
@@ -77,6 +81,25 @@ async def test_lifecycle_refuses_a_profile_with_no_unit():
     assert got["state"] == "stopped"
     assert "unit" in (got["reason"] or "")
     assert called["n"] == 0, "shelled out for a profile with no systemd unit"
+
+
+@pytest.mark.parametrize("tool", ["hermes_start", "hermes_stop", "hermes_restart"])
+async def test_lifecycle_refuses_an_unconfigured_tier_profile(tool):
+    """_systemctl runs resolve -> check_tier -> unit check -> runner. The
+    no-unit path is covered above; this covers the tier path. UNCONFIGURED
+    carries a unit precisely so that if check_tier's refusal were skipped, the
+    call would fall through the unit check and reach the runner instead of
+    failing for an unrelated reason.
+    """
+    called = {"n": 0}
+
+    async def runner(*argv, **_kw):
+        called["n"] += 1
+        return _Proc()
+
+    got = await _tools(runner)[tool](profile="ghost")
+    assert got["state"] == "unconfigured"
+    assert called["n"] == 0, "shelled out for a profile with an unconfigured tier"
 
 
 async def test_lifecycle_reports_a_failing_systemctl():
