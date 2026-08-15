@@ -86,7 +86,14 @@ class _BridgeTokenVerifier(TokenVerifier):
     otherwise reach compare_digest and raise -- surfacing as an unauthenticated
     500 rather than a 401, since Starlette's AuthenticationMiddleware only
     catches AuthenticationError. Comparing encoded bytes instead sidesteps
-    compare_digest's str-only restriction entirely, so no input can raise.
+    compare_digest's str-only restriction.
+
+    str.encode(..., errors="surrogateescape") is itself not total: it raises
+    UnicodeEncodeError on a lone surrogate (U+D800-U+DFFF), which surrogateescape's
+    own decode-side round trip never produces but which a Python caller can still
+    construct directly. That UnicodeEncodeError is caught below and treated as a
+    non-matching token, so verify_token itself is total: no str input can raise,
+    and a lone-surrogate token gets the same result as any other wrong token.
     """
 
     def __init__(self, key: str) -> None:
@@ -94,7 +101,10 @@ class _BridgeTokenVerifier(TokenVerifier):
         self._key_bytes = key.encode("utf-8")
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        token_bytes = token.encode("utf-8", errors="surrogateescape")
+        try:
+            token_bytes = token.encode("utf-8", errors="surrogateescape")
+        except UnicodeEncodeError:
+            return None
         if hmac.compare_digest(token_bytes, self._key_bytes):
             return AccessToken(token=token, client_id="hermes-mcp-caller", scopes=[])
         return None

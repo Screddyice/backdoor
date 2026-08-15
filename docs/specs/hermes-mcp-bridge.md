@@ -90,7 +90,7 @@ MCP client (any surface)
   ▼
 https://<gateway-host>/<route>/          reverse proxy / tunnel
   ▼
-127.0.0.1:<bridge-port>   hermes-mcp-http   (FastMCP, streamable HTTP)
+127.0.0.1:<bridge-port>   hermes-mcp-http   (MCPServer, streamable HTTP)
   │
   ├─ profile A  → 127.0.0.1:<port A>   full
   ├─ profile B  → 127.0.0.1:<port B>   full
@@ -115,7 +115,7 @@ the three things REST cannot: run `systemctl --user` for lifecycle, and read eac
 | `registry.py` | Profile → port, key env var, capability tier. Loaded from one config file outside the repo. Fails startup on duplicate ports. |
 | `client.py` | Async `httpx` wrapper over one gateway's REST API. Per-profile timeouts. Converts transport failures into structured state, never exceptions. |
 | `tools.py` | MCP tool definitions. Fans out across the registry. |
-| `http_server.py` | FastMCP app over streamable HTTP. Bearer auth. Refuses to boot on a missing, short, or placeholder key, mirroring Hermes's own guard. |
+| `http_server.py` | MCPServer app over streamable HTTP. Bearer auth. Refuses to boot on a missing, short, or placeholder key, mirroring Hermes's own guard. |
 
 This repo is otherwise an LLM proxy, and `src/proxy/` never touches MCP. This package is a
 sibling concern and does not import from it.

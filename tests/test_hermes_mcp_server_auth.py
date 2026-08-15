@@ -115,11 +115,13 @@ async def test_build_server_registers_every_expected_tool(monkeypatch):
     reality instead of duplicating a list that would silently drift as tools
     are added or renamed.
 
-    Accessor note: the brief's `server._tool_manager.list_tools()` does not
-    exist on the installed mcp SDK (mcp==2.0.0 renamed FastMCP to MCPServer
-    and dropped the private _tool_manager attribute). The installed version
-    exposes tools via the public, async `MCPServer.list_tools()` coroutine,
-    so that is used here instead. The assertion itself is unchanged.
+    Accessor note: the brief's `server._tool_manager.list_tools()` reaches
+    through a private attribute. `_tool_manager` is still present on the
+    installed mcp SDK (mcp==2.0.0, which renamed FastMCP to MCPServer) -- it
+    was not dropped -- but `MCPServer.list_tools()` is the public, async,
+    supported accessor, so this test uses that instead and does not depend on
+    a private attribute that carries no compatibility guarantee. The
+    assertion itself is unchanged.
     """
     monkeypatch.setenv("HERMES_MCP_KEY", STRONG_KEY)
     server = build_server(REGISTRY)
@@ -158,6 +160,31 @@ async def test_bridge_token_verifier_rejects_a_non_ascii_token_without_raising()
     verifier = _BridgeTokenVerifier(STRONG_KEY)
     result = await verifier.verify_token("\xff\xfe not ascii")
     assert result is None
+
+
+@pytest.mark.parametrize(
+    "surrogate", ["\ud800", "\udc00"], ids=["lone-high-surrogate", "lone-low-surrogate"]
+)
+async def test_bridge_token_verifier_rejects_a_lone_surrogate_without_raising(surrogate):
+    """U+D800 (high) and U+DC00 (low) are lone surrogates.
+    str.encode("utf-8", errors="surrogateescape") is not total over them --
+    surrogateescape only round-trips its own decode-side U+DC80-U+DCFF range,
+    not arbitrary surrogates -- so without the try/except in verify_token this
+    would raise UnicodeEncodeError instead of returning cleanly. Not reachable
+    over HTTP (Starlette decodes header values with .decode("latin-1"), which
+    is total over all 256 byte values and can never produce a surrogate), but
+    verify_token must still be total over any str a caller could construct
+    directly.
+
+    Asserted against the wrong-token result, not a bare None check, so a
+    regression that made the two paths return different-but-still-falsy
+    values would also fail here.
+    """
+    verifier = _BridgeTokenVerifier(STRONG_KEY)
+    wrong = await verifier.verify_token("not-the-configured-key-value-at-all")
+    result = await verifier.verify_token(surrogate)
+    assert result is None
+    assert result == wrong
 
 
 def test_allowed_hosts_from_env_is_empty_when_unset(monkeypatch):

@@ -415,7 +415,14 @@ Larger changes get written down before they get built. Specs live in [`docs/spec
 
 | Spec | Status | What it covers |
 | --- | --- | --- |
-| [Hermes MCP Bridge](docs/specs/hermes-mcp-bridge.md) | Approved, planned, not yet implemented | An HTTP MCP surface for [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateways, so an MCP client can list and control them, converse with an agent, read its history, and answer its run approvals |
+| [Hermes MCP Bridge](docs/specs/hermes-mcp-bridge.md) | Implemented | An HTTP MCP surface for [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateways, so an MCP client can list and control them, converse with an agent, read its history, and answer its run approvals |
+
+The bridge ships as `src/hermes_mcp/`, a sibling concern that never touches
+`src/proxy/`. It is off by default everywhere: the service is not installed by
+this repo, and `qwen` attaches it only when `QWEN_HERMES=1`. Configure it with
+a registry file (`deploy/registry.example.toml`) and a `HERMES_MCP_KEY`; the
+server refuses to start on a missing, short, or placeholder key. Deployment
+identifiers live outside this repo, the way `profiles/*.env` already does.
 
 Approved specs get an implementation plan before any code, in
 [`docs/superpowers/plans/`](docs/superpowers/plans/). A plan is task-by-task and test-first, with
@@ -439,6 +446,14 @@ operator use, and rides the existing opt-in MCP mechanism in the `qwen` wrapper 
 rather than being attached by default. MCP stays off by default in every tier for the reason
 documented above: the global schema set costs roughly 142K tokens, which is most of what bare mode
 exists to remove.
+
+**Environment.** Set at deploy time, never committed:
+
+| Setting | Required | Effect |
+| --- | --- | --- |
+| `HERMES_MCP_KEY` | Yes | Bearer key callers must present. Boot refuses on a missing, short (under 16 characters), or placeholder-looking value |
+| `HERMES_MCP_REGISTRY` | No | Path to the profile registry TOML. Defaults to `~/.config/hermes-mcp/registry.toml` |
+| `HERMES_MCP_ALLOWED_HOSTS` | No | Comma-separated, whitespace-tolerant extra `Host` values for the streamable-HTTP transport's DNS-rebinding allowlist, e.g. `bridge.example.com:443`. Unset or empty leaves today's behavior unchanged — the SDK's own loopback-only default applies (`127.0.0.1:*`, `localhost:*`, `[::1]:*`). Set it and those loopback defaults stay, with the configured hosts added on top; DNS-rebinding protection stays on, the allowlist only widens. Needed when the bridge runs behind a tunnel that forwards a public hostname in the `Host` header — without it such a request is rejected with **421 before auth even runs** |
 
 ---
 
