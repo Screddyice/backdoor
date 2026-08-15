@@ -122,6 +122,41 @@ class Settings(BaseSettings):
     claude_workspace: str = "./workspace"
     max_cli_sessions: int = 5
 
+    # CONNECT forward proxy — lets Remote Control and the router coexist.
+    #
+    # Claude Code refuses Remote Control unless ANTHROPIC_BASE_URL is unset or
+    # points at api.anthropic.com (exact host allowlist; the
+    # _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL escape hatch is explicitly
+    # excluded from RC). Naming this router as the base URL therefore bought
+    # `/model qwen` and failover at the cost of Remote Control.
+    #
+    # It only ever needed to be IN the path, not NAMED as the endpoint. Claude
+    # Code honours HTTPS_PROXY, so pointing that here and leaving the base URL
+    # unset satisfies both: the RC gate sees a clean environment, and every
+    # request still crosses this process. See src/proxy/forward.py.
+    #
+    # Off by default: it mints a local CA on first run, which should be an
+    # opt-in for anyone running backdoor for its original purpose.
+    forward_proxy: bool = False
+    forward_host: str = "127.0.0.1"
+    forward_port: int = 8084
+
+    # Hosts to TLS-terminate and hand to the router. Everything absent from
+    # this list is tunnelled opaquely — including the Remote Control bridge on
+    # claude.ai, which must not be intercepted.
+    forward_mitm_hosts: str = "api.anthropic.com"
+
+    # Where the intercepted plaintext is delivered. Deliberately NOT `port`
+    # above: the hybrid instance is launched by launchd as
+    # `uvicorn --port 8083`, a CLI flag pydantic never sees, so `port` still
+    # reads 8082 in that process and reusing it would splice into the wrong
+    # server (or nothing at all).
+    forward_router_host: str = "127.0.0.1"
+    forward_router_port: int = 8083
+
+    # Shares ~/.backdoor with the failover breaker's published state.
+    forward_ca_dir: str = "~/.backdoor/ca"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
