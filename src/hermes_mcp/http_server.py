@@ -20,9 +20,12 @@ what this module needs from the old FastMCP name.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 
 from .registry import Profile, load_registry
@@ -58,9 +61,35 @@ def require_bridge_key() -> str:
     return value
 
 
+class _BridgeTokenVerifier(TokenVerifier):
+    """Checks a caller's bearer token against the bridge key.
+
+    The key is read once, at construction, from the value require_bridge_key()
+    already validated — never re-read from the environment per request.
+    Comparison uses hmac.compare_digest, not ==, so a wrong guess cannot be
+    timed apart from a right one character by character.
+    """
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if hmac.compare_digest(token, self._key):
+            return AccessToken(token=token, client_id="hermes-mcp-caller", scopes=[])
+        return None
+
+
 def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
-    """Build the MCPServer app. Applies the boot guard before registering anything."""
-    require_bridge_key()
+    """Build the MCPServer app. Applies the boot guard before registering anything,
+    then wires per-request bearer auth (via token_verifier) so every request after
+    boot is checked too, not just the process's own startup.
+
+    auth_server_provider and resource_server_url are both left unset, so the SDK
+    mounts no OAuth discovery/authorization routes; issuer_url is a required
+    AuthSettings field but is never read in that configuration, so it holds an
+    inert placeholder rather than a real issuer.
+    """
+    key = require_bridge_key()
     if registry is None:
         registry = load_registry()
     logger.info(
@@ -68,7 +97,11 @@ def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
         len(registry),
         ", ".join(f"{n}:{p.tier}" for n, p in sorted(registry.items())),
     )
-    mcp = MCPServer("hermes-mcp")
+    mcp = MCPServer(
+        "hermes-mcp",
+        token_verifier=_BridgeTokenVerifier(key),
+        auth=AuthSettings(issuer_url="http://localhost", resource_server_url=None),
+    )
     register_tools(mcp, registry)
     return mcp
 
