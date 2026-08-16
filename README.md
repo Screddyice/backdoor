@@ -521,6 +521,35 @@ The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces fo
 
 **Test the `/v1` path, which is what the profile uses.** Passing `reasoning_effort` as a top-level `/api/chat` argument did not suppress thinking here, so checking only that endpoint reports a failure that isn't real. On `/v1/chat/completions` the `reasoning` field came back empty and `tool_calls` was populated, which is the pass condition.
 
+### Durable memory on local models
+
+Local sessions read Mem0 recall from the offline mirror at `~/.mem0-local/cache.db` and get it prepended to the system prompt as plain text. No MCP server, no tool call, no network.
+
+This exists because of a gap that was invisible from either side. Memory normally arrives through the `UserPromptSubmit` hook, which is why `bare.py` puts Mem0's MCP tools on the dropped side of the keep-list — the hook already injected the text before the request was built. But the `qwen` wrapper's lean and fast modes pass `--bare`, and `--bare` disables CLAUDE.md discovery and **every hook**. So the default local tier, the 27B, was the only brain in the stack with no durable memory, while `/model qwen`, failover, and `qwen full` all had it.
+
+| Path | Before | Now |
+|---|---|---|
+| `/model qwen` (router) | hook injects | unchanged |
+| Cloud→local failover | hook injects | unchanged |
+| `qwen full` | hook injects | unchanged |
+| `qwen`, `qwen lean` | **nothing** | proxy injects |
+| `qwen fast` | **nothing** | proxy injects |
+
+The proxy is the one place every local request passes through whichever door it came in by, so one code path covers all of them.
+
+Reading the local mirror rather than the Mem0 API is deliberate: the cloud endpoint is unreachable during exactly the outage failover exists to cover, since the breaker opens on one condition — this host being offline.
+
+```
+PROVIDER_BASE_URL=http://localhost:11434/v1   # injection only fires for local providers
+MEMORY_INJECT=false                           # turn it off
+MEMORY_TOP_K=6
+MEMORY_CHAR_BUDGET=1200
+```
+
+Cloud providers are excluded so a session whose hook already ran does not pay for the same text twice. Recall is read-only (`mode=ro`), fails open on a missing or locked cache, and times out in 1.5s so the Mem0 sync job's write lock cannot stall a turn. The budget is small on purpose: bare mode exists to hold the prompt near 945 tokens, and unbounded recall would rebuild the problem it solved.
+
+Memories are labelled as background that may be stale rather than as instructions, because they are. The mirror still describes the heavy tier as `qwen3.5:27b-bare` at 15 GB, two facts that are both now wrong, and a local model asked about the tier will say so rather than assert the stale version.
+
 ### Building a bare tag
 
 Build from the **registry** tag, never from a local one. `modelfiles/build.sh` appends a ~43K-token system prompt to every `*.Modelfile` it builds and defaults to building all of them, so every local `qwen3.5:*` tag carries 186,647 bytes of baked prompt. `FROM` inherits it, which makes a "bare" model that is nothing of the sort. The failure is not subtle but it is easy to miss: the first attempt here answered from the baked prompt's tool vocabulary and invented a `weather_fetch` tool the request never defined.

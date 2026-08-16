@@ -257,6 +257,80 @@ def _hoist_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
     return ([{"role": "system", "content": "\n\n".join(lead)}] if lead else []) + rest
 
 
+def _is_local_provider(settings) -> bool:
+    """Is this request headed for a model running on this machine?
+
+    Cloud sessions already receive Mem0 through the `UserPromptSubmit` hook, so
+    injecting for them would duplicate the same text and spend context twice.
+    Local sessions launched with `--bare` get no hooks at all, which is the gap
+    this fills.
+    """
+    url = (getattr(settings, "provider_base_url", "") or "").lower()
+    return "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """Text of the most recent user turn — the query recall is run against."""
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(
+                b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"
+            )
+    return ""
+
+
+def _inject_memory(messages: list[dict[str, Any]], settings) -> list[dict[str, Any]]:
+    """Prepend durable-memory recall to the system block for local models.
+
+    Local sessions started by the `qwen` wrapper run with `--bare`, which
+    disables every hook — including the one that normally injects Mem0. Without
+    this, the default local tier is the only one in the stack with no durable
+    memory. Recall is read from the offline SQLite mirror so it survives the
+    outage that failover exists to cover.
+
+    Fail-open: a recall problem returns the messages untouched.
+    """
+    if not getattr(settings, "memory_inject", False) or not _is_local_provider(settings):
+        return messages
+
+    try:
+        from . import memory as _memory
+
+        head = messages[0] if messages else None
+        if head is not None and head.get("role") == "system" and _memory.already_injected(str(head.get("content") or "")):
+            return messages
+
+        query = _last_user_text(messages)
+        if not query:
+            return messages
+
+        found = _memory.recall(
+            query,
+            k=getattr(settings, "memory_top_k", 6),
+            char_budget=getattr(settings, "memory_char_budget", 1200),
+        )
+        block = _memory.build_block(found)
+        if not block:
+            return messages
+
+        logger.info("injected %d durable memories (%d chars)", len(found), len(block))
+
+        out = list(messages)
+        if out and out[0].get("role") == "system":
+            out[0] = {**out[0], "content": f"{block}\n\n{out[0].get('content') or ''}".rstrip()}
+        else:
+            out.insert(0, {"role": "system", "content": block})
+        return out
+    except Exception as exc:  # noqa: BLE001 — never cost the user a turn
+        logger.warning("memory injection skipped: %s", exc)
+        return messages
+
+
 def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
     """Build the full NIM chat/completions payload from an Anthropic request."""
     oai_messages: list[dict[str, Any]] = []
@@ -267,6 +341,7 @@ def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
 
     oai_messages.extend(messages_to_openai(req.messages))
     oai_messages = _hoist_system_messages(oai_messages)
+    oai_messages = _inject_memory(oai_messages, settings)
 
     payload: dict[str, Any] = {
         "model": settings.provider_model,
