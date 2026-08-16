@@ -157,6 +157,25 @@ The harness verification gate in `.claude-harness/config.json` runs the venv for
 
 ## Troubleshooting
 
+**`500 ... "system message must be at the beginning"`**
+Ollama 0.32 rejects any system message at index > 0, including a payload that already opens with a valid one. Claude Code does send `system` roles inside the messages array, and Ollama 0.23.4 accepted them anywhere, so this appears the moment the daemon is upgraded and hits every tool-using session. The proxy normalises this now (`_hoist_system_messages`); if you see it again, the running service is on older code than you think — check which checkout it is actually serving:
+
+```
+plutil -p ~/Library/LaunchAgents/com.screddy.backdoor-router.plist | grep WorkingDirectory
+```
+
+**The router is serving code you did not just edit**
+The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), in detached HEAD, not from your dev clone. Editing the dev clone changes nothing until you deploy:
+
+```
+cd ~/projects/Screddyice/backdoor-service && git fetch origin && git checkout <sha>
+launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
+```
+
+A dev-clone process started by hand on the same port hides this completely, because it answers first and serves current code. Kill it and the stale service takes over, which reads as a sudden unexplained regression. Confirm which one is live with `pgrep -fl "uvicorn src.proxy.app"` and compare its interpreter path against the LaunchAgent's.
+
+
+
 **`Proxy failed to start`**
 Something is already using port 8082. Either stop the other process or change `PORT=8083` in your `.env`.
 

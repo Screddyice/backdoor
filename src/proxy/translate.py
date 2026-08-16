@@ -1,11 +1,14 @@
 """Translate between Anthropic Messages API format and OpenAI/NIM format."""
 
 import json
+import logging
 import re
 import uuid
 from typing import Any
 
 from .models import MessagesRequest, Message, Tool
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +208,55 @@ def tools_to_openai(tools: list[Tool] | None) -> list[dict[str, Any]] | None:
     ]
 
 
+def _hoist_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Guarantee at most one system message, at index 0.
+
+    Ollama 0.32 rejects any system message at index > 0 with HTTP 500
+    "system message must be at the beginning", and that includes a payload whose
+    FIRST message is a valid system message and which carries a second one later.
+    0.23.4 accepted both shapes, so this only started failing when the daemon was
+    upgraded on 2026-08-16 — every request in a tool-using session 500'd in about
+    150ms, before any inference, which is what a validation rejection looks like
+    against a load failure.
+
+    Anthropic keeps the system prompt in its own top-level field, so a system
+    message arriving inside `messages` is already unusual. Rather than drop that
+    content (it is instruction text, and dropping instructions silently is worse
+    than reordering them) it gets merged into the leading system block in the
+    order it appeared.
+
+    Providers differ on this: some accept system anywhere, some take only the
+    first, some 500. Normalising here means the proxy sends the one shape all of
+    them accept, instead of depending on which daemon is installed.
+    """
+    stray = [i for i, m in enumerate(messages) if m.get("role") == "system" and i > 0]
+    if not stray:
+        return messages
+
+    logger.warning(
+        "hoisting %d system message(s) from position(s) %s to the front — "
+        "Ollama 0.32+ rejects system messages that are not first",
+        len(stray),
+        stray,
+    )
+
+    lead: list[str] = []
+    rest: list[dict[str, Any]] = []
+    for i, m in enumerate(messages):
+        if m.get("role") == "system":
+            content = m.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if content:
+                lead.append(str(content))
+        else:
+            rest.append(m)
+
+    return ([{"role": "system", "content": "\n\n".join(lead)}] if lead else []) + rest
+
+
 def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
     """Build the full NIM chat/completions payload from an Anthropic request."""
     oai_messages: list[dict[str, Any]] = []
@@ -214,6 +266,7 @@ def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
         oai_messages.append({"role": "system", "content": system_text})
 
     oai_messages.extend(messages_to_openai(req.messages))
+    oai_messages = _hoist_system_messages(oai_messages)
 
     payload: dict[str, Any] = {
         "model": settings.provider_model,
