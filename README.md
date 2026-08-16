@@ -447,16 +447,21 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 
 | Tier | Params | On disk | Resident | Tools | Notes |
 |---|---|---|---|---|---|
-| `qwen3.8:27b-bare` | 27B | 17.7 GB | *unmeasured* | *unverified* | Default, 32K window. GGUF + vision projector — see below |
-| `qwen3.5:27b-bare` | 27.8B | 17.4 GB | **23 GB** | yes | Predecessor, removed 2026-08-16. The measured baseline 3.8 replaces |
+| `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Default, 32K window. GGUF + vision projector — see below |
+| `qwen3.5:27b-bare` | 27.8B | 17.4 GB | 23 GB | yes | Predecessor, removed 2026-08-16 |
 | `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
 | `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
 
-⚠️ **The 3.8 row is deliberately not filled in.** Resident size and tool calling were not measured before this was written, and guessing them is the exact move that panicked this host twice. Measure both, then replace the italics:
+**3.8 costs 6 GB less resident than the 3.5 tag it replaces**, which is not the direction anyone predicted: 3.8 carries an *extra* vision projector layer, and the estimate written down before measuring was 24 GB. The guess missed by 7 GB. Measure, do not compute.
+
+Verify a swap with both of these, not just the first:
 
 ```
-ollama run qwen3.8:27b-bare "hi" >/dev/null && ollama ps    # resident + CONTEXT (must be 32768)
+ollama run qwen3.8:27b-bare "hi" >/dev/null && ollama ps   # resident + CONTEXT (must read 32768)
+# then re-run ollama ps after a few thousand tokens of context
 ```
+
+The second check is the one that catches the old MLX failure: that build sat at a lazily-allocated ~15 GB floor and grew toward 32 GB as a session filled its window. A GGUF load allocates KV up front, so a resident number that does not move under load is the proof the window is enforced. 3.8 held at 17 GB after an 8K-token fill.
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
 
@@ -493,7 +498,9 @@ The `projector` layer is new in 3.8: the tag is multimodal, which is why it is 1
 
 Headroom exists because llm-jury reads `~/.backdoor/failover-state.json` and stands down while failover is active, so nothing else holds the GPU. Ollama caps residency by model count and never by bytes, and Metal allocations are wired and cannot be paged out, so over-committing panics this host rather than raising OOM. It did, twice, on 2026-07-31.
 
-The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Verified that this does not break tool calling on qwen3.5, with both settings emitting a correct call. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Re-verified on qwen3.8 under Ollama 0.32.13 (2026-08-16): the model still emits a correct `get_weather` call with reasoning suppressed. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+
+**Test the `/v1` path, which is what the profile uses.** Passing `reasoning_effort` as a top-level `/api/chat` argument did not suppress thinking here, so checking only that endpoint reports a failure that isn't real. On `/v1/chat/completions` the `reasoning` field came back empty and `tool_calls` was populated, which is the pass condition.
 
 ### Building a bare tag
 

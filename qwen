@@ -242,7 +242,9 @@ done
 # with it; 10 minutes still covers an active session while giving the GPU back
 # sooner. This comment said ~15GB until 2026-08-14, which was the int4 build's
 # lazily-allocated floor; the GGUF rebuild (PR #23) made the real number 23GB
-# and the collision correspondingly worse. See the panic note in
+# and the collision correspondingly worse. The qwen3.8 swap on 2026-08-16
+# measured 17GB, so the collision eased, but a ~21GB council still does not fit
+# beside it under the ~27GB wired ceiling. Keep the 10m. See the panic note in
 # modelfiles/bare/qwen3.8-27b-bare.Modelfile.
 KEEP_ALIVE="30m"
 [ "$PROFILE" = "local-failover-qwen27" ] && KEEP_ALIVE="10m"

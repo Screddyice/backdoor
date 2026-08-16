@@ -95,15 +95,40 @@ fetch_big() {
     done
     xargs -P "$CHUNK_JOBS" -n 4 bash -c 'fetch_chunk "$0" "$1" "$2" "$3"' < /tmp/.ollama_chunks.$$
     rm -f /tmp/.ollama_chunks.$$
-    # Reassemble in index order. `cat` on a sorted glob is the ordering, and the
-    # SHA check below is what proves the ordering was right.
-    cat "$cdir"/[0-9]* > "$dest.part" 2>/dev/null
+
+    # Pre-check the total before touching anything. A plain `cat` of short or
+    # missing chunks produces a wrong blob that only the SHA catches, and by
+    # then the disk cost has already been paid. Cheap arithmetic first.
+    have=0
+    for f in "$cdir"/[0-9]*; do
+        [ -f "$f" ] && have=$(( have + $(stat -f%z "$f") ))
+    done
+    if [ "$have" != "$size" ]; then
+        echo "  big blob ${hex:0:12}: have $((have/1000000))MB of $((size/1000000))MB — rerun to resume" >&2
+        return 1
+    fi
+
+    # Concatenate chunk by chunk and DELETE EACH CHUNK AS IT LANDS.
+    #
+    # The obvious `cat "$cdir"/* > "$dest.part"` needs the blob twice on disk at
+    # once: 16.81GB of chunks plus a 16.81GB reassembly. This host was at 14GB
+    # free when it got here, so that plain cat cannot run. Appending and
+    # unlinking keeps the peak at one chunk (64MB) above steady state.
+    #
+    # Safe because the size pre-check above already ran: the only thing the SHA
+    # can still catch is bad bytes, not missing ones, and the chunks are
+    # reproducible from the registry either way.
+    : > "$dest.part"
+    for f in "$cdir"/[0-9]*; do
+        cat "$f" >> "$dest.part" || { echo "  concat failed at $f" >&2; return 1; }
+        rm -f "$f"
+    done
     if [ "$(stat -f%z "$dest.part" 2>/dev/null)" = "$size" ] &&
        [ "$(shasum -a 256 "$dest.part" | cut -d' ' -f1)" = "$hex" ]; then
         mv "$dest.part" "$dest"; rm -rf "$cdir"; return 0
     fi
     rm -f "$dest.part"
-    echo "  big blob ${hex:0:12} incomplete — rerun to resume" >&2
+    echo "  big blob ${hex:0:12} failed verification — rerun to re-fetch" >&2
     return 1
 }
 
@@ -146,6 +171,16 @@ fetch_one() {
                 # Start this blob over rather than resume onto a bad prefix.
                 rm -f "$part"
             fi
+        fi
+        # OVERSIZE MUST BE CHECKED EVERY ATTEMPT, not just before the loop.
+        # If the server ignores the Range header and replays the whole body,
+        # `-C -` appends it to what is already there and the file grows past
+        # $size. The equality test above then never matches, so the next attempt
+        # appends again. Measured on the qwen3.8 projector blob: 931,146,016
+        # bytes expected, 1.74GB on disk after the retries, and the loop was
+        # still going. Truncating here is what stops a resume from running away.
+        if [ -f "$part" ] && [ "$(stat -f%z "$part" 2>/dev/null)" -gt "$size" ]; then
+            rm -f "$part"
         fi
         sleep $((attempt))
     done

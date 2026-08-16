@@ -75,27 +75,31 @@
 #
 #   ollama create qwen3.8:27b-bare -f modelfiles/bare/qwen3.8-27b-bare.Modelfile
 #
-# Sizing: 17.7GB on disk. RESIDENT SIZE IS NOT YET MEASURED ON THIS TAG — the
-# predecessor qwen3.5:27b-bare measured **23GB** resident at num_ctx 32768 /
-# OLLAMA_NUM_PARALLEL=2, and 3.8 should land near it plus the projector, but
-# "should" is exactly the word that preceded both panics on this host. Run this
-# and write the real number here before trusting the tier under memory pressure:
-#   ollama run qwen3.8:27b-bare "hi" >/dev/null && ollama ps
-# `ollama list` reports the on-disk figure and will mislead you by roughly half.
+# Sizing, MEASURED with `ollama ps` on this 36GB M5 Max on 2026-08-16 under
+# Ollama 0.32.13: 17.7GB on disk, **17GB resident** at num_ctx 32768 /
+# OLLAMA_NUM_PARALLEL=2, engine llama.cpp, 100% GPU.
 #
-# Plan against the measured GGUF number, never a computed one. The int4 build the
-# 3.5 tag once used was recorded at ~15GB, which was a real reading of a lazily
-# allocated floor rather than a steady state — see the MLX note above. Paying
-# more at rest to get a window that actually holds is the right trade: bounded
-# beats unbounded.
+# THAT IS 6GB LESS THAN qwen3.5:27b-bare's MEASURED 23GB, which was not the
+# expected direction — 3.8 carries an extra projector layer, so the prediction
+# written here before measuring was 24GB. Measure, do not compute; the guess was
+# wrong by 7GB and it was wrong in the safe direction only by luck.
+#
+# Re-measured after filling ~8K tokens of the window: still 17GB. That check
+# matters more than the cold number, because the int4/MLX build this tier once
+# used sat at a lazily-allocated ~15GB floor and GREW toward 32GB as a session
+# filled its 262144 window. A GGUF load allocates its KV up front, so a resident
+# figure that does not move under load is the evidence that the window is real.
+#
+# `ollama list` reports the on-disk figure and will mislead you by roughly half.
 #
 # Budget against the ~27GB Metal wired ceiling, not against 36GB. Wired pages
 # cannot be evicted, so over-committing them panics this host instead of raising
-# OOM (it did, twice, on 2026-07-31). At 23GB+ this tag alone leaves very little
-# room: it will NOT co-reside with an llm-jury council (~21GB), and Ollama caps
-# residency by model COUNT rather than bytes, so nothing upstream refuses that
-# combination. The `qwen` wrapper shortens keep_alive to 10m on this profile for
-# exactly that reason.
+# OOM (it did, twice, on 2026-07-31). At 17GB this tag leaves ~10GB of that
+# ceiling, which is roomier than 3.5's 23GB left but still NOT enough to
+# co-reside with an llm-jury council (~21GB). Ollama caps residency by model
+# COUNT rather than bytes, so nothing upstream refuses that combination. The
+# `qwen` wrapper shortens keep_alive to 10m on this profile for that reason;
+# the extra 6GB of headroom is not a licence to run both.
 #
 # Why 32K and not the model's native window: KV is charged num_ctx x
 # OLLAMA_NUM_PARALLEL, so the window is the expensive knob. Bare mode keeps the
