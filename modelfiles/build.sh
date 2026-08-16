@@ -15,6 +15,10 @@
 # harness is unaffected.
 #
 # NOT covered here (deliberately):
+#   - Any tag whose name has no suffix after the colon (qwen3.5:9b, qwen3.5:4b).
+#     Those collide with the upstream registry names and get SKIPPED — see the
+#     guard in the loop. Both were being clobbered until 2026-08-16.
+#   - Tags listed in BARE_TAGS, which build without the prompt.
 #   - phi4 (16K native) and qwen3:8b (41K max) — the 43K-token prompt does not
 #     fit their context windows at all.
 #   - The CANONICAL llm-jury council tags (phi4, gemma3:12b, llama3.1:8b) stay
@@ -39,6 +43,16 @@ if grep -q '"""' "$PROMPT_FILE"; then
   exit 1
 fi
 
+# Tags that must NEVER carry the baked prompt, even though they live here.
+#
+# qwen3.5:9b-64k backs `/model qwen-9b` and the fusion-qwen subagent. Those
+# always send their own system message, so the baked prompt bought them nothing
+# and the only consumer it could have served — bare `ollama run` — was
+# unusable on a 9B: 43,092 tokens of prefill, 8+ minutes, then a 500. Measured
+# 2026-08-16, and 12 tokens / 2.4s once stripped. It kept the FROM-inheritance
+# footgun with no upside, so this tag is built plain.
+BARE_TAGS=("qwen3.5:9b-64k")
+
 MODELFILES=("$@")
 [ ${#MODELFILES[@]} -eq 0 ] && MODELFILES=(*.Modelfile)
 
@@ -46,6 +60,35 @@ for mf in "${MODELFILES[@]}"; do
   [ -f "$mf" ] || { echo "ERROR: $mf not found" >&2; exit 1; }
   tag="${mf%.Modelfile}"
   tag="${tag/-/:}"
+
+  # NEVER CLOBBER AN UPSTREAM REGISTRY TAG.
+  #
+  # The tag is the filename with the first "-" turned into ":", so
+  # qwen3.5-9b.Modelfile produced `qwen3.5:9b` — the exact name `ollama pull`
+  # uses for the pristine base. Building it overwrote the registry pull with a
+  # prompt-baked copy, and then every `FROM qwen3.5:9b` in this directory
+  # inherited 43K tokens. That is the same inheritance bug the bare/ Modelfile
+  # documents (the model answered from the baked prompt's tool vocabulary and
+  # invented a `weather_fetch` tool), except the poisoned base made it invisible:
+  # the Modelfile you read has no SYSTEM line anywhere in it.
+  #
+  # Found 2026-08-16 with `ollama show --system qwen3.5:9b` returning 186,647
+  # bytes when it should return 0. Fix was `ollama pull qwen3.5:9b`, which took
+  # 4 seconds because the model blob was already local and only the manifest
+  # changed. A variant tag always has a suffix after the colon; a bare one does
+  # not, and that is the whole test.
+  if [[ "${tag#*:}" != *-* ]]; then
+    echo "⚠ SKIP $mf → $tag — would overwrite the upstream registry tag." >&2
+    echo "  Rename it to a variant (e.g. ${tag}-fable) if you want a persona build." >&2
+    continue
+  fi
+
+  if [[ " ${BARE_TAGS[*]} " == *" $tag "* ]]; then
+    echo "▶ ollama create $tag  ($mf, NO system prompt — see BARE_TAGS)"
+    ollama create "$tag" -f "$mf"
+    continue
+  fi
+
   tmp="$(mktemp)"
   {
     cat "$mf"
