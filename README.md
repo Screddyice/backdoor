@@ -508,6 +508,33 @@ Build from the **registry** tag, never from a local one. `modelfiles/build.sh` a
 
 Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` cannot glob. Check any new tag with `ollama show --system <tag>`, which must return nothing.
 
+#### The base tags were poisoned, which made that check lie
+
+`build.sh` derives its tag from the filename with the first `-` turned into `:`, so `qwen3.5-9b.Modelfile` built **`qwen3.5:9b`** — the exact name `ollama pull` uses for the pristine base. It overwrote the registry pull with a prompt-baked copy, and from then on every `FROM qwen3.5:9b` in this directory inherited 43K tokens.
+
+That is the same inheritance bug described above, but far harder to see: the Modelfile you read has no `SYSTEM` line anywhere in it, and neither does the one it inherits from. Only the tag does.
+
+Found 2026-08-16 with `ollama show --system qwen3.5:9b` returning 186,647 bytes where it should return 0. `qwen3.5:4b` was poisoned the same way. Both are fixed, and the repair is cheap because only the manifest differs:
+
+```
+ollama pull qwen3.5:9b     # 4 seconds — the model blob was already on disk
+```
+
+`build.sh` now refuses any tag with no suffix after the colon, so it cannot happen again. If you want a persona build of a base model, give it a variant name (`qwen3.5:9b-fable`), which is the convention `llama3.1:8b-fable` and `gemma3:12b-fable` already follow.
+
+**`SYSTEM ""` does not undo it.** Rebuilding `FROM` a poisoned base with an empty `SYSTEM` still reports 186,647 bytes. The base itself has to be re-pulled.
+
+#### `qwen3.5:9b-64k` is built bare
+
+Listed in `build.sh`'s `BARE_TAGS`. The baked prompt only applies when a request sends no system message, and both consumers of this tag (`/model qwen-9b`, the `fusion-qwen` subagent) always send one, so it bought them nothing. The one thing it could have served, bare `ollama run`, was unusable on a 9B:
+
+| | prompt tokens | wall clock |
+|---|---|---|
+| With baked prompt | 43,092 | 8+ min, then `500` |
+| Built bare | 12 | 2.4 s |
+
+The 4B tiers keep theirs, since bare usage there completes.
+
 ### When `ollama pull` will not finish
 
 `scripts/fetch-ollama-model.sh <model> <tag> [jobs]` pulls a library model by fetching its blobs directly, verifying each SHA-256, and writing the manifest last so a half-downloaded model can never appear in `ollama list`.
