@@ -72,12 +72,12 @@ done
 # stays on the 4B @ 64K — the tier the 2026-07-09 prefill revert chose for
 # exactly this case. Do not "unify" these two onto the 27B without first giving
 # the 27B a bigger window, and read the KV sizing note in
-# modelfiles/bare/qwen3.5-27b-bare.Modelfile before you do.
+# modelfiles/bare/qwen3.8-27b-bare.Modelfile before you do.
 if [ -z "$PROFILE" ]; then
   if [ "$MODE" = "full" ]; then
     PROFILE="local-qwen35"           # qwen3.5:4b-64k  — harness needs the window
   else
-    PROFILE="local-failover-qwen27"  # qwen3.5:27b-bare — 32K, biggest local brain
+    PROFILE="local-failover-qwen27"  # qwen3.8:27b-bare — 32K, biggest local brain
   fi
 fi
 
@@ -243,7 +243,7 @@ done
 # sooner. This comment said ~15GB until 2026-08-14, which was the int4 build's
 # lazily-allocated floor; the GGUF rebuild (PR #23) made the real number 23GB
 # and the collision correspondingly worse. See the panic note in
-# modelfiles/bare/qwen3.5-27b-bare.Modelfile.
+# modelfiles/bare/qwen3.8-27b-bare.Modelfile.
 KEEP_ALIVE="30m"
 [ "$PROFILE" = "local-failover-qwen27" ] && KEEP_ALIVE="10m"
 curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \

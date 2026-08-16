@@ -10,6 +10,13 @@
 # fix is concurrency rather than bigger reads. Each blob is small enough that one
 # request completes well inside the window that stays alive on this network.
 #
+# THE OPPOSITE SHAPE ALSO SHOWS UP, and it broke this script once. qwen3.8:27b
+# is packaged as FOUR blobs, one of them a single 16.81GB model layer. There the
+# concurrency does nothing (one blob = one worker) and the thing that matters is
+# resume: `ollama pull` stalled it at 0.93GB on 2026-08-16 and never recovered.
+# So this script now resumes with `curl -C -` and detects a dead transfer by
+# throughput rather than by a wall-clock cap — see fetch_one.
+#
 # Safety: every blob is written to .part, SHA-256 verified, and only then moved
 # into the content-addressed store. The manifest is written last, so `ollama
 # list` cannot show a model whose tensors are missing.
@@ -38,28 +45,119 @@ for l in [d['config']] + d['layers']:
 total=$(wc -l < /tmp/.ollama_fetch_list | tr -d ' ')
 echo "manifest has $total blobs; fetching with $JOBS workers"
 
+# A single huge blob gets exactly ONE worker from the xargs pool above, so the
+# whole model moves at one connection's speed. The registry throttles per
+# connection: measured 2026-08-16 on the qwen3.8:27b model layer, one stream ran
+# 435KB/s while four ranged streams aggregated ~1.0MB/s. Roughly 2x, not 4x —
+# there is a ceiling above the per-connection limit — but 2x on a 16.81GB blob
+# is hours.
+#
+# So blobs past the threshold are fetched as parallel byte ranges and
+# concatenated. Each chunk is its own resumable file, so an interrupted run
+# restarts only the chunks that were mid-flight. The SHA-256 check on the
+# reassembled blob is what makes this safe: a misordered or short concat cannot
+# pass it, and a failed check throws the whole blob away rather than installing
+# it.
+BIG_BLOB_BYTES=${BIG_BLOB_BYTES:-1073741824}   # 1GB
+CHUNK_BYTES=${CHUNK_BYTES:-67108864}           # 64MB
+CHUNK_JOBS=${CHUNK_JOBS:-6}
+
+fetch_chunk() {
+    url="$1"; start="$2"; end="$3"; out="$4"; want=$(( end - start + 1 ))
+    if [ -f "$out" ] && [ "$(stat -f%z "$out" 2>/dev/null)" = "$want" ]; then return 0; fi
+    for a in 1 2 3 4 5 6; do
+        rm -f "$out"
+        if curl -sfL -r "${start}-${end}" --connect-timeout 15 \
+                --speed-limit 20480 --speed-time 60 -o "$out" "$url" 2>/dev/null &&
+           [ "$(stat -f%z "$out" 2>/dev/null)" = "$want" ]; then
+            return 0
+        fi
+        sleep $a
+    done
+    return 1
+}
+export -f fetch_chunk
+
+fetch_big() {
+    dig="$1"; size="$2"; hex="${dig#sha256:}"
+    dest="$HOME/.ollama/models/blobs/sha256-$hex"
+    cdir="$dest.chunks"; mkdir -p "$cdir"
+    url="$REG_URL/blobs/$dig"
+    n=$(( (size + CHUNK_BYTES - 1) / CHUNK_BYTES ))
+    echo "  big blob ${hex:0:12} — $((size/1000000))MB in $n chunks, $CHUNK_JOBS at a time" >&2
+    : > /tmp/.ollama_chunks.$$
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        s=$(( i * CHUNK_BYTES )); e=$(( s + CHUNK_BYTES - 1 ))
+        [ "$e" -ge "$size" ] && e=$(( size - 1 ))
+        printf '%s %s %s %s\n' "$url" "$s" "$e" "$cdir/$(printf '%06d' $i)" >> /tmp/.ollama_chunks.$$
+        i=$(( i + 1 ))
+    done
+    xargs -P "$CHUNK_JOBS" -n 4 bash -c 'fetch_chunk "$0" "$1" "$2" "$3"' < /tmp/.ollama_chunks.$$
+    rm -f /tmp/.ollama_chunks.$$
+    # Reassemble in index order. `cat` on a sorted glob is the ordering, and the
+    # SHA check below is what proves the ordering was right.
+    cat "$cdir"/[0-9]* > "$dest.part" 2>/dev/null
+    if [ "$(stat -f%z "$dest.part" 2>/dev/null)" = "$size" ] &&
+       [ "$(shasum -a 256 "$dest.part" | cut -d' ' -f1)" = "$hex" ]; then
+        mv "$dest.part" "$dest"; rm -rf "$cdir"; return 0
+    fi
+    rm -f "$dest.part"
+    echo "  big blob ${hex:0:12} incomplete — rerun to resume" >&2
+    return 1
+}
+
 fetch_one() {
     dig="$1"; size="$2"
     hex="${dig#sha256:}"
     dest="$HOME/.ollama/models/blobs/sha256-$hex"
-    part="$dest.part.$$"
+    # Stable .part name (no $$): a partial must survive the script exiting so a
+    # rerun resumes instead of restarting. Workers never share a digest, so
+    # concurrent runs cannot collide on one .part.
+    part="$dest.part"
     if [ -f "$dest" ] && [ "$(stat -f%z "$dest")" = "$size" ]; then echo "have"; return 0; fi
-    for attempt in 1 2 3 4 5 6; do
+    if [ "$size" -ge "$BIG_BLOB_BYTES" ]; then fetch_big "$dig" "$size"; return $?; fi
+    # A .part longer than the blob is corrupt, and -C - would happily append to
+    # it forever. Truncating here is what keeps a bad resume from looping.
+    if [ -f "$part" ] && [ "$(stat -f%z "$part" 2>/dev/null)" -gt "$size" ]; then
         rm -f "$part"
-        if curl -sfL --connect-timeout 15 --max-time 240 \
+    fi
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        # -C - resumes from whatever is already in .part.
+        #
+        # Stall detection replaces a fixed --max-time. --max-time 240 was right
+        # when every blob was a few MB (qwen3.5:27b-int4's 1,184 tensor layers)
+        # and wrong the moment a model shipped as ONE big blob: qwen3.8:27b is a
+        # single 16.81GB layer, which cannot transfer inside 240s at any speed
+        # this network reaches, so every attempt timed out mid-download and the
+        # old `rm -f "$part"` threw the bytes away before retrying. That is an
+        # infinite loop that looks like a slow network.
+        #
+        # --speed-limit/--speed-time abort only when throughput actually dies
+        # (<50KB/s sustained for 60s), which is the real failure being guarded
+        # against, and is independent of blob size.
+        if curl -sfL -C - --connect-timeout 15 \
+                --speed-limit 51200 --speed-time 60 \
                 -o "$part" "$REG_URL/blobs/$dig" 2>/dev/null; then
             if [ "$(stat -f%z "$part" 2>/dev/null)" = "$size" ]; then
                 actual=$(shasum -a 256 "$part" | cut -d' ' -f1)
                 if [ "$actual" = "$hex" ]; then mv "$part" "$dest"; echo "got"; return 0; fi
+                # Right length, wrong hash: the resume glued together garbage.
+                # Start this blob over rather than resume onto a bad prefix.
+                rm -f "$part"
             fi
         fi
         sleep $((attempt))
     done
-    rm -f "$part"
     echo "FAIL $hex" >&2
     return 1
 }
 export -f fetch_one
+# fetch_one runs in an xargs `bash -c` subshell, so everything it reaches for
+# must cross that boundary explicitly — including fetch_big, which it calls, and
+# fetch_big's own tuning vars. Exporting fetch_chunk alone is not enough.
+export -f fetch_big
+export BIG_BLOB_BYTES CHUNK_BYTES CHUNK_JOBS
 export REG_URL="$REG"
 
 # xargs runs the workers; the counter below just reports progress cheaply.
