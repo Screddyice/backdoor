@@ -354,7 +354,7 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
-| `qwen` | `local-failover-qwen27` | `qwen3.5:27b-bare` | 32K | yes |
+| `qwen` | `local-failover-qwen27` | `qwen3.8:27b-bare` | 32K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
 | `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
 
@@ -387,7 +387,7 @@ The paragraph above describes the check on the **hybrid** path, and on its own i
 So the tier check runs **after every routing branch has chosen**, where no path can skip it:
 
 ```
-⇢ TIER ESCALATE [qwen3.5:27b-bare → qwen3.5:4b-256k] in≈143490 over 28000
+⇢ TIER ESCALATE [qwen3.8:27b-bare → qwen3.5:4b-256k] in≈143490 over 28000
 ```
 
 Three properties make that placement safe:
@@ -417,7 +417,7 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-failover-qwen27` | `qwen3.5:27b-bare` | `--bare` client-side holds the prompt near 945 tokens, so 32K is roomy |
+| `qwen`, `qwen lean` | `local-failover-qwen27` | `qwen3.8:27b-bare` | `--bare` client-side holds the prompt near 945 tokens, so 32K is roomy |
 | `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
 | `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the 27B costs more GPU than the task is worth |
 
@@ -447,9 +447,21 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 
 | Tier | Params | On disk | Resident | Tools | Notes |
 |---|---|---|---|---|---|
-| `qwen3.5:27b-bare` | 27.8B | 17.4 GB | **23 GB** | yes | Default, 32K window. GGUF — see below |
+| `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Default, 32K window. GGUF + vision projector — see below |
+| `qwen3.5:27b-bare` | 27.8B | 17.4 GB | 23 GB | yes | Predecessor, removed 2026-08-16 |
 | `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
 | `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
+
+**3.8 costs 6 GB less resident than the 3.5 tag it replaces**, which is not the direction anyone predicted: 3.8 carries an *extra* vision projector layer, and the estimate written down before measuring was 24 GB. The guess missed by 7 GB. Measure, do not compute.
+
+Verify a swap with both of these, not just the first:
+
+```
+ollama run qwen3.8:27b-bare "hi" >/dev/null && ollama ps   # resident + CONTEXT (must read 32768)
+# then re-run ollama ps after a few thousand tokens of context
+```
+
+The second check is the one that catches the old MLX failure: that build sat at a lazily-allocated ~15 GB floor and grew toward 32 GB as a session filled its window. A GGUF load allocates KV up front, so a resident number that does not move under load is the proof the window is enforced. 3.8 held at 17 GB after an 8K-token fill.
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
 
@@ -457,7 +469,7 @@ Measure, do not compute. The first estimate for the 14B was 16GB and the real nu
 
 This tier used to be built `FROM qwen3.5:27b-int4` and was recorded here at **15 GB**. That number was real but it was a *floor*, not a steady state, and the difference took this host down.
 
-Ollama 0.23.4 serves int4 tags on its MLX engine, and **that engine applies `num_ctx` from neither the Modelfile nor `OLLAMA_CONTEXT_LENGTH`** — it loads the model's native window and spawns its runner with no `--ctx-size` at all. So the tier ran at 262144 instead of the 32768 it was configured for, in two places, and nothing reported an error. Measured 2026-08-12 on one server with one env:
+Ollama serves int4/mlx tags on its MLX engine, and **that engine applies `num_ctx` from neither the Modelfile nor `OLLAMA_CONTEXT_LENGTH`** — it loads the model's native window and spawns its runner with no `--ctx-size` at all. So the tier ran at 262144 instead of the 32768 it was configured for, in two places, and nothing reported an error. Measured 2026-08-12 on 0.23.4, one server with one env:
 
 | Tag | Engine | Native | `num_ctx` on tag | `OLLAMA_CONTEXT_LENGTH` | Loaded at |
 |---|---|---|---|---|---|
@@ -467,19 +479,28 @@ Ollama 0.23.4 serves int4 tags on its MLX engine, and **that engine applies `num
 
 `phi4-mini` carries no `num_ctx` of its own, so its clamp can only have come from the env — which is what proves the env reaches the GGUF path and is ignored on the MLX one.
 
+**Re-run the `phi4-mini` row after every Ollama upgrade.** It is the cheapest possible proof that the clamp this whole section depends on still works, and an upgrade is exactly when it could silently stop. Done on 2026-08-16 going 0.23.4 → 0.32.13: `phi4-mini` still loaded at **32768** against its 131072 native window, so 0.32.13 still honours `OLLAMA_CONTEXT_LENGTH` on the llama.cpp path.
+
 MLX also allocates KV *lazily*, so the tier loaded at the advertised 15 GB and grew toward **32 GB** as a session filled its 262K window. On a 36GB host that is the whole budget. The symptom is macOS's "Your system has run out of application memory", and it is deliberately hard to attribute: a 100%-GPU Ollama daemon shows up in neither the Force Quit list nor a RAM-percentage readout, so both indicators look calm while the machine dies.
 
 The GGUF build costs **8 GB more at rest** (23 GB vs the old 15 GB floor) and that is the correct trade: 23 GB bounded beats 15 GB unbounded. The window is now enforced, so the number stops moving. Tell the formats apart from the manifest — GGUF is a single `model` layer, MLX is many small `tensor` layers:
 
 ```
-curl -s https://registry.ollama.ai/v2/library/qwen3.5/manifests/27b | jq '.layers[].mediaType'
+curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+  https://registry.ollama.ai/v2/library/qwen3.8/manifests/27b | jq -r '.layers[].mediaType'
 ```
+
+Check this **before** pulling; it costs one request and it is the only thing standing between you and a 262144-window load. `qwen3.8:27b` returns `license`, `model`, `params`, `projector` — one `model` layer, so GGUF. The sibling `qwen3.8:27b-mlx` is the trap.
+
+The `projector` layer is new in 3.8: the tag is multimodal, which is why it is 17.7 GB against 3.5's 17.4 GB. Bare mode never sends it an image, so on this tier the projector is dead weight to budget for rather than a feature to plan around.
 
 **Verify the window with `ollama ps`, never with `ollama show --parameters`.** `--parameters` reads the tag's stored value and answers "was `num_ctx` written", which stayed a reassuring 32768 for the entire time the model was actually running at 262144. Only `ps` reports what the running instance loaded. An earlier revision of this file had that backwards, which is why the regression went unnoticed.
 
 Headroom exists because llm-jury reads `~/.backdoor/failover-state.json` and stands down while failover is active, so nothing else holds the GPU. Ollama caps residency by model count and never by bytes, and Metal allocations are wired and cannot be paged out, so over-committing panics this host rather than raising OOM. It did, twice, on 2026-07-31.
 
-The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Verified that this does not break tool calling on qwen3.5, with both settings emitting a correct call. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Re-verified on qwen3.8 under Ollama 0.32.13 (2026-08-16): the model still emits a correct `get_weather` call with reasoning suppressed. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+
+**Test the `/v1` path, which is what the profile uses.** Passing `reasoning_effort` as a top-level `/api/chat` argument did not suppress thinking here, so checking only that endpoint reports a failure that isn't real. On `/v1/chat/completions` the `reasoning` field came back empty and `tool_calls` was populated, which is the pass condition.
 
 ### Building a bare tag
 
@@ -494,6 +515,23 @@ Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` 
 Reach for it when a pull stalls. `qwen3.5:27b-int4` is packaged as **1,193 layers**, 1,184 of them per-tensor, and `ollama pull` never finished it here: it transferred ~9MB, discarded the chunk, and restarted, twice over 15 minutes each. Neither disk (152GB free) nor bandwidth was the cause, since a ranged `curl` against the same blob sustained 20MB/s throughout. The problem is many small sequential transfers on a connection that drops, with `OLLAMA_MAX_TRANSFER_STREAMS=1` forbidding any overlap, so one stall halts everything.
 
 Concurrency is the fix, because the cost is per-request latency rather than bandwidth. The script finished the same 16.1GB in about two minutes with 12 workers. It resumes: already-present blobs are skipped, so rerun it after an interruption.
+
+#### The opposite packaging breaks it too
+
+`qwen3.8:27b` is **four** blobs, one of them a single **16.81 GB** model layer. Per-blob concurrency does nothing there — one blob is one worker — and two assumptions in the original script were wrong for that shape:
+
+- `--max-time 240` cannot transfer 16.81 GB at any speed this network reaches, so every attempt timed out mid-download and the old `rm -f "$part"` threw the bytes away before retrying. An infinite loop that looks like a slow network.
+- No `-C -`, so nothing resumed.
+
+Both are fixed. Large blobs now download as parallel byte ranges (`fetch_big`), each chunk separately resumable, with the reassembled blob SHA-256 checked before install — a misordered or short concat cannot pass. Transfers are now aborted on **throughput** (`--speed-limit`/`--speed-time`) rather than a wall-clock cap, which is size-independent.
+
+Measured against the registry on 2026-08-16: one connection 435 KB/s, four ranged connections ~1.0 MB/s aggregate. The per-connection throttle is real, so ranges help — but there is a ceiling above it, and on a bad night the registry alone can put a 17 GB model into the multi-hour range no matter how you fetch it.
+
+#### Two failure modes that look like something else
+
+**A pull that transfers zero bytes and exits 0 is a too-old client.** `ollama pull qwen3.8:27b` on 0.23.4 prints only `Please download the latest version at: https://ollama.com/download`. It does not say "unsupported", it does not fail, and `echo $?` is 0. `qwen3.6:27b` pulls fine on the same daemon, so the version floor is per-model — 3.8 needs Ollama ≥ 0.32.
+
+**A partial of exactly the right size can still be corrupt.** Ollama's abandoned `-partial` file for the projector blob was byte-for-byte the manifest's size, 931,146,016, and its SHA-256 did not match. Size is not verification; promoting that blob on size alone would have installed a broken model. Always check the digest before salvaging a partial.
 
 **The breaker opens on exactly one condition: this machine is offline.** That is deliberately narrow, because failing over is not free — it loads a local model into Ollama, and on a machine that also runs a local council (see [llm-jury](https://github.com/Screddyice/llm-jury)) two GPU consumers at once will fight for memory.
 

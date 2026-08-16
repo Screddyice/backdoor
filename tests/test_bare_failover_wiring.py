@@ -238,7 +238,7 @@ async def test_profile_mode_oversized_session_escalates(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:27b-bare",
+        provider_model="qwen3.8:27b-bare",
         route_max_input_tokens=28_000,
     )
     try:
@@ -264,7 +264,7 @@ async def test_profile_mode_normal_session_stays_put(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:27b-bare",
+        provider_model="qwen3.8:27b-bare",
         route_max_input_tokens=28_000,
     )
     try:
