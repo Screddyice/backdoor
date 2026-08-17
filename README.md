@@ -170,12 +170,40 @@ to detect*. Some networks, including one this repo was developed on, run a trans
 that completes a connection to any address in ~0.2s. TEST-NET included. So the test failed on
 precisely the networks the code most needs to be right about.
 
-Worth knowing operationally: that middlebox also defeats `internet_reachable` itself. The probe
-opens a TCP connection to `1.1.1.1:443` and `8.8.8.8:443` and treats a completed handshake as
-"online". Behind a middlebox that accepts everything, it reports online even when the internet is
-gone, the breaker never opens, and **failover silently does not happen**. Distinguishing the two
-needs something above TCP — a TLS handshake that must validate, or a response whose contents can
-be checked. If you are on such a network and failover never fires, this is why.
+That same middlebox used to defeat `internet_reachable` itself, which was the more serious half of
+the problem. See below.
+
+### The probe verifies who answered
+
+`internet_reachable` opens a TCP connection to `1.1.1.1:443` and `8.8.8.8:443`, **completes a TLS
+handshake, and verifies the certificate chain and hostname**. Only that counts as online.
+
+Until 2026-08-17 a completed TCP connection was enough, and that was a silent hole. A transparent
+middlebox accepts a connection to any address, so the probe reported "online" with the internet
+gone, the breaker never opened, and **failover silently did not happen** — the one situation the
+mechanism exists for. A box that answers TCP has nothing the trust store accepts for
+`one.one.one.one` or `dns.google`, so it cannot fake the verified handshake.
+
+Both middlebox flavours are handled, and they fail differently: one speaks TLS with an untrusted
+certificate, the other accepts the socket and says nothing until the timeout. Either way the probe
+logs a warning naming the address, because "no network" and "something is answering for the entire
+internet" need different responses from you, and moves on to the next probe rather than giving up —
+interception is per-route, so a hijacked path to `1.1.1.1` does not make a clean `8.8.8.8` unusable.
+
+Still literal IPs, and the hostname is only ever used as SNI and verified — never resolved — so a
+broken resolver still cannot fold itself into the answer.
+
+One case this cannot catch: a corporate MITM proxy whose CA is installed in this machine's trust
+store. Such a proxy is generally forwarding traffic, so "online" is the right answer anyway.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `BACKDOOR_PROBE_TCP_ONLY` | unset | Set to `1` to fall back to the pre-2026-08-17 TCP-only probe |
+
+The escape hatch exists because a false *offline* is not a harmless failure here — it claims the
+GPU and routes a live session to a local model while the cloud was fine. If verification ever
+misbehaves on a network this was not tested against, it can be switched off without a deploy.
+Leaving it set re-opens the hole.
 
 ## Troubleshooting
 

@@ -7,6 +7,7 @@ the published state file so a test run never writes to ~/.backdoor.
 
 import contextlib
 import json
+import ssl
 import tempfile
 from pathlib import Path
 
@@ -204,11 +205,40 @@ def test_statuses_can_be_restored_via_env(monkeypatch):
 # Verified 2026-08-17 — this host completes a connection to 192.0.2.1:443 in
 # ~0.2s, so the test failed while `internet_reachable` was behaving correctly.
 
-_PROBES = (("1.1.1.1", 443), ("8.8.8.8", 443))
+_PROBES = (("1.1.1.1", 443, "one.one.one.one"), ("8.8.8.8", 443, "dns.google"))
 
 
 def _refuse(address, timeout=None):
     raise OSError(101, "Network is unreachable")
+
+
+class _FakeSocket:
+    """Stands in for a connected socket. Records the handshake timeout it got."""
+
+    def __init__(self, record=None):
+        self.record = record
+
+    def settimeout(self, value):
+        if self.record is not None:
+            self.record.append(value)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _accepting_tls(monkeypatch, record=None):
+    """Every probe connects AND presents a certificate that verifies."""
+    monkeypatch.setattr(
+        "src.proxy.failover.socket.create_connection",
+        lambda address, timeout=None: _FakeSocket(record),
+    )
+    monkeypatch.setattr(
+        "src.proxy.failover._tls_context",
+        lambda: type("Ctx", (), {"wrap_socket": lambda self, sock, server_hostname=None: contextlib.nullcontext()})(),
+    )
 
 
 def test_internet_probe_reports_offline_when_no_probe_connects(monkeypatch):
@@ -222,21 +252,24 @@ def test_internet_probe_reports_offline_when_no_probe_connects(monkeypatch):
     monkeypatch.setattr("src.proxy.failover.socket.create_connection", refuse)
 
     assert internet_reachable(probes=_PROBES) is False
-    assert tried == list(_PROBES), "every probe must be tried before declaring offline"
+    assert tried == [("1.1.1.1", 443), ("8.8.8.8", 443)], (
+        "every probe must be tried before declaring offline"
+    )
 
 
 def test_internet_probe_reports_online_on_the_first_connection(monkeypatch):
-    """One reachable address is enough, and it stops dialling there."""
+    """One verified address is enough, and it stops dialling there."""
     tried = []
+    _accepting_tls(monkeypatch)
 
     def accept(address, timeout=None):
         tried.append(address)
-        return contextlib.nullcontext()
+        return _FakeSocket()
 
     monkeypatch.setattr("src.proxy.failover.socket.create_connection", accept)
 
     assert internet_reachable(probes=_PROBES) is True
-    assert tried == [_PROBES[0]], "a connected probe must short-circuit the rest"
+    assert tried == [("1.1.1.1", 443)], "a verified probe must short-circuit the rest"
 
 
 def test_internet_probe_survives_one_dead_probe(monkeypatch):
@@ -247,10 +280,12 @@ def test_internet_probe_survives_one_dead_probe(monkeypatch):
     on corporate DNS — would load 17 GB and route the session to a local model
     while the cloud was reachable the whole time.
     """
+    _accepting_tls(monkeypatch)
+
     def first_probe_fails(address, timeout=None):
-        if address == _PROBES[0]:
+        if address == ("1.1.1.1", 443):
             return _refuse(address, timeout)
-        return contextlib.nullcontext()
+        return _FakeSocket()
 
     monkeypatch.setattr("src.proxy.failover.socket.create_connection", first_probe_fails)
 
@@ -269,6 +304,114 @@ def test_internet_probe_honours_the_timeout_it_is_given(monkeypatch):
 
     internet_reachable(probes=_PROBES, timeout=0.25)
     assert seen == [0.25, 0.25]
+
+
+def test_one_unverifiable_probe_does_not_end_the_check(monkeypatch):
+    """Interception is per-route, so a failed handshake must not stop the loop.
+
+    The mirror of `survives_one_dead_probe`, for the verification path. A host
+    whose route to 1.1.1.1 is hijacked while 8.8.8.8 is clean is online, and
+    giving up at the first unverifiable peer would report it offline and claim
+    the GPU. Cheap to get wrong: the natural way to write the handler is to
+    return, not continue.
+    """
+    monkeypatch.setattr(
+        "src.proxy.failover.socket.create_connection",
+        lambda address, timeout=None: _FakeSocket(),
+    )
+
+    class Ctx:
+        def wrap_socket(self, sock, server_hostname=None):
+            if server_hostname == "one.one.one.one":
+                raise ssl.SSLCertVerificationError("hostname mismatch")
+            return contextlib.nullcontext()
+
+    monkeypatch.setattr("src.proxy.failover._tls_context", Ctx)
+
+    assert internet_reachable(probes=_PROBES) is True
+
+
+def test_timeout_also_bounds_the_tls_handshake(monkeypatch):
+    """The handshake, not the connect, is what hangs against a silent acceptor."""
+    handshake_timeouts = []
+    _accepting_tls(monkeypatch, record=handshake_timeouts)
+
+    assert internet_reachable(probes=_PROBES, timeout=0.25) is True
+    assert handshake_timeouts == [0.25]
+
+
+# ── The middlebox hole ───────────────────────────────────────────────────────
+#
+# These two use a real loopback listener rather than a mock. That is not a
+# relapse into testing the network: loopback needs no network, behaves the same
+# on every host, and is the only way to exercise the actual failure — a peer
+# that completes a TCP handshake and then cannot prove who it is.
+
+
+def _accept_only_listener():
+    """A transparent middlebox in miniature: accepts TCP, speaks nothing."""
+    import socket as _socket
+    import threading
+
+    srv = _socket.socket()
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+
+    # Hold every accepted socket. Dropping it would let refcounting close the
+    # connection, and the client would fail fast on EOF instead of hanging —
+    # which is not what a middlebox does, and would test the wrong thing.
+    held = []
+
+    def accept_forever():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            held.append(conn)
+
+    threading.Thread(target=accept_forever, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
+def test_a_box_that_answers_every_address_reads_as_offline():
+    """The regression test for the reason this probe was rewritten.
+
+    Captive portals, some corporate and hotel networks, and certain VPN
+    configurations complete a TCP connection to any address, including ones RFC
+    5737 guarantees are unroutable — measured at ~0.2s on the network this repo
+    is developed on. The old probe read that as "online", so with the internet
+    gone the breaker never opened and failover silently did not happen, which is
+    the single situation the whole mechanism exists for.
+
+    Verifying the certificate closes it: the box has nothing the trust store
+    accepts for `one.one.one.one`.
+    """
+    srv, port = _accept_only_listener()
+    try:
+        assert internet_reachable(
+            probes=(("127.0.0.1", port, "one.one.one.one"),), timeout=0.25
+        ) is False
+    finally:
+        srv.close()
+
+
+def test_tcp_only_escape_hatch_restores_the_old_behaviour(monkeypatch):
+    """A false offline claims the GPU, so the strict probe must be switchable off.
+
+    Same listener, same probe, opposite verdict — which also proves the listener
+    genuinely accepts the connection, so the test above fails on verification
+    rather than on connectivity.
+    """
+    monkeypatch.setenv("BACKDOOR_PROBE_TCP_ONLY", "1")
+    srv, port = _accept_only_listener()
+    try:
+        assert internet_reachable(
+            probes=(("127.0.0.1", port, "one.one.one.one"),), timeout=0.25
+        ) is True
+    finally:
+        srv.close()
 
 
 # ── Published state: the handshake llm-jury reads ────────────────────────────
