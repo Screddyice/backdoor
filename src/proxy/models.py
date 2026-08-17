@@ -48,9 +48,22 @@ ContentBlock = TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock
 
 class Message(BaseModel):
     # Claude Code may send "system" (and occasionally "tool") roles inside the
-    # messages array, not just "user"/"assistant". Keep this permissive — the
-    # role is passed straight through to the OpenAI-compatible backend, which
-    # accepts system/tool messages. A strict Literal here 422s real requests.
+    # messages array, not just "user"/"assistant". Keep this permissive — a
+    # strict Literal here 422s real requests.
+    #
+    # This comment used to end "...passed straight through to the OpenAI-
+    # compatible backend, which accepts system/tool messages." That was true of
+    # every backend this proxy had been pointed at, and it stopped being true on
+    # 2026-08-16: Ollama 0.32 rejects ANY system message at index > 0 with a 500
+    # ("system message must be at the beginning"), including a payload that
+    # already opens with a valid one. Ollama 0.23.4 accepted it, so upgrading the
+    # daemon broke every tool-using local session — each request 500'd in ~150ms,
+    # before inference, which is what a validation rejection looks like next to a
+    # load failure.
+    #
+    # The role still passes through here. `_hoist_system_messages` in
+    # translate.py now normalises the payload just before it goes out, so the
+    # proxy stops betting on the backend being lenient about ordering.
     role: str
     content: str | list[dict[str, Any]]
 

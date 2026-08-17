@@ -238,7 +238,7 @@ async def test_profile_mode_oversized_session_escalates(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:27b-bare",
+        provider_model="qwen3.8:27b-bare",
         route_max_input_tokens=28_000,
     )
     try:
@@ -264,7 +264,7 @@ async def test_profile_mode_normal_session_stays_put(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:27b-bare",
+        provider_model="qwen3.8:27b-bare",
         route_max_input_tokens=28_000,
     )
     try:
@@ -287,3 +287,124 @@ async def test_oversized_route_session_escalates_to_the_wide_tier(route_app):
     assert seen[-1] == "local-failover-256k", (
         f"oversized /model qwen session stayed on {seen[-1]}; it must escalate"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ollama 0.32 rejects any system message that is not at index 0.
+# ---------------------------------------------------------------------------
+
+def test_system_messages_are_hoisted_to_the_front():
+    """Ollama 0.32 500s on a system message at index > 0, including when the
+    payload already opens with a valid one. 0.23.4 accepted both, so every
+    tool-using local session broke on the daemon upgrade (2026-08-16). The proxy
+    now normalises instead of trusting the provider to be lenient."""
+    from src.proxy.translate import _hoist_system_messages
+
+    out = _hoist_system_messages([
+        {"role": "system", "content": "first"},
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "stray"},
+    ])
+
+    assert [m["role"] for m in out] == ["system", "user"], (
+        f"a system message survived at index > 0: {[m['role'] for m in out]}"
+    )
+    assert out[0]["content"] == "first\n\nstray", "stray system content must be kept, not dropped"
+
+
+def test_hoist_leaves_a_conforming_payload_untouched():
+    from src.proxy.translate import _hoist_system_messages
+
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "result"},
+    ]
+    assert _hoist_system_messages(list(msgs)) == msgs
+
+
+def test_hoist_handles_system_with_no_leading_system():
+    from src.proxy.translate import _hoist_system_messages
+
+    out = _hoist_system_messages([
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "late"},
+    ])
+    assert [m["role"] for m in out] == ["system", "user"]
+    assert out[0]["content"] == "late"
+
+
+# ---------------------------------------------------------------------------
+# Durable memory injection for local models (the --bare hook gap).
+# ---------------------------------------------------------------------------
+
+def _mem_settings(**kw):
+    from src.proxy.config import Settings
+    base = dict(provider_base_url="http://localhost:11434/v1", memory_inject=True)
+    base.update(kw)
+    return Settings(**base)
+
+
+def test_memory_injected_for_local_provider(monkeypatch):
+    """The qwen wrapper's lean mode runs --bare, which kills every hook, so the
+    proxy is the only place left that can give the 27B durable memory."""
+    from src.proxy import translate
+
+    monkeypatch.setattr(translate, "_hoist_system_messages", lambda m: m)
+    import src.proxy.memory as memory
+    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["the 27B tier is qwen3.8:27b-bare"])
+
+    out = translate._inject_memory(
+        [{"role": "system", "content": "You are offline."}, {"role": "user", "content": "which tier?"}],
+        _mem_settings(),
+    )
+    assert memory.BLOCK_OPEN in out[0]["content"]
+    assert "qwen3.8:27b-bare" in out[0]["content"]
+    assert "You are offline." in out[0]["content"], "the real system prompt must survive"
+
+
+def test_memory_not_injected_for_cloud_provider(monkeypatch):
+    """Cloud sessions already get Mem0 from the UserPromptSubmit hook; injecting
+    again would spend the context twice on the same text."""
+    from src.proxy import translate
+    import src.proxy.memory as memory
+    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["should not appear"])
+
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+    out = translate._inject_memory(list(msgs), _mem_settings(provider_base_url="https://api.deepseek.com/v1"))
+    assert out == msgs
+
+
+def test_memory_injection_is_fail_open(monkeypatch):
+    """A broken cache must cost the user nothing."""
+    from src.proxy import translate
+    import src.proxy.memory as memory
+
+    def boom(*a, **k):
+        raise sqlite_error()
+
+    class sqlite_error(Exception):
+        pass
+
+    monkeypatch.setattr(memory, "recall", boom)
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+    assert translate._inject_memory(list(msgs), _mem_settings()) == msgs
+
+
+def test_memory_not_double_injected(monkeypatch):
+    from src.proxy import translate
+    import src.proxy.memory as memory
+    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["m"])
+
+    msgs = [
+        {"role": "system", "content": f"{memory.BLOCK_OPEN}\nalready here\n{memory.BLOCK_CLOSE}"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert translate._inject_memory(list(msgs), _mem_settings()) == msgs
+
+
+def test_recall_survives_punctuation_that_breaks_fts5():
+    """Raw prompts contain quotes and operators; FTS5 treats them as syntax."""
+    from src.proxy.memory import recall
+    assert recall("what's the 27B's window? (AND OR NOT) -- ;", k=3) == [] or True

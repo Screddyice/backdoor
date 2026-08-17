@@ -157,6 +157,25 @@ The harness verification gate in `.claude-harness/config.json` runs the venv for
 
 ## Troubleshooting
 
+**`500 ... "system message must be at the beginning"`**
+Ollama 0.32 rejects any system message at index > 0, including a payload that already opens with a valid one. Claude Code does send `system` roles inside the messages array, and Ollama 0.23.4 accepted them anywhere, so this appears the moment the daemon is upgraded and hits every tool-using session. The proxy normalises this now (`_hoist_system_messages`); if you see it again, the running service is on older code than you think — check which checkout it is actually serving:
+
+```
+plutil -p ~/Library/LaunchAgents/com.screddy.backdoor-router.plist | grep WorkingDirectory
+```
+
+**The router is serving code you did not just edit**
+The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), in detached HEAD, not from your dev clone. Editing the dev clone changes nothing until you deploy:
+
+```
+cd ~/projects/Screddyice/backdoor-service && git fetch origin && git checkout <sha>
+launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
+```
+
+A dev-clone process started by hand on the same port hides this completely, because it answers first and serves current code. Kill it and the stale service takes over, which reads as a sudden unexplained regression. Confirm which one is live with `pgrep -fl "uvicorn src.proxy.app"` and compare its interpreter path against the LaunchAgent's.
+
+
+
 **`Proxy failed to start`**
 Something is already using port 8082. Either stop the other process or change `PORT=8083` in your `.env`.
 
@@ -203,7 +222,119 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
-> **Point Claude Code at the router, or none of this runs.** Failover lives in the request path, so a session started with `ANTHROPIC_BASE_URL` unset gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the base URL first.
+> **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
+
+### Forward-proxy mode: failover *and* Remote Control
+
+Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
+
+```js
+function eit(){ let e=process.env.ANTHROPIC_BASE_URL; if(!e) return true; return Oxe(e) }
+function Oxe(e){ let t=new URL(e).host; return ["api.anthropic.com"].includes(t) }
+```
+
+The allowlist is exact and there is no escape hatch — the binary states that `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` "does not apply to Remote Control". That forced an either/or: routed sessions had failover but no phone control, direct sessions had phone control but no failover.
+
+The premise was wrong. Backdoor has to be **in the path**, not **named as the endpoint** — and Claude Code honours `HTTPS_PROXY`. Enable `FORWARD_PROXY` and the router also serves an HTTP CONNECT proxy on `:8084`:
+
+```
+claude  (ANTHROPIC_BASE_URL unset  →  Remote Control offered)
+  │  HTTPS_PROXY=http://127.0.0.1:8084
+  ├── CONNECT api.anthropic.com:443 ──► TLS-terminated ──► :8083 router
+  └── CONNECT everything else       ──► opaque tunnel, untouched
+```
+
+Point a session at it:
+
+```bash
+env -u ANTHROPIC_BASE_URL \
+    HTTPS_PROXY=http://127.0.0.1:8084 \
+    NODE_EXTRA_CA_CERTS=~/.backdoor/ca/ca-cert.pem \
+    claude
+```
+
+`/model qwen` and offline failover keep working, and `claude remote-control` starts instead of refusing.
+
+#### Wiring it without touching the environment
+
+Claude Code applies its own `env` block to every session, so the proxy can live in `~/.claude/settings.json` instead of a shell profile:
+
+```json
+{
+  "env": {
+    "HTTPS_PROXY": "http://127.0.0.1:8084",
+    "NODE_EXTRA_CA_CERTS": "/Users/you/.backdoor/ca/ca-cert.pem",
+    "NO_PROXY": "localhost,127.0.0.1,::1,github.com,.github.com,githubusercontent.com,.githubusercontent.com",
+    "no_proxy": "localhost,127.0.0.1,::1,github.com,.github.com,githubusercontent.com,.githubusercontent.com"
+  }
+}
+```
+
+**Exempt GitHub.** Every command a session runs inherits that `env`, so `git` and `gh` tunnel through `:8084` as well. They gain nothing from it, and they pay for the extra hop: a dropped tunnel surfaces as `CONNECT tunnel failed` from `git push`, or `POST https://api.github.com/graphql: Bad Gateway` from `gh pr merge`. A 502 there is ambiguous, because a merge that fails that way may still have landed. The `NO_PROXY` entries above route GitHub straight out. Both cases are listed because curl reads the lowercase name first, and `githubusercontent.com` is a separate apex that covers release assets, LFS objects, and raw fetches.
+
+For `git` specifically, a per-URL override holds even when the environment does not:
+
+```bash
+git config --global http.https://github.com.proxy ""
+```
+
+This is usually what you want, for two reasons. It reaches GUI surfaces — the Claude Desktop app and IDE extensions never source your shell profile, so an exported variable never gets to them. And it stays scoped to Claude Code, unlike a login-wide `launchctl setenv HTTPS_PROXY`, which would put this proxy in front of every other application's HTTPS traffic.
+
+Two behaviours are worth knowing before you rely on it:
+
+- **A settings `env` value beats an empty process variable.** Clearing `HTTPS_PROXY` in the shell does *not* opt a session out; settings.json fills it back in.
+- **`NO_PROXY=*` is the opt-out.** It bypasses the proxy for every host, which is what a "go direct" launcher wants. Useful for a health-gated wrapper: if `:8084` is unreachable, export `NO_PROXY=*` so the session degrades to a plain cloud session instead of failing every request against a dead proxy.
+
+Settings `env` has no health gate of its own, so pair it with a wrapper that checks the port when you care about that degradation path.
+
+**Only allowlisted hosts are inspected.** `FORWARD_MITM_HOSTS` defaults to `api.anthropic.com`; everything else — Composio, npm, your MCP servers, and the Remote Control bridge to claude.ai — is relayed as opaque bytes, so nothing else can have its TLS broken by a proxy it never asked for.
+
+**About the CA.** Reading a CONNECT tunnel means presenting a certificate for a host you do not own, so Backdoor mints one from a CA at `~/.backdoor/ca` (key `0600`). It is **never** installed into the system keychain: the only thing that trusts it is a process you hand `NODE_EXTRA_CA_CERTS` to. Every other program on the machine rejects anything it signs. Delete the directory to revoke it; it regenerates on next use.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `FORWARD_PROXY` | `false` | Enable the CONNECT proxy |
+| `FORWARD_PORT` | `8084` | Port it listens on |
+| `FORWARD_MITM_HOSTS` | `api.anthropic.com` | Hosts to intercept; all others tunnel blind |
+| `FORWARD_ROUTER_PORT` | `8083` | Where intercepted traffic is delivered |
+| `FORWARD_CA_DIR` | `~/.backdoor/ca` | CA and minted leaves |
+
+Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
+
+#### Do not run the service from your dev checkout
+
+Once a launchd job or systemd unit points `WorkingDirectory` at the clone you develop in, the service inherits whatever branch you happen to have checked out. Check out a branch that predates `src/proxy/forward.py` and the next restart silently drops the forward proxy.
+
+It fails quietly by design. `app.py` imports `forward` and `ca` inside the lifespan, wrapped in `try/except`, so the router keeps serving `:8083` rather than taking down inference for every session on the machine:
+
+```
+Forward proxy failed to start; continuing without it
+```
+
+The router looks healthy. `:8084` never listens. Any session pointed at it by `settings.json` now fails every request against a dead port, and a GUI surface has no shell wrapper to fall back on.
+
+Give the service its own checkout. A detached worktree pinned to `main` keeps your dev tree free to sit on any branch:
+
+```bash
+git worktree add --detach ../backdoor-service main
+cd ../backdoor-service
+uv sync --frozen
+ln -s ../backdoor/.env .env                                 # gitignored, loaded relative to cwd
+ln -s ../../backdoor/profiles/modal-qwen.env profiles/      # gitignored profile, if you use it
+```
+
+Detached rather than a checked-out branch, so `git checkout main` still works in the dev tree. Symlink the config instead of copying it, so the two never drift apart. Then point the service at `backdoor-service` and deploy on purpose:
+
+```bash
+git -C ../backdoor-service fetch origin main
+git -C ../backdoor-service checkout --detach origin/main
+(cd ../backdoor-service && uv sync --frozen)
+launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
+```
+
+The tradeoff is that editing code in your clone no longer deploys. That is the point: a restart can no longer pick up half-finished work, and the router's logs move to the service checkout with it.
+
+One launchd wrinkle if you script that swap: `launchctl bootout` returns before teardown finishes, so an immediate `bootstrap` fails with `Bootstrap failed: 5: Input/output error`. Poll `launchctl print gui/$(id -u)/<label>` until it errors, then bootstrap.
 
 ### Bare mode: what the local model actually receives
 
@@ -242,7 +373,7 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
-| `qwen` | `local-failover-qwen27` | `qwen3.5:27b-bare` | 32K | yes |
+| `qwen` | `local-failover-qwen27` | `qwen3.8:27b-bare` | 32K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
 | `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
 
@@ -275,7 +406,7 @@ The paragraph above describes the check on the **hybrid** path, and on its own i
 So the tier check runs **after every routing branch has chosen**, where no path can skip it:
 
 ```
-⇢ TIER ESCALATE [qwen3.5:27b-bare → qwen3.5:4b-256k] in≈143490 over 28000
+⇢ TIER ESCALATE [qwen3.8:27b-bare → qwen3.5:4b-256k] in≈143490 over 28000
 ```
 
 Three properties make that placement safe:
@@ -286,17 +417,46 @@ Three properties make that placement safe:
 
 The general lesson: `router_mode` is a real fork in this file, and a guard is only as good as the branch it sits in. Verify a fix against the mode the failure actually used, not the one you were reading when you wrote it.
 
-Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at roughly 15GB and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at **23GB** and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+
+### Keeping the 27B warm without starving the council
+
+The wrapper warms its tier at launch so the first turn skips the cold load, then holds it with `keep_alive`. That hold is shorter on the 27B, and the reason is the 44GB in the paragraph above:
+
+| Profile | `keep_alive` |
+|---|---|
+| `local-failover-qwen27` | **10m** |
+| every other profile | 30m |
+
+Thirty idle minutes of a resident 27B is thirty minutes in which `llmjury solve` can collide with it, and neither side will refuse: Ollama counts models, not bytes. Ten minutes still spans an active session and returns the GPU sooner. Failover has a stronger interlock and does not need this — llm-jury reads `~/.backdoor/failover-state.json` and stands down while the breaker is open — but a deliberate `qwen` session writes no such file, so the shorter hold is the only thing bounding the overlap.
+
+The warm-up call **must** carry a system message. A systemless request falls through to the baked ~46K-token Fable-5 SYSTEM prompt on the `*-64k/128k/256k` tags and cold-prefills all of it, which takes about a minute and looks exactly like an offline hang.
 
 The `qwen` wrapper reaches Ollama by a third path and never reads this table. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile and nothing strips server-side. Its modes pick their own tier:
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-failover-qwen27` | `qwen3.5:27b-bare` | `--bare` client-side holds the prompt near 945 tokens, so 32K is roomy |
+| `qwen`, `qwen lean` | `local-failover-qwen27` | `qwen3.8:27b-bare` | `--bare` client-side holds the prompt near 945 tokens, so 32K is roomy |
 | `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
 | `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the 27B costs more GPU than the task is worth |
 
 The wrapper prints the tier it resolved at launch. Read that line if you are unsure which model you got.
+
+#### What `--bare` takes away, and what lean mode puts back
+
+Client-side `--bare` is what keeps the lean prompt near 945 tokens, but it is blunter than the name suggests. Per `claude --help` it skips *"hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and CLAUDE.md auto-discovery"*. Two of those matter more than the token saving:
+
+- **Hooks do not run.** Not reduced — off. A `SessionStart` probe fired without `--bare` and stayed silent with it, and `--settings` does not put it back.
+- **CLAUDE.md is not loaded.** The session gets none of the repo or machine conventions it would normally start with.
+
+Together those quietly removed pull requests from local-model sessions. The convention that every branch gets a PR lives in CLAUDE.md, so the model never saw it; the hook that opens the PR anyway is a hook, so it never ran. Branches accumulated commits, no PR appeared, and nothing reported a failure — the two mechanisms that would each have caught the other were disabled by the same flag.
+
+Lean mode now restores both, narrowly:
+
+- `--append-system-prompt` injects `prompts/qwen-pr-rules.md` (~600 tokens): branch naming, open the draft PR on the first commit, update the README, check `gh repo set-default` when the repo has an `upstream` remote, and leave RS21 alone. Loading real CLAUDE.md files with `--add-dir` would also work, but at ~33KB it would spend a quarter of the 27B's window on context that is mostly irrelevant to a coding turn.
+- The wrapper runs `auto-pr-push.sh` after the session exits, which is why it no longer `exec`s. That is the same script the Stop hook would have run; it no-ops unless the branch is off trunk, has commits ahead, has no open PR, and belongs to an allowlisted owner, and it refuses any repo with `rs21` in the name.
+
+If you write your own wrapper around `--bare`, assume nothing in `.claude/` applies to that session.
 
 ### Sizing the failover tier
 
@@ -306,9 +466,21 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 
 | Tier | Params | On disk | Resident | Tools | Notes |
 |---|---|---|---|---|---|
-| `qwen3.5:27b-bare` | 27.8B | 17.4 GB | **23 GB** | yes | Default, 32K window. GGUF — see below |
+| `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Default, 32K window. GGUF + vision projector — see below |
+| `qwen3.5:27b-bare` | 27.8B | 17.4 GB | 23 GB | yes | Predecessor, removed 2026-08-16 |
 | `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
 | `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
+
+**3.8 costs 6 GB less resident than the 3.5 tag it replaces**, which is not the direction anyone predicted: 3.8 carries an *extra* vision projector layer, and the estimate written down before measuring was 24 GB. The guess missed by 7 GB. Measure, do not compute.
+
+Verify a swap with both of these, not just the first:
+
+```
+ollama run qwen3.8:27b-bare "hi" >/dev/null && ollama ps   # resident + CONTEXT (must read 32768)
+# then re-run ollama ps after a few thousand tokens of context
+```
+
+The second check is the one that catches the old MLX failure: that build sat at a lazily-allocated ~15 GB floor and grew toward 32 GB as a session filled its window. A GGUF load allocates KV up front, so a resident number that does not move under load is the proof the window is enforced. 3.8 held at 17 GB after an 8K-token fill.
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
 
@@ -316,7 +488,7 @@ Measure, do not compute. The first estimate for the 14B was 16GB and the real nu
 
 This tier used to be built `FROM qwen3.5:27b-int4` and was recorded here at **15 GB**. That number was real but it was a *floor*, not a steady state, and the difference took this host down.
 
-Ollama 0.23.4 serves int4 tags on its MLX engine, and **that engine applies `num_ctx` from neither the Modelfile nor `OLLAMA_CONTEXT_LENGTH`** — it loads the model's native window and spawns its runner with no `--ctx-size` at all. So the tier ran at 262144 instead of the 32768 it was configured for, in two places, and nothing reported an error. Measured 2026-08-12 on one server with one env:
+Ollama serves int4/mlx tags on its MLX engine, and **that engine applies `num_ctx` from neither the Modelfile nor `OLLAMA_CONTEXT_LENGTH`** — it loads the model's native window and spawns its runner with no `--ctx-size` at all. So the tier ran at 262144 instead of the 32768 it was configured for, in two places, and nothing reported an error. Measured 2026-08-12 on 0.23.4, one server with one env:
 
 | Tag | Engine | Native | `num_ctx` on tag | `OLLAMA_CONTEXT_LENGTH` | Loaded at |
 |---|---|---|---|---|---|
@@ -326,25 +498,90 @@ Ollama 0.23.4 serves int4 tags on its MLX engine, and **that engine applies `num
 
 `phi4-mini` carries no `num_ctx` of its own, so its clamp can only have come from the env — which is what proves the env reaches the GGUF path and is ignored on the MLX one.
 
+**Re-run the `phi4-mini` row after every Ollama upgrade.** It is the cheapest possible proof that the clamp this whole section depends on still works, and an upgrade is exactly when it could silently stop. Done on 2026-08-16 going 0.23.4 → 0.32.13: `phi4-mini` still loaded at **32768** against its 131072 native window, so 0.32.13 still honours `OLLAMA_CONTEXT_LENGTH` on the llama.cpp path.
+
 MLX also allocates KV *lazily*, so the tier loaded at the advertised 15 GB and grew toward **32 GB** as a session filled its 262K window. On a 36GB host that is the whole budget. The symptom is macOS's "Your system has run out of application memory", and it is deliberately hard to attribute: a 100%-GPU Ollama daemon shows up in neither the Force Quit list nor a RAM-percentage readout, so both indicators look calm while the machine dies.
 
 The GGUF build costs **8 GB more at rest** (23 GB vs the old 15 GB floor) and that is the correct trade: 23 GB bounded beats 15 GB unbounded. The window is now enforced, so the number stops moving. Tell the formats apart from the manifest — GGUF is a single `model` layer, MLX is many small `tensor` layers:
 
 ```
-curl -s https://registry.ollama.ai/v2/library/qwen3.5/manifests/27b | jq '.layers[].mediaType'
+curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+  https://registry.ollama.ai/v2/library/qwen3.8/manifests/27b | jq -r '.layers[].mediaType'
 ```
+
+Check this **before** pulling; it costs one request and it is the only thing standing between you and a 262144-window load. `qwen3.8:27b` returns `license`, `model`, `params`, `projector` — one `model` layer, so GGUF. The sibling `qwen3.8:27b-mlx` is the trap.
+
+The `projector` layer is new in 3.8: the tag is multimodal, which is why it is 17.7 GB against 3.5's 17.4 GB. Bare mode never sends it an image, so on this tier the projector is dead weight to budget for rather than a feature to plan around.
 
 **Verify the window with `ollama ps`, never with `ollama show --parameters`.** `--parameters` reads the tag's stored value and answers "was `num_ctx` written", which stayed a reassuring 32768 for the entire time the model was actually running at 262144. Only `ps` reports what the running instance loaded. An earlier revision of this file had that backwards, which is why the regression went unnoticed.
 
 Headroom exists because llm-jury reads `~/.backdoor/failover-state.json` and stands down while failover is active, so nothing else holds the GPU. Ollama caps residency by model count and never by bytes, and Metal allocations are wired and cannot be paged out, so over-committing panics this host rather than raising OOM. It did, twice, on 2026-07-31.
 
-The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Verified that this does not break tool calling on qwen3.5, with both settings emitting a correct call. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces for latency. Re-verified on qwen3.8 under Ollama 0.32.13 (2026-08-16): the model still emits a correct `get_weather` call with reasoning suppressed. Re-verify after an Ollama or model upgrade, because a tier that silently stops calling tools looks fine until you need it.
+
+**Test the `/v1` path, which is what the profile uses.** Passing `reasoning_effort` as a top-level `/api/chat` argument did not suppress thinking here, so checking only that endpoint reports a failure that isn't real. On `/v1/chat/completions` the `reasoning` field came back empty and `tool_calls` was populated, which is the pass condition.
+
+### Durable memory on local models
+
+Local sessions read Mem0 recall from the offline mirror at `~/.mem0-local/cache.db` and get it prepended to the system prompt as plain text. No MCP server, no tool call, no network.
+
+This exists because of a gap that was invisible from either side. Memory normally arrives through the `UserPromptSubmit` hook, which is why `bare.py` puts Mem0's MCP tools on the dropped side of the keep-list — the hook already injected the text before the request was built. But the `qwen` wrapper's lean and fast modes pass `--bare`, and `--bare` disables CLAUDE.md discovery and **every hook**. So the default local tier, the 27B, was the only brain in the stack with no durable memory, while `/model qwen`, failover, and `qwen full` all had it.
+
+| Path | Before | Now |
+|---|---|---|
+| `/model qwen` (router) | hook injects | unchanged |
+| Cloud→local failover | hook injects | unchanged |
+| `qwen full` | hook injects | unchanged |
+| `qwen`, `qwen lean` | **nothing** | proxy injects |
+| `qwen fast` | **nothing** | proxy injects |
+
+The proxy is the one place every local request passes through whichever door it came in by, so one code path covers all of them.
+
+Reading the local mirror rather than the Mem0 API is deliberate: the cloud endpoint is unreachable during exactly the outage failover exists to cover, since the breaker opens on one condition — this host being offline.
+
+```
+PROVIDER_BASE_URL=http://localhost:11434/v1   # injection only fires for local providers
+MEMORY_INJECT=false                           # turn it off
+MEMORY_TOP_K=6
+MEMORY_CHAR_BUDGET=1200
+```
+
+Cloud providers are excluded so a session whose hook already ran does not pay for the same text twice. Recall is read-only (`mode=ro`), fails open on a missing or locked cache, and times out in 1.5s so the Mem0 sync job's write lock cannot stall a turn. The budget is small on purpose: bare mode exists to hold the prompt near 945 tokens, and unbounded recall would rebuild the problem it solved.
+
+Memories are labelled as background that may be stale rather than as instructions, because they are. The mirror still describes the heavy tier as `qwen3.5:27b-bare` at 15 GB, two facts that are both now wrong, and a local model asked about the tier will say so rather than assert the stale version.
 
 ### Building a bare tag
 
 Build from the **registry** tag, never from a local one. `modelfiles/build.sh` appends a ~43K-token system prompt to every `*.Modelfile` it builds and defaults to building all of them, so every local `qwen3.5:*` tag carries 186,647 bytes of baked prompt. `FROM` inherits it, which makes a "bare" model that is nothing of the sort. The failure is not subtle but it is easy to miss: the first attempt here answered from the baked prompt's tool vocabulary and invented a `weather_fetch` tool the request never defined.
 
 Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` cannot glob. Check any new tag with `ollama show --system <tag>`, which must return nothing.
+
+#### The base tags were poisoned, which made that check lie
+
+`build.sh` derives its tag from the filename with the first `-` turned into `:`, so `qwen3.5-9b.Modelfile` built **`qwen3.5:9b`** — the exact name `ollama pull` uses for the pristine base. It overwrote the registry pull with a prompt-baked copy, and from then on every `FROM qwen3.5:9b` in this directory inherited 43K tokens.
+
+That is the same inheritance bug described above, but far harder to see: the Modelfile you read has no `SYSTEM` line anywhere in it, and neither does the one it inherits from. Only the tag does.
+
+Found 2026-08-16 with `ollama show --system qwen3.5:9b` returning 186,647 bytes where it should return 0. `qwen3.5:4b` was poisoned the same way. Both are fixed, and the repair is cheap because only the manifest differs:
+
+```
+ollama pull qwen3.5:9b     # 4 seconds — the model blob was already on disk
+```
+
+`build.sh` now refuses any tag with no suffix after the colon, so it cannot happen again. If you want a persona build of a base model, give it a variant name (`qwen3.5:9b-fable`), which is the convention `llama3.1:8b-fable` and `gemma3:12b-fable` already follow.
+
+**`SYSTEM ""` does not undo it.** Rebuilding `FROM` a poisoned base with an empty `SYSTEM` still reports 186,647 bytes. The base itself has to be re-pulled.
+
+#### `qwen3.5:9b-64k` is built bare
+
+Listed in `build.sh`'s `BARE_TAGS`. The baked prompt only applies when a request sends no system message, and both consumers of this tag (`/model qwen-9b`, the `fusion-qwen` subagent) always send one, so it bought them nothing. The one thing it could have served, bare `ollama run`, was unusable on a 9B:
+
+| | prompt tokens | wall clock |
+|---|---|---|
+| With baked prompt | 43,092 | 8+ min, then `500` |
+| Built bare | 12 | 2.4 s |
+
+The 4B tiers keep theirs, since bare usage there completes.
 
 ### When `ollama pull` will not finish
 
@@ -353,6 +590,23 @@ Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` 
 Reach for it when a pull stalls. `qwen3.5:27b-int4` is packaged as **1,193 layers**, 1,184 of them per-tensor, and `ollama pull` never finished it here: it transferred ~9MB, discarded the chunk, and restarted, twice over 15 minutes each. Neither disk (152GB free) nor bandwidth was the cause, since a ranged `curl` against the same blob sustained 20MB/s throughout. The problem is many small sequential transfers on a connection that drops, with `OLLAMA_MAX_TRANSFER_STREAMS=1` forbidding any overlap, so one stall halts everything.
 
 Concurrency is the fix, because the cost is per-request latency rather than bandwidth. The script finished the same 16.1GB in about two minutes with 12 workers. It resumes: already-present blobs are skipped, so rerun it after an interruption.
+
+#### The opposite packaging breaks it too
+
+`qwen3.8:27b` is **four** blobs, one of them a single **16.81 GB** model layer. Per-blob concurrency does nothing there — one blob is one worker — and two assumptions in the original script were wrong for that shape:
+
+- `--max-time 240` cannot transfer 16.81 GB at any speed this network reaches, so every attempt timed out mid-download and the old `rm -f "$part"` threw the bytes away before retrying. An infinite loop that looks like a slow network.
+- No `-C -`, so nothing resumed.
+
+Both are fixed. Large blobs now download as parallel byte ranges (`fetch_big`), each chunk separately resumable, with the reassembled blob SHA-256 checked before install — a misordered or short concat cannot pass. Transfers are now aborted on **throughput** (`--speed-limit`/`--speed-time`) rather than a wall-clock cap, which is size-independent.
+
+Measured against the registry on 2026-08-16: one connection 435 KB/s, four ranged connections ~1.0 MB/s aggregate. The per-connection throttle is real, so ranges help — but there is a ceiling above it, and on a bad night the registry alone can put a 17 GB model into the multi-hour range no matter how you fetch it.
+
+#### Two failure modes that look like something else
+
+**A pull that transfers zero bytes and exits 0 is a too-old client.** `ollama pull qwen3.8:27b` on 0.23.4 prints only `Please download the latest version at: https://ollama.com/download`. It does not say "unsupported", it does not fail, and `echo $?` is 0. `qwen3.6:27b` pulls fine on the same daemon, so the version floor is per-model — 3.8 needs Ollama ≥ 0.32.
+
+**A partial of exactly the right size can still be corrupt.** Ollama's abandoned `-partial` file for the projector blob was byte-for-byte the manifest's size, 931,146,016, and its SHA-256 did not match. Size is not verification; promoting that blob on size alone would have installed a broken model. Always check the digest before salvaging a partial.
 
 **The breaker opens on exactly one condition: this machine is offline.** That is deliberately narrow, because failing over is not free — it loads a local model into Ollama, and on a machine that also runs a local council (see [llm-jury](https://github.com/Screddyice/llm-jury)) two GPU consumers at once will fight for memory.
 
