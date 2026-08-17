@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import socket
+import ssl
 import subprocess
 import time
 from pathlib import Path
@@ -86,8 +87,32 @@ STATE_PATH = Path(
 # route to the internet, and a hostname would fold a broken resolver into the
 # answer. (A host that cannot resolve anything is offline for our purposes, but
 # it should read as offline because of the probe, not because of a DNS timeout.)
-CONNECTIVITY_PROBES = (("1.1.1.1", 443), ("8.8.8.8", 443))
+#
+# The third element is the name the probe's certificate must be valid for. It is
+# passed as SNI and verified, never resolved, so the no-DNS property above still
+# holds. See internet_reachable for why a TCP connection alone is not evidence.
+CONNECTIVITY_PROBES = (
+    ("1.1.1.1", 443, "one.one.one.one"),
+    ("8.8.8.8", 443, "dns.google"),
+)
 CONNECTIVITY_TIMEOUT = 2.0
+
+# Escape hatch back to the old TCP-only probe. Exists because a false "offline"
+# is not a harmless failure here — it claims the GPU and routes a session to a
+# local model while the cloud was fine — so if TLS verification ever misbehaves
+# on a network this was not tested against, it can be switched off without a
+# deploy. Leaving it set re-opens the middlebox hole described below.
+_TCP_ONLY_ENV = "BACKDOOR_PROBE_TCP_ONLY"
+
+_tls_ctx: "ssl.SSLContext | None" = None
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Default verifying context, built once. Certificates and hostname checked."""
+    global _tls_ctx
+    if _tls_ctx is None:
+        _tls_ctx = ssl.create_default_context()
+    return _tls_ctx
 
 
 def internet_reachable(
@@ -102,13 +127,61 @@ def internet_reachable(
     Fails CLOSED (returns True, "we are online") only on a real connection; any
     error on every probe means offline. Both probes are tried before giving up,
     so one blackholed resolver does not read as a dead network.
+
+    **A completed TCP handshake is not evidence.** It was until 2026-08-17, and
+    that was a silent hole: transparent middleboxes — captive portals, some
+    corporate and hotel networks, certain VPN configurations — accept a
+    connection to *any* address, including RFC 5737 addresses that are
+    guaranteed unroutable. Measured on the network this repo is developed on,
+    such a box completed a connection to 192.0.2.1:443 in ~0.2s. Against that,
+    the old probe reported "online" with the internet gone, the breaker never
+    opened, and failover silently did not happen — the one situation the whole
+    mechanism exists for.
+
+    So the probe now completes a TLS handshake and verifies the certificate
+    chain and hostname. A box that answers TCP without holding a certificate
+    the system trust store accepts for `one.one.one.one` or `dns.google` cannot
+    fake that. A corporate MITM proxy whose CA is installed on this machine
+    still can, but such a proxy is generally forwarding traffic, so "online" is
+    then the right answer anyway.
+
+    Set BACKDOOR_PROBE_TCP_ONLY=1 to fall back to the pre-2026-08-17 behavior.
     """
-    for host, port in probes:
+    verify = os.environ.get(_TCP_ONLY_ENV, "").strip().lower() not in {"1", "true", "yes"}
+
+    for host, port, cert_name in probes:
         try:
-            with socket.create_connection((host, port), timeout=timeout):
-                return True
+            raw = socket.create_connection((host, port), timeout=timeout)
         except OSError:
-            continue
+            continue  # Nothing answered. Ordinary offline.
+
+        with raw:
+            if not verify:
+                return True
+            # create_connection leaves its timeout on the socket, but the
+            # handshake is the part that hangs against a silent acceptor, so
+            # bound it explicitly rather than relying on that.
+            raw.settimeout(timeout)
+            try:
+                with _tls_context().wrap_socket(raw, server_hostname=cert_name):
+                    return True
+            except OSError as exc:
+                # Connected, then could not prove who it was. Deliberately catches
+                # every OSError rather than ssl.SSLError alone, because the two
+                # middlebox flavours fail differently: one speaks TLS with an
+                # untrusted certificate (SSLError), the other accepts the socket
+                # and says nothing at all (timeout). Both are the same lie.
+                #
+                # Logged loudly because it is the difference between "no network"
+                # and "something is answering for the entire internet", and only
+                # one of those is a thing the user can fix.
+                logger.warning(
+                    "connectivity probe %s:%s accepted a connection but did not "
+                    "prove it is %s (%s) — treating as offline; a captive portal "
+                    "or transparent middlebox answers exactly this way",
+                    host, port, cert_name, exc,
+                )
+                continue
     return False
 
 
