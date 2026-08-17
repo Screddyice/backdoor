@@ -1,0 +1,121 @@
+# qwen3.8:27b-bare — the cloud→local failover brain (profiles/
+# local-failover-qwen27.env). "bare" is the whole point: NO baked system prompt,
+# 32K window, and a model that can still call tools.
+#
+# Upgraded 2026-08-16 from qwen3.5:27b-bare. Note the version jump skips 3.7:
+# Qwen never shipped a 3.7 on Ollama, the library goes 3.5 → 3.6 → 3.8, so
+# "3.7" in a request means "the next one up" and resolves here.
+#
+# THIS UPGRADE REQUIRED AN OLLAMA UPGRADE, which is the part to remember if you
+# ever roll back. Ollama 0.23.4 REFUSES this tag: `ollama pull qwen3.8:27b`
+# exits 0 having downloaded nothing and prints only "Please download the latest
+# version at: https://ollama.com/download". It is not a network failure and it
+# does not say "unsupported"; a pull that transfers 0 bytes and succeeds is what
+# a too-old client looks like. This host went 0.23.4 → 0.32.13 (Homebrew) on
+# 2026-08-16. qwen3.6:27b, by contrast, pulls fine on 0.23.4 — so 3.6 is the
+# rollback that does NOT need the daemon downgraded, and 3.5 is the one that
+# does not need it either.
+#
+# THIS DIRECTORY EXISTS TO STAY OUT OF ../build.sh's GLOB, and that is not
+# theoretical. build.sh appends prompts/claude-fable-5-system.md as a SYSTEM
+# directive to every *.Modelfile it builds and defaults to building ALL of them.
+# Measured 2026-08-06: every local qwen3.5 tag (9b, 4b, and each -64k/-128k/
+# -256k failover tier) carries 186,647 bytes — roughly 43K tokens — of baked
+# system prompt as a result. A subdirectory does not match `*.Modelfile`, so a
+# bare `./build.sh` cannot reach this file.
+#
+# BUILD FROM THE REGISTRY TAG, NEVER FROM A LOCAL ONE. `FROM` inherits the
+# base's SYSTEM directive, so `FROM qwen3.5:9b` produces a "bare" model carrying
+# all 43K tokens. That happened on the first attempt here and was not subtle:
+# the model answered from the baked prompt's tool vocabulary, inventing a
+# `weather_fetch` tool that the request never defined. qwen3.8:27b is a pristine
+# registry pull (verified: `ollama show --system` returns 0 bytes), so this tag
+# inherits nothing.
+#
+# BUILD FROM THE GGUF TAG, NOT THE int4/MLX ONE — this is a memory-safety
+# requirement, not a preference. Ollama serves int4/mlx tags on its MLX engine
+# (`ollama runner --mlx-engine ...`), and that engine applies num_ctx from
+# NEITHER the Modelfile NOR OLLAMA_CONTEXT_LENGTH: it loads the model's native
+# window and its runner is spawned with no --ctx-size argument at all. The
+# llama.cpp engine (`--ollama-engine`, used for GGUF/Q4_K_M) applies both.
+#
+# `qwen3.8:27b` (no suffix) IS the GGUF build — verified from the manifest
+# before pulling, and that check is the cheap way to stay safe:
+#   curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+#     https://registry.ollama.ai/v2/library/qwen3.8/manifests/27b | \
+#     jq -r '.layers[].mediaType'
+# GGUF is a SINGLE `...image.model` layer; MLX is many small `tensor` layers.
+# qwen3.8:27b returns license + model + params + projector = 4 layers, one of
+# them `model` → GGUF. The sibling `qwen3.8:27b-mlx` is the one to avoid.
+#
+# THE `projector` LAYER IS NEW IN 3.8 and 3.5 had no equivalent: this tag is
+# multimodal (vision). That is the entire reason it is 17.7GB on disk against
+# 3.5's 17.4GB. Bare mode never sends it an image, so the projector is dead
+# weight here rather than a feature — budget for it, do not plan around it.
+#
+# Measured 2026-08-12 on this host (Ollama 0.23.4), and RE-VERIFIED 2026-08-16
+# on 0.32.13, same server, same env:
+#   phi4-mini:3.8b   GGUF  native 131072  num_ctx unset  → loaded at  32768 ✅
+#   qwen3.5:27b-bare MLX   native 262144  num_ctx 32768  → loaded at 262144 ❌
+# phi4-mini carries no num_ctx of its own, so its clamp can only have come from
+# OLLAMA_CONTEXT_LENGTH — which is what proves the env reaches the GGUF path and
+# is ignored on the MLX one. Re-running that phi4-mini control immediately after
+# the 0.32.13 upgrade still printed 32768, which is how we know the upgrade did
+# not quietly change the clamp this whole file depends on. RE-RUN IT after any
+# future Ollama upgrade; it is two commands and it is the only cheap proof.
+#
+# Cost of getting this wrong, observed in production: this tag ran at a 262144
+# window on a 36GB host. MLX allocates KV lazily, so the int4 build loaded at
+# ~15GB and GREW toward ~32GB as a session filled the window — which is why the
+# sizing measurement in this file was honest and the machine still ran out of
+# memory. A 15GB floor was recorded as if it were a steady state.
+# "Out of application memory" is what you get; the RAM% readout and Force Quit's
+# app list both stay innocent, because a 100%-GPU Ollama daemon appears in
+# neither.
+#
+#   ollama create qwen3.8:27b-bare -f modelfiles/bare/qwen3.8-27b-bare.Modelfile
+#
+# Sizing, MEASURED with `ollama ps` on this 36GB M5 Max on 2026-08-16 under
+# Ollama 0.32.13: 17.7GB on disk, **17GB resident** at num_ctx 32768 /
+# OLLAMA_NUM_PARALLEL=2, engine llama.cpp, 100% GPU.
+#
+# THAT IS 6GB LESS THAN qwen3.5:27b-bare's MEASURED 23GB, which was not the
+# expected direction — 3.8 carries an extra projector layer, so the prediction
+# written here before measuring was 24GB. Measure, do not compute; the guess was
+# wrong by 7GB and it was wrong in the safe direction only by luck.
+#
+# Re-measured after filling ~8K tokens of the window: still 17GB. That check
+# matters more than the cold number, because the int4/MLX build this tier once
+# used sat at a lazily-allocated ~15GB floor and GREW toward 32GB as a session
+# filled its 262144 window. A GGUF load allocates its KV up front, so a resident
+# figure that does not move under load is the evidence that the window is real.
+#
+# `ollama list` reports the on-disk figure and will mislead you by roughly half.
+#
+# Budget against the ~27GB Metal wired ceiling, not against 36GB. Wired pages
+# cannot be evicted, so over-committing them panics this host instead of raising
+# OOM (it did, twice, on 2026-07-31). At 17GB this tag leaves ~10GB of that
+# ceiling, which is roomier than 3.5's 23GB left but still NOT enough to
+# co-reside with an llm-jury council (~21GB). Ollama caps residency by model
+# COUNT rather than bytes, so nothing upstream refuses that combination. The
+# `qwen` wrapper shortens keep_alive to 10m on this profile for that reason;
+# the extra 6GB of headroom is not a licence to run both.
+#
+# Why 32K and not the model's native window: KV is charged num_ctx x
+# OLLAMA_NUM_PARALLEL, so the window is the expensive knob. Bare mode keeps the
+# prompt small enough that 32K is generous, and FAILOVER_LADDER hands anything
+# larger to the 4B 256K tier.
+#
+# VERIFY THE WINDOW WITH `ollama ps`, NOT `ollama show --parameters`. An earlier
+# revision of this comment had that backwards — it claimed the CONTEXT column
+# always prints the model's native window and that only `--parameters` confirms
+# num_ctx applied. Both halves are wrong, and believing them is what let the
+# 262144 regression above sit unnoticed:
+#   `ollama show --parameters` reads the TAG's stored parameter. It answers
+#     "was num_ctx written to the tag", which stayed 32768 the whole time the
+#     model was actually running at 262144. It cannot see the load at all.
+#   `ollama ps` CONTEXT reports what the running instance ACTUALLY loaded —
+#     proven above by phi4-mini printing 32768 against a 131072 native window.
+# So: --parameters checks the build, ps checks the truth. Only ps can catch this.
+FROM qwen3.8:27b
+PARAMETER num_ctx 32768

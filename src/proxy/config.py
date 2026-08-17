@@ -76,11 +76,27 @@ class Settings(BaseSettings):
     failover_keep_tools: str = "local"
     failover_tool_result_chars: int = 2000
 
+    # Durable-memory recall injected into LOCAL model prompts, read from the
+    # offline mirror at ~/.mem0-local/cache.db. See src/proxy/memory.py.
+    #
+    # On by default because the tier that needs it most is the one that had
+    # nothing: the `qwen` wrapper's lean/fast modes pass `--bare`, which disables
+    # every hook, including the `UserPromptSubmit` recall that gives every other
+    # session its memory. Cloud requests are excluded at the call site, so this
+    # cannot double-inject for a session whose hook already ran.
+    #
+    # The budget is deliberately small. Bare mode exists to keep the prompt near
+    # 945 tokens against a 32K window, and unbounded recall would rebuild the
+    # problem it was created to solve.
+    memory_inject: bool = True
+    memory_top_k: int = 6
+    memory_char_budget: int = 1200
+
     # Bare mode for an EXPLICIT `/model <name>` route, not just failover.
     # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
     # deliberate `/model qwen` handed the full unstripped harness to whatever
     # tier the route named. That is fine for the 64K tiers and wrong for a tier
-    # whose window assumes bare mode: qwen3.5:27b-bare is 32K, and a full
+    # whose window assumes bare mode: qwen3.8:27b-bare is 32K, and a full
     # harness session does not fit — the same over-window regression the
     # profile header warns about, on a 27B instead of a 4B.
     # Set ROUTE_BARE=true on those profiles only. Deliberately reuses the
@@ -170,7 +186,7 @@ def clear_settings_cache():
 # Model names a Claude Code session can request (via `/model <name>` or
 # `--model <name>`) that route to a LOCAL profile in hybrid mode.
 MODEL_ROUTES: dict[str, str] = {
-    "qwen": "local-failover-qwen27",  # qwen3.5:27b-bare — same as backdoor
+    "qwen": "local-failover-qwen27",  # qwen3.8:27b-bare — same as backdoor
     "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
     "qwen-9b": "local-qwen-9b",   # qwen3.5:9b-64k — stronger brain for subagents
 }
@@ -194,7 +210,7 @@ MODEL_ROUTES: dict[str, str] = {
 # still overflows the 27B's 32K window — at which point a weaker model that
 # retains the session beats a stronger one that truncates it.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (28_000, "local-failover-qwen27"),      # qwen3.5:27b-bare (32K window, tools)
+    (28_000, "local-failover-qwen27"),      # qwen3.8:27b-bare (32K window, tools)
     (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
 ]
 

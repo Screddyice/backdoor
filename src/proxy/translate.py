@@ -1,11 +1,14 @@
 """Translate between Anthropic Messages API format and OpenAI/NIM format."""
 
 import json
+import logging
 import re
 import uuid
 from typing import Any
 
 from .models import MessagesRequest, Message, Tool
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +208,129 @@ def tools_to_openai(tools: list[Tool] | None) -> list[dict[str, Any]] | None:
     ]
 
 
+def _hoist_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Guarantee at most one system message, at index 0.
+
+    Ollama 0.32 rejects any system message at index > 0 with HTTP 500
+    "system message must be at the beginning", and that includes a payload whose
+    FIRST message is a valid system message and which carries a second one later.
+    0.23.4 accepted both shapes, so this only started failing when the daemon was
+    upgraded on 2026-08-16 — every request in a tool-using session 500'd in about
+    150ms, before any inference, which is what a validation rejection looks like
+    against a load failure.
+
+    Anthropic keeps the system prompt in its own top-level field, so a system
+    message arriving inside `messages` is already unusual. Rather than drop that
+    content (it is instruction text, and dropping instructions silently is worse
+    than reordering them) it gets merged into the leading system block in the
+    order it appeared.
+
+    Providers differ on this: some accept system anywhere, some take only the
+    first, some 500. Normalising here means the proxy sends the one shape all of
+    them accept, instead of depending on which daemon is installed.
+    """
+    stray = [i for i, m in enumerate(messages) if m.get("role") == "system" and i > 0]
+    if not stray:
+        return messages
+
+    logger.warning(
+        "hoisting %d system message(s) from position(s) %s to the front — "
+        "Ollama 0.32+ rejects system messages that are not first",
+        len(stray),
+        stray,
+    )
+
+    lead: list[str] = []
+    rest: list[dict[str, Any]] = []
+    for i, m in enumerate(messages):
+        if m.get("role") == "system":
+            content = m.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if content:
+                lead.append(str(content))
+        else:
+            rest.append(m)
+
+    return ([{"role": "system", "content": "\n\n".join(lead)}] if lead else []) + rest
+
+
+def _is_local_provider(settings) -> bool:
+    """Is this request headed for a model running on this machine?
+
+    Cloud sessions already receive Mem0 through the `UserPromptSubmit` hook, so
+    injecting for them would duplicate the same text and spend context twice.
+    Local sessions launched with `--bare` get no hooks at all, which is the gap
+    this fills.
+    """
+    url = (getattr(settings, "provider_base_url", "") or "").lower()
+    return "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """Text of the most recent user turn — the query recall is run against."""
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(
+                b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"
+            )
+    return ""
+
+
+def _inject_memory(messages: list[dict[str, Any]], settings) -> list[dict[str, Any]]:
+    """Prepend durable-memory recall to the system block for local models.
+
+    Local sessions started by the `qwen` wrapper run with `--bare`, which
+    disables every hook — including the one that normally injects Mem0. Without
+    this, the default local tier is the only one in the stack with no durable
+    memory. Recall is read from the offline SQLite mirror so it survives the
+    outage that failover exists to cover.
+
+    Fail-open: a recall problem returns the messages untouched.
+    """
+    if not getattr(settings, "memory_inject", False) or not _is_local_provider(settings):
+        return messages
+
+    try:
+        from . import memory as _memory
+
+        head = messages[0] if messages else None
+        if head is not None and head.get("role") == "system" and _memory.already_injected(str(head.get("content") or "")):
+            return messages
+
+        query = _last_user_text(messages)
+        if not query:
+            return messages
+
+        found = _memory.recall(
+            query,
+            k=getattr(settings, "memory_top_k", 6),
+            char_budget=getattr(settings, "memory_char_budget", 1200),
+        )
+        block = _memory.build_block(found)
+        if not block:
+            return messages
+
+        logger.info("injected %d durable memories (%d chars)", len(found), len(block))
+
+        out = list(messages)
+        if out and out[0].get("role") == "system":
+            out[0] = {**out[0], "content": f"{block}\n\n{out[0].get('content') or ''}".rstrip()}
+        else:
+            out.insert(0, {"role": "system", "content": block})
+        return out
+    except Exception as exc:  # noqa: BLE001 — never cost the user a turn
+        logger.warning("memory injection skipped: %s", exc)
+        return messages
+
+
 def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
     """Build the full NIM chat/completions payload from an Anthropic request."""
     oai_messages: list[dict[str, Any]] = []
@@ -214,6 +340,8 @@ def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
         oai_messages.append({"role": "system", "content": system_text})
 
     oai_messages.extend(messages_to_openai(req.messages))
+    oai_messages = _hoist_system_messages(oai_messages)
+    oai_messages = _inject_memory(oai_messages, settings)
 
     payload: dict[str, Any] = {
         "model": settings.provider_model,
