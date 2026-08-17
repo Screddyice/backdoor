@@ -1,0 +1,61 @@
+# Hermes MCP bridge. Copy to ~/.config/systemd/user/ and edit the paths.
+#
+# This unit deliberately does NOT set SuccessExitStatus. The bridge exits 0 on
+# SIGTERM. It does not copy Hermes's convention of exiting 1 to provoke
+# Restart=on-failure: with Restart=always that buys nothing, and on a
+# deliberate stop systemd does not restart at all, records the non-zero exit as
+# a failure, and parks the unit in "failed" with NRestarts=0. A gateway unit
+# doing exactly that is how a healthy agent can look dead for days after a
+# clean shutdown.
+#
+# EnvironmentFile (%h/.config/hermes-mcp/http.env) is not shipped here — it
+# holds real values and this repo is public. It must define, one KEY=value
+# per line:
+#   HERMES_MCP_KEY=<a long, random string>
+#     Required. Boot refuses on missing, short (<16 chars), or
+#     placeholder-looking values — never a real value in this repo.
+#   HERMES_MCP_ALLOWED_HOSTS=<comma-separated extra Host values>
+#     Optional. Example: bridge.example.com:443,other.example.com:*
+#     Unset or empty leaves today's behavior unchanged: the SDK's own
+#     loopback-only default applies (127.0.0.1:*, localhost:*, [::1]:*). Set
+#     it and those loopback defaults stay, with the configured hosts added on
+#     top — the allowlist only widens, DNS-rebinding protection stays on.
+#     Needed when the bridge runs behind a tunnel that forwards a public
+#     hostname in the Host header; without it such a request is rejected with
+#     421 before auth even runs. Required, not optional, whenever
+#     HERMES_MCP_HOST is non-loopback. See README.md for the full contract.
+#   HERMES_MCP_HOST=<address to bind>
+#     Optional. Defaults to 127.0.0.1. A non-loopback address turns OFF the
+#     SDK's automatic loopback-only DNS-rebinding protection, so
+#     HERMES_MCP_ALLOWED_HOSTS is REQUIRED with one: boot is refused on a
+#     non-loopback bind with an empty allowlist rather than serving with no
+#     protection at all. Loopback (127.0.0.1, localhost, ::1) needs no
+#     allowlist and is unaffected.
+#   HERMES_MCP_PORT=<port to bind>
+#     Optional. Defaults to 8000. A non-integer or out-of-range value is
+#     refused at boot, not left to fail later as a bind error.
+#   Per-profile gateway keys, one per profile's key_env field in the registry
+#     (deploy/registry.example.toml shows the shape).
+#
+# The MCP endpoint is served at path /mcp on that host and port, so a reverse
+# proxy or tunnel in front of this unit routes /mcp and nothing else.
+
+[Unit]
+Description=Hermes MCP bridge — HTTP MCP surface for Hermes gateways
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hermes-mcp/http.env
+WorkingDirectory=%h/backdoor
+ExecStart=%h/backdoor/.venv/bin/python -m src.hermes_mcp.http_server
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=append:%h/logs/hermes-mcp-http.log
+StandardError=append:%h/logs/hermes-mcp-http.log
+
+[Install]
+WantedBy=default.target

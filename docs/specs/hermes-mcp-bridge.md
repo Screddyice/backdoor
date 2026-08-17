@@ -42,8 +42,14 @@ Auth is `Authorization: Bearer <API_SERVER_KEY>`, compared with `hmac.compare_di
 | Runs | `POST /v1/runs`, `GET /v1/runs/{id}`, `GET /v1/runs/{id}/events` (SSE), `POST /v1/runs/{id}/approval`, `POST /v1/runs/{id}/stop` |
 | Jobs | `GET\|POST /api/jobs`, `GET\|PATCH\|DELETE /api/jobs/{id}`, `POST /api/jobs/{id}/{pause,resume,run}` |
 
-Custom headers: `X-Hermes-Session-Id` for continuity, `X-Hermes-Session-Key` for long-term memory
-scope.
+Custom headers: `X-Hermes-Session-Id` and `X-Hermes-Session-Key`. They are two different things and
+should not be conflated: the first identifies a session, the second scopes long-term memory and is
+independent of session id.
+
+Neither is how this bridge maintains continuity. On the `POST /v1/runs` path it uses, continuity
+rides a `session_id` in the request **body**, which Hermes prefers over the stored or generated
+one. The session-id header matters for the `/api/sessions/{id}/chat` path, which the bridge does
+not use.
 
 **Hermes also ships an MCP server, but it is the wrong one for this job.** `mcp_serve.py` (FastMCP)
 exposes ten tools: `conversations_list`, `conversation_get`, `messages_read`, `attachments_fetch`,
@@ -90,7 +96,7 @@ MCP client (any surface)
   ▼
 https://<gateway-host>/<route>/          reverse proxy / tunnel
   ▼
-127.0.0.1:<bridge-port>   hermes-mcp-http   (FastMCP, streamable HTTP)
+127.0.0.1:<bridge-port>   hermes-mcp-http   (MCPServer, streamable HTTP)
   │
   ├─ profile A  → 127.0.0.1:<port A>   full
   ├─ profile B  → 127.0.0.1:<port B>   full
@@ -115,7 +121,7 @@ the three things REST cannot: run `systemctl --user` for lifecycle, and read eac
 | `registry.py` | Profile → port, key env var, capability tier. Loaded from one config file outside the repo. Fails startup on duplicate ports. |
 | `client.py` | Async `httpx` wrapper over one gateway's REST API. Per-profile timeouts. Converts transport failures into structured state, never exceptions. |
 | `tools.py` | MCP tool definitions. Fans out across the registry. |
-| `http_server.py` | FastMCP app over streamable HTTP. Bearer auth. Refuses to boot on a missing, short, or placeholder key, mirroring Hermes's own guard. |
+| `http_server.py` | MCPServer app over streamable HTTP. Bearer auth. Refuses to boot on a missing, short, or placeholder key, mirroring Hermes's own guard. |
 
 This repo is otherwise an LLM proxy, and `src/proxy/` never touches MCP. This package is a
 sibling concern and does not import from it.
@@ -152,21 +158,30 @@ regenerated each launch so key rotations carry over.
 
 | Capability | Tools | Backed by |
 | --- | --- | --- |
-| Control | `hermes_list`, `hermes_status` | `GET /health`, `GET /v1/capabilities`, `systemctl --user show` |
+| Control | `hermes_list` | `GET /health` per profile |
+| Control | `hermes_status` | `GET /v1/capabilities` |
 | Control | `hermes_start`, `hermes_stop`, `hermes_restart` | `systemctl --user` |
 | Control | `hermes_logs` | each profile's `HERMES_HOME/logs/` |
-| Converse | `hermes_chat` | `POST /api/sessions/{id}/chat` |
+| Converse | `hermes_chat` | `POST /v1/runs`, with `session_id` in the body |
 | Converse | `hermes_run_status`, `hermes_run_stop` | `GET /v1/runs/{id}`, `POST /v1/runs/{id}/stop` |
-| Approvals | `hermes_run_approve` | `GET /v1/runs/{id}/events`, `POST /v1/runs/{id}/approval` |
+| Approvals | `hermes_run_approve` | `POST /v1/runs/{id}/approval` |
 | History | `hermes_sessions`, `hermes_session_messages` | `GET /api/sessions`, `GET /api/sessions/{id}/messages` |
 | Config | `hermes_models`, `hermes_skills`, `hermes_toolsets`, `hermes_jobs` | `GET /v1/models`, `/v1/skills`, `/v1/toolsets`, `/api/jobs` |
 
 Every tool takes a `profile` argument except `hermes_list`, which fans out.
 
+**On the chat path.** `hermes_chat` posts `POST /v1/runs` rather than
+`POST /api/sessions/{id}/chat`. Both endpoints exist, but only the run path returns a run this
+bridge can then follow with `hermes_run_status`, `hermes_run_stop` and `hermes_run_approve`, all
+of which are run-scoped. Continuity is preserved on that path by a `session_id` in the request
+body, which Hermes honours in place of the stored or generated one.
+
 **On approvals.** The gating model is to let Hermes's own hook and approval layer decide, rather
 than re-confirming in the MCP client. For that to work, approval requests must be answerable in
 the session that triggered them. Over REST that is run-scoped: `/v1/runs/{id}/events` streams
-`approval.request` and `/v1/runs/{id}/approval` answers it. `hermes_run_approve` wraps the pair.
+`approval.request` and `/v1/runs/{id}/approval` answers it. `hermes_run_approve` posts the answer
+only; the bridge does not consume the event stream, so a caller learns that an approval is pending
+from the run's own status rather than from a stream this bridge holds open.
 
 The broader `permissions_list_open` / `permissions_respond` tools in `mcp_serve.py` cover pending
 approvals across messaging channels rather than one run, but that server is stdio-only with no
@@ -201,7 +216,11 @@ States: `ok`, `stopped`, `unconfigured`, `control_only`, `unreachable`, `unautho
 
 - Per-profile timeouts, so a hung gateway bounds only its own entry.
 - Bearer failures return 401 without echoing key material.
-- The bridge never proxies a gateway's `API_SERVER_KEY` to a caller.
+- The bridge never proxies a gateway's `API_SERVER_KEY` to a caller. This holds on every status
+  code, not only the auth ones: a gateway that echoes the key in a 2xx body has it replaced by a
+  fixed placeholder before the body is returned. It holds for internal failures too — an exception
+  raised while the request is being issued can carry key material in its message, so no exception
+  text reaches the caller and every such failure returns one fixed reason.
 
 ## Testing
 

@@ -73,6 +73,42 @@ cmd_claude() {
 }
 cmd_log() { tail -n "${1:-40}" "$LOG" 2>/dev/null || echo "(no log yet)"; }
 
+# The bridge speaks streamable-HTTP MCP (mcp==2.0.0, stateful mode): every
+# JSON-RPC method except 'initialize' requires an Mcp-Session-Id header
+# minted by a prior initialize response, so a single curl POST to tools/call
+# is rejected with 400 "Missing session ID" — there is no one-shot envelope
+# fix for that. 'initialize' is the one call the transport accepts without
+# an existing session, so it is what 'ping' actually sends; 'list'/'status'/
+# 'logs' need a real MCP client that can hold a session, not curl.
+cmd_hermes() {
+  local sub="${1:-ping}"; shift || true
+  local url="${HERMES_MCP_URL:-}"
+  local key="${HERMES_MCP_KEY:-}"
+  if [ -z "$url" ]; then
+    echo "HERMES_MCP_URL is not set" >&2; return 1
+  fi
+  if [ -z "$key" ]; then
+    echo "HERMES_MCP_KEY is not set" >&2; return 1
+  fi
+  case "$sub" in
+    ping)
+      # The Authorization header is visible in `ps` output for the lifetime
+      # of this curl invocation. Accepted here for a sub-second CLI call.
+      curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$url" \
+        -H "Authorization: Bearer $key" \
+        -H 'content-type: application/json' \
+        -H 'accept: application/json, text/event-stream' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bd-hermes-ping","version":"0"}}}'
+      ;;
+    list|status|logs)
+      echo "bd hermes $sub can't run as a single curl request: tools/call needs a session id minted by a prior MCP 'initialize' handshake, which a one-shot request can't hold." >&2
+      echo "Reach the hermes_* tools through an MCP client instead (e.g. QWEN_HERMES=1 ./qwen, or register HERMES_MCP_URL/HERMES_MCP_KEY with any MCP-capable client)." >&2
+      return 1
+      ;;
+    *) echo "usage: bd hermes {list|status|logs|ping}" >&2; return 1 ;;
+  esac
+}
+
 case "${1:-}" in
   list|ls) cmd_list ;;
   switch|use) shift; cmd_switch "$@" ;;
@@ -82,6 +118,7 @@ case "${1:-}" in
   status|st) cmd_status ;;
   claude|run) shift; cmd_claude "$@" ;;
   log|logs) shift; cmd_log "${1:-40}" ;;
+  hermes) shift; cmd_hermes "$@" ;;
   *) cat <<USAGE
 bd - Backdoor control (Claude Code <-> any AI backend)
   bd list                list backends (* = active)
@@ -89,6 +126,8 @@ bd - Backdoor control (Claude Code <-> any AI backend)
   bd start|stop|restart|status
   bd claude [args...]    launch Claude Code through the active backend
   bd log [n]             tail proxy log
+  bd hermes ping          check the Hermes MCP bridge is reachable and authenticated
+  bd hermes list|status|logs   not curl-shaped; see 'bd hermes list' output for why
 USAGE
   ;;
 esac

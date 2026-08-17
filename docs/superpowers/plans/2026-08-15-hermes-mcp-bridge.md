@@ -4,9 +4,9 @@
 
 **Goal:** Expose Hermes gateway agents over an HTTP MCP surface so any MCP client — including ones that cannot run a local process — can list and control them, converse with them, read their history, and answer their run approvals.
 
-**Architecture:** A FastMCP server over streamable HTTP, co-located with the gateways, fanning out to each profile's own Hermes REST API. A registry file maps profile → port, key env var, and capability tier; tools check the tier before acting. Two auth boundaries: callers present the bridge's key, the bridge presents each gateway's key, and a gateway key never reaches a caller.
+**Architecture:** An MCPServer app over streamable HTTP, co-located with the gateways, fanning out to each profile's own Hermes REST API. A registry file maps profile → port, key env var, and capability tier; tools check the tier before acting. Two auth boundaries: callers present the bridge's key, the bridge presents each gateway's key, and a gateway key never reaches a caller.
 
-**Tech Stack:** Python 3.11+, `mcp` SDK (`mcp.server.fastmcp.FastMCP`), `httpx` (async), `tomllib` (stdlib), pytest with `asyncio_mode = "auto"`.
+**Tech Stack:** Python 3.11+, `mcp` SDK (`mcp.server.mcpserver.MCPServer`), `httpx` (async), `tomllib` (stdlib), pytest with `asyncio_mode = "auto"`.
 
 **Spec:** `docs/specs/hermes-mcp-bridge.md`
 
@@ -31,7 +31,7 @@
 | `src/hermes_mcp/registry.py` | Parse and validate the registry file. Profile → port, key env var, tier, unit, home. |
 | `src/hermes_mcp/client.py` | One gateway's REST API over async httpx. Converts transport failures into structured state. |
 | `src/hermes_mcp/tools.py` | MCP tool definitions and tier enforcement. |
-| `src/hermes_mcp/http_server.py` | FastMCP app, bearer auth, boot guard, entry point. |
+| `src/hermes_mcp/http_server.py` | MCPServer app, bearer auth, boot guard, entry point. |
 | `deploy/hermes-mcp-http.service` | systemd unit template. |
 | `deploy/registry.example.toml` | Registry shape with placeholder values. |
 | `tests/test_hermes_mcp_registry.py` | Registry parsing and validation. |
@@ -797,7 +797,7 @@ Create `src/hermes_mcp/tools.py`:
 ```python
 """MCP tool definitions and the tier gate.
 
-Tools are registered against a FastMCP instance by register_tools(), which
+Tools are registered against an MCPServer instance by register_tools(), which
 Tasks 4-6 fill in. This file starts with the gate because every tool consults
 it first.
 """
@@ -1569,7 +1569,7 @@ git commit -m "feat(hermes-mcp): lifecycle and log tools via co-located systemct
   - `class KeyGuardError(RuntimeError)`
   - `MIN_KEY_LEN: int = 16`, `PLACEHOLDERS: frozenset[str]`
   - `require_bridge_key() -> str`
-  - `build_server(registry=None) -> FastMCP`
+  - `build_server(registry=None) -> MCPServer`
   - `main() -> None`
 
 - [ ] **Step 1: Write the failing test**
@@ -1664,7 +1664,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'src.hermes_mcp.http_se
 Create `src/hermes_mcp/http_server.py`:
 
 ```python
-"""FastMCP server exposing Hermes gateways over streamable HTTP.
+"""MCPServer app exposing Hermes gateways over streamable HTTP.
 
 Two auth boundaries, deliberately distinct. Callers authenticate to the bridge
 with HERMES_MCP_KEY. The bridge authenticates to each gateway with that
@@ -1682,7 +1682,7 @@ from __future__ import annotations
 import logging
 import os
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .registry import Profile, load_registry
 from .tools import register_tools
@@ -1717,8 +1717,8 @@ def require_bridge_key() -> str:
     return value
 
 
-def build_server(registry: dict[str, Profile] | None = None) -> FastMCP:
-    """Build the FastMCP app. Applies the boot guard before registering anything."""
+def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
+    """Build the MCPServer app. Applies the boot guard before registering anything."""
     require_bridge_key()
     if registry is None:
         registry = load_registry()
@@ -1727,7 +1727,7 @@ def build_server(registry: dict[str, Profile] | None = None) -> FastMCP:
         len(registry),
         ", ".join(f"{n}:{p.tier}" for n, p in sorted(registry.items())),
     )
-    mcp = FastMCP("hermes-mcp")
+    mcp = MCPServer("hermes-mcp")
     register_tools(mcp, registry)
     return mcp
 
@@ -1746,7 +1746,7 @@ if __name__ == "__main__":
 Run: `.venv/bin/python -m pytest tests/test_hermes_mcp_server_auth.py -q`
 Expected: PASS
 
-Note: `server._tool_manager.list_tools()` is a FastMCP internal. If the installed
+Note: `server._tool_manager.list_tools()` is an MCPServer internal. If the installed
 `mcp` version exposes tools differently, adjust the assertion to whatever that
 version provides and keep the same expected-name set.
 

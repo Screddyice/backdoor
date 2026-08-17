@@ -1,0 +1,30 @@
+# Hermes MCP bridge registry. Copy to ~/.config/hermes-mcp/registry.toml and
+# fill in real values. Never commit a filled-in copy: this repo is public.
+#
+# tier:
+#   full          chat + control + history + config
+#   control_only  everything except chat. Use for hardened single-purpose
+#                 profiles that expose an API server for their own product.
+#   unconfigured  listed with a reason; every action refused.
+#
+# port and key_env are required for full and control_only. key_env names the
+# environment variable holding that gateway's API_SERVER_KEY — never the key.
+# unit and home are optional; without unit the lifecycle tools refuse, without
+# home the log tool refuses.
+
+[profiles.primary]
+tier = "full"
+port = 9001
+key_env = "HERMES_KEY_PRIMARY"
+unit = "gateway-primary.service"
+home = "/home/example/.hermes"
+
+[profiles.product-endpoint]
+tier = "control_only"
+port = 9002
+key_env = "HERMES_KEY_PRODUCT"
+unit = "gateway-product.service"
+home = "/home/example/.hermes/profiles/product"
+
+[profiles.not-yet-configured]
+tier = "unconfigured"

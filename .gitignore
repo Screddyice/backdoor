@@ -25,3 +25,6 @@ modal/__pycache__/
 .claude/settings.local.json
 .claude-harness/.setup-stamp
 .claude-harness/.verify-cache
+
+# Git worktrees
+.worktrees/

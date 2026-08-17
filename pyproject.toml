@@ -15,6 +15,10 @@ dependencies = [
     # Mints the local CA and per-host leaf certificates the CONNECT forward
     # proxy needs to terminate TLS for api.anthropic.com. See src/proxy/ca.py.
     "cryptography>=42.0",
+    # 2.0 is the floor, not a preference: src/hermes_mcp/http_server.py imports
+    # mcp.server.mcpserver.MCPServer, which 2.0 introduced when it renamed
+    # FastMCP. Any resolve below it is a ModuleNotFoundError at import.
+    "mcp>=2.0",
 ]
 
 [dependency-groups]
@@ -29,7 +33,7 @@ asyncio_mode = "auto"
 pythonpath = ["."]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/proxy"]
+packages = ["src/proxy", "src/hermes_mcp"]
 
 [build-system]
 requires = ["hatchling"]
