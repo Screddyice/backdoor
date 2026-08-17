@@ -155,6 +155,28 @@ pytest                          5 errors during collection
 
 The harness verification gate in `.claude-harness/config.json` runs the venv form for the same reason.
 
+### Tests never touch the network
+
+Connectivity is injected, never observed. `internet_reachable` is exercised by patching
+`socket.create_connection`, and the failover breaker takes an `online_fn`, so the suite runs
+identically on a plane and in an office.
+
+This is a rule rather than a preference because breaking it produced a test that failed on
+correct code. The offline case used to assert that a connection to TEST-NET-1 (`192.0.2.1`, which
+RFC 5737 reserves and promises is unroutable) would be refused. That promise binds the public
+internet, not the machine running the suite — and it is the worst possible thing to lean on here,
+because *a network that answers TCP on every address is the exact failure mode this probe exists
+to detect*. Some networks, including one this repo was developed on, run a transparent middlebox
+that completes a connection to any address in ~0.2s. TEST-NET included. So the test failed on
+precisely the networks the code most needs to be right about.
+
+Worth knowing operationally: that middlebox also defeats `internet_reachable` itself. The probe
+opens a TCP connection to `1.1.1.1:443` and `8.8.8.8:443` and treats a completed handshake as
+"online". Behind a middlebox that accepts everything, it reports online even when the internet is
+gone, the breaker never opens, and **failover silently does not happen**. Distinguishing the two
+needs something above TCP — a TLS handshake that must validate, or a response whose contents can
+be checked. If you are on such a network and failover never fires, this is why.
+
 ## Troubleshooting
 
 **`500 ... "system message must be at the beginning"`**

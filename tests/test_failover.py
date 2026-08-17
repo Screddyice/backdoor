@@ -5,6 +5,7 @@ connectivity through `online_fn` rather than touching the network, and redirect
 the published state file so a test run never writes to ~/.backdoor.
 """
 
+import contextlib
 import json
 import tempfile
 from pathlib import Path
@@ -189,10 +190,85 @@ def test_statuses_can_be_restored_via_env(monkeypatch):
     assert _statuses_from_env() == set()
 
 
-def test_internet_probe_reports_offline_when_no_probe_connects():
-    # TEST-NET-1 (RFC 5737) is guaranteed unroutable, with a short timeout so a
-    # blackholing network cannot stall the suite.
-    assert internet_reachable(probes=(("192.0.2.1", 443),), timeout=0.25) is False
+# ── The connectivity probe ───────────────────────────────────────────────────
+#
+# These drive `socket.create_connection` directly, per this module's contract of
+# injecting connectivity rather than touching the network.
+#
+# The offline case used to assert against TEST-NET-1 (192.0.2.1), which RFC 5737
+# reserves and promises is unroutable. That promise binds the public internet,
+# not the machine running the suite, and it is exactly the wrong thing to lean
+# on here: a network that answers TCP on every address is the failure mode this
+# probe exists to detect, so borrowing the routing table as a fixture meant the
+# test broke on precisely the networks the code most needs to be right about.
+# Verified 2026-08-17 — this host completes a connection to 192.0.2.1:443 in
+# ~0.2s, so the test failed while `internet_reachable` was behaving correctly.
+
+_PROBES = (("1.1.1.1", 443), ("8.8.8.8", 443))
+
+
+def _refuse(address, timeout=None):
+    raise OSError(101, "Network is unreachable")
+
+
+def test_internet_probe_reports_offline_when_no_probe_connects(monkeypatch):
+    """Offline means every probe refused, not that one address looked dead."""
+    tried = []
+
+    def refuse(address, timeout=None):
+        tried.append(address)
+        return _refuse(address, timeout)
+
+    monkeypatch.setattr("src.proxy.failover.socket.create_connection", refuse)
+
+    assert internet_reachable(probes=_PROBES) is False
+    assert tried == list(_PROBES), "every probe must be tried before declaring offline"
+
+
+def test_internet_probe_reports_online_on_the_first_connection(monkeypatch):
+    """One reachable address is enough, and it stops dialling there."""
+    tried = []
+
+    def accept(address, timeout=None):
+        tried.append(address)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr("src.proxy.failover.socket.create_connection", accept)
+
+    assert internet_reachable(probes=_PROBES) is True
+    assert tried == [_PROBES[0]], "a connected probe must short-circuit the rest"
+
+
+def test_internet_probe_survives_one_dead_probe(monkeypatch):
+    """A single blackholed resolver is not a dead network.
+
+    This is the case that decides whether the breaker wrongly claims the GPU. If
+    one refusal short-circuited to offline, a host with 1.1.1.1 filtered — common
+    on corporate DNS — would load 17 GB and route the session to a local model
+    while the cloud was reachable the whole time.
+    """
+    def first_probe_fails(address, timeout=None):
+        if address == _PROBES[0]:
+            return _refuse(address, timeout)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr("src.proxy.failover.socket.create_connection", first_probe_fails)
+
+    assert internet_reachable(probes=_PROBES) is True
+
+
+def test_internet_probe_honours_the_timeout_it_is_given(monkeypatch):
+    """The timeout is a latency contract: it bounds how long a turn can stall."""
+    seen = []
+
+    def record(address, timeout=None):
+        seen.append(timeout)
+        return _refuse(address, timeout)
+
+    monkeypatch.setattr("src.proxy.failover.socket.create_connection", record)
+
+    internet_reachable(probes=_PROBES, timeout=0.25)
+    assert seen == [0.25, 0.25]
 
 
 # ── Published state: the handshake llm-jury reads ────────────────────────────
