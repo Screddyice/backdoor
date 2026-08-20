@@ -337,6 +337,13 @@ Two behaviours are worth knowing before you rely on it:
 
 Settings `env` has no health gate of its own, so pair it with a wrapper that checks the port when you care about that degradation path.
 
+**Backdoor recovers the Anthropic pool after a dropped network.** Active streams can occupy every
+shared HTTP connection while Wi-Fi changes or DNS disappears. A later request then raises
+`PoolTimeout` even after direct access to Anthropic recovers. Backdoor now replaces that exhausted
+pool, closes it, and retries the request once. Check `router.log` for
+`Anthropic connection pool exhausted; rotated pool and retrying once`. A second timeout still
+reaches Claude Code so its normal retry and failover behavior stays intact.
+
 **Only allowlisted hosts are inspected.** `FORWARD_MITM_HOSTS` defaults to `api.anthropic.com`; everything else — Composio, npm, your MCP servers, and the Remote Control bridge to claude.ai — is relayed as opaque bytes, so nothing else can have its TLS broken by a proxy it never asked for.
 
 **About the CA.** Reading a CONNECT tunnel means presenting a certificate for a host you do not own, so Backdoor mints one from a CA at `~/.backdoor/ca` (key `0600`). It is **never** installed into the system keychain: the only thing that trusts it is a process you hand `NODE_EXTRA_CA_CERTS` to. Every other program on the machine rejects anything it signs. Delete the directory to revoke it; it regenerates on next use.
