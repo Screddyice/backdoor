@@ -229,6 +229,16 @@ its interpreter path against the LaunchAgent's.
 
 
 
+**`API error · Retrying…` banners in Claude Code, nothing in the router log**
+An upstream transport failure below the failover threshold used to return a bare 502 with no
+trace, so intermittent banners could not be correlated with anything. Every transport failure
+now logs `upstream transport failure (<type>)` at WARNING — grep the router log for that
+before suspecting the proxy stack. The usual culprit is the network path underneath: on
+2026-08-20 a VPN on a distant exit pushed connection setup past the old 10s connect limit
+572 times in one evening. New upstream connections now get 30s to establish — the same
+patience Claude Code shows when talking to Anthropic directly — so a slow path degrades to
+slower turns instead of visible errors.
+
 **`Proxy failed to start`**
 Something is already using port 8082. Either stop the other process or change `PORT=8083` in your `.env`.
 
