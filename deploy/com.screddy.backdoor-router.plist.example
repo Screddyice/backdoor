@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.screddy.backdoor-router</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/projects/Screddyice/backdoor-service/.venv/bin/python</string>
+        <string>-m</string>
+        <string>src.proxy.serve</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/you/projects/Screddyice/backdoor-service</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ROUTER_MODE</key>
+        <string>hybrid</string>
+        <key>HOST</key>
+        <string>127.0.0.1</string>
+        <!-- Keep this port equal to FORWARD_ROUTER_PORT below. -->
+        <key>PORT</key>
+        <string>8083</string>
+        <key>LOG_FILE</key>
+        <string>/Users/you/Library/Logs/backdoor-router.log</string>
+        <key>FORWARD_PROXY</key>
+        <string>true</string>
+        <key>FORWARD_ROUTER_PORT</key>
+        <string>8083</string>
+        <key>FORWARD_IDLE_TIMEOUT</key>
+        <string>660</string>
+        <key>FORWARD_MAX_CONNECTIONS</key>
+        <string>512</string>
+    </dict>
+
+    <!-- Each CONNECT tunnel consumes two descriptors. Intercepted Anthropic
+         traffic adds the router-side loopback connection. The launchd default
+         of 256 is too small for several concurrent Claude sessions. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>

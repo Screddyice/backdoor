@@ -1,34 +1,16 @@
 """FastAPI application factory."""
 
 import logging
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from .config import get_settings
 from .client import ProviderClient
+from .logging_config import configure_logging as _configure_logging
 from .routes import router, set_provider_client
 
 logger = logging.getLogger(__name__)
-
-
-def _configure_logging(log_file: str):
-    if logging.root.handlers:
-        return
-    os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
-    open(log_file, "w", encoding="utf-8").close()
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    for noisy in ("uvicorn", "uvicorn.access", "httpx", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -73,6 +55,8 @@ async def lifespan(app: FastAPI):
                 router_host=settings.forward_router_host,
                 router_port=settings.forward_router_port,
                 ca=LocalCA(settings.forward_ca_dir),
+                idle_timeout=settings.forward_idle_timeout,
+                max_connections=settings.forward_max_connections,
             )
             await forward.start()
             logger.info(

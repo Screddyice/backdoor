@@ -46,7 +46,7 @@ import asyncio
 import contextlib
 import logging
 import ssl
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .ca import LocalCA
 
@@ -57,6 +57,10 @@ _MAX_HEADER_BYTES = 64 * 1024
 # A client that opens a socket and sends nothing must not pin a task forever.
 _HEADER_TIMEOUT = 30.0
 _HANDSHAKE_TIMEOUT = 30.0
+# Longer than the router's 600-second Anthropic read timeout. This only closes
+# a tunnel when neither direction has moved a byte for the full interval.
+_IDLE_TIMEOUT = 660.0
+_MAX_CONNECTIONS = 512
 _CHUNK = 64 * 1024
 
 _ESTABLISHED = b"HTTP/1.1 200 Connection Established\r\n\r\n"
@@ -108,13 +112,18 @@ def _close(writer: asyncio.StreamWriter) -> None:
         writer.close()
 
 
-async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def _pipe(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    mark_activity: Callable[[], None],
+) -> None:
     """Copy one direction until EOF, then half-close the far end."""
     try:
         while True:
             data = await reader.read(_CHUNK)
             if not data:
                 break
+            mark_activity()
             writer.write(data)
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, ssl.SSLError, OSError):
@@ -125,6 +134,11 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
         with contextlib.suppress(Exception):
             if writer.can_write_eof():
                 writer.write_eof()
+            else:
+                # TLS transports cannot represent a TCP half-close. Once the
+                # far side has ended its response, close the TLS connection so
+                # the sibling pipe and its descriptors cannot remain pending.
+                writer.close()
 
 
 async def _splice(
@@ -132,12 +146,42 @@ async def _splice(
     a_writer: asyncio.StreamWriter,
     b_reader: asyncio.StreamReader,
     b_writer: asyncio.StreamWriter,
+    *,
+    idle_timeout: float = _IDLE_TIMEOUT,
 ) -> None:
-    await asyncio.gather(
-        _pipe(a_reader, b_writer),
-        _pipe(b_reader, a_writer),
-        return_exceptions=True,
-    )
+    """Relay both directions, preserving half-close but bounding dead peers."""
+    loop = asyncio.get_running_loop()
+    last_activity = [loop.time()]
+
+    def mark_activity() -> None:
+        last_activity[0] = loop.time()
+
+    async def wait_until_idle() -> None:
+        while True:
+            remaining = idle_timeout - (loop.time() - last_activity[0])
+            if remaining <= 0:
+                return
+            await asyncio.sleep(remaining)
+
+    pipes = [
+        asyncio.create_task(_pipe(a_reader, b_writer, mark_activity)),
+        asyncio.create_task(_pipe(b_reader, a_writer, mark_activity)),
+    ]
+    idle = asyncio.create_task(wait_until_idle())
+    try:
+        while not all(pipe.done() for pipe in pipes):
+            pending = [pipe for pipe in pipes if not pipe.done()]
+            if not idle.done():
+                pending.append(idle)
+            await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if idle.done():
+                logger.info("closing forward-proxy tunnel after %.0fs idle", idle_timeout)
+                break
+    finally:
+        for task in [*pipes, idle]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pipes, idle, return_exceptions=True)
 
 
 class ForwardProxy:
@@ -152,6 +196,8 @@ class ForwardProxy:
         router_host: str = "127.0.0.1",
         router_port: int = 8083,
         ca: LocalCA,
+        idle_timeout: float = _IDLE_TIMEOUT,
+        max_connections: int = _MAX_CONNECTIONS,
     ) -> None:
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -159,13 +205,17 @@ class ForwardProxy:
         self.router_host = router_host
         self.router_port = router_port
         self.ca = ca
+        self.idle_timeout = idle_timeout
+        self.max_connections = max_connections
         self._server: asyncio.AbstractServer | None = None
+        self._connections: set[asyncio.Task[None]] = set()
+        self._connection_writers: set[asyncio.StreamWriter] = set()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
-            self._handle, self.listen_host, self.listen_port
+            self._accept, self.listen_host, self.listen_port
         )
         logger.info(
             "CONNECT forward proxy on %s:%d — intercepting %s → %s:%d",
@@ -177,12 +227,25 @@ class ForwardProxy:
         )
 
     async def stop(self) -> None:
-        if self._server is None:
-            return
-        self._server.close()
-        with contextlib.suppress(Exception):
-            await self._server.wait_closed()
+        server = self._server
         self._server = None
+        if server is not None:
+            server.close()
+
+        # Python 3.12's Server.wait_closed() waits for active client handlers,
+        # so cancel them before awaiting the listener shutdown.
+        current = asyncio.current_task()
+        connections = [task for task in self._connections if task is not current]
+        for writer in list(self._connection_writers):
+            _close(writer)
+        for task in connections:
+            task.cancel()
+        if connections:
+            await asyncio.gather(*connections, return_exceptions=True)
+
+        if server is not None:
+            with contextlib.suppress(Exception):
+                await server.wait_closed()
 
     @property
     def port(self) -> int:
@@ -192,6 +255,36 @@ class ForwardProxy:
         return self._server.sockets[0].getsockname()[1]
 
     # ── connection handling ──────────────────────────────────────────────────
+
+    def _accept(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Register the handler synchronously so stop() cannot miss it."""
+        handler = (
+            self._reject
+            if len(self._connections) >= self.max_connections
+            else self._handle
+        )
+        task = asyncio.create_task(handler(reader, writer))
+        self._connections.add(task)
+        self._connection_writers.add(writer)
+
+        def unregister(done: asyncio.Task[None]) -> None:
+            self._connections.discard(done)
+            self._connection_writers.discard(writer)
+
+        task.add_done_callback(unregister)
+
+    async def _reject(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        del reader
+        writer.write(
+            _error(503, "Service Unavailable", "too many proxy connections\n")
+        )
+        with contextlib.suppress(Exception):
+            await writer.drain()
+        _close(writer)
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -311,7 +404,13 @@ class ForwardProxy:
                 writer.start_tls(ctx), timeout=_HANDSHAKE_TIMEOUT
             )
 
-            await _splice(reader, writer, r_reader, r_writer)
+            await _splice(
+                reader,
+                writer,
+                r_reader,
+                r_writer,
+                idle_timeout=self.idle_timeout,
+            )
         except (ssl.SSLError, ConnectionResetError, TimeoutError) as exc:
             # A client that does not trust our CA aborts here. Expected whenever
             # something other than the configured launcher hits the proxy.
@@ -337,6 +436,12 @@ class ForwardProxy:
         try:
             writer.write(_ESTABLISHED)
             await writer.drain()
-            await _splice(reader, writer, t_reader, t_writer)
+            await _splice(
+                reader,
+                writer,
+                t_reader,
+                t_writer,
+                idle_timeout=self.idle_timeout,
+            )
         finally:
             _close(t_writer)

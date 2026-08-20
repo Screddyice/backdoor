@@ -1,5 +1,6 @@
 import os
 from functools import lru_cache
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -163,12 +164,16 @@ class Settings(BaseSettings):
     forward_mitm_hosts: str = "api.anthropic.com"
 
     # Where the intercepted plaintext is delivered. Deliberately NOT `port`
-    # above: the hybrid instance is launched by launchd as
-    # `uvicorn --port 8083`, a CLI flag pydantic never sees, so `port` still
-    # reads 8082 in that process and reusing it would splice into the wrong
-    # server (or nothing at all).
+    # above: the hybrid LaunchAgent sets both PORT and FORWARD_ROUTER_PORT to
+    # 8083. They remain separate settings because other deployment modes can
+    # forward to a router in another process.
     forward_router_host: str = "127.0.0.1"
     forward_router_port: int = 8083
+
+    # Close a tunnel only after both directions have been byte-idle longer than
+    # the router's 600-second Anthropic read timeout.
+    forward_idle_timeout: float = Field(default=660.0, gt=0, allow_inf_nan=False)
+    forward_max_connections: int = Field(default=512, ge=1)
 
     # Shares ~/.backdoor with the failover breaker's published state.
     forward_ca_dir: str = "~/.backdoor/ca"

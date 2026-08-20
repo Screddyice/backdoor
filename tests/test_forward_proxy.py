@@ -24,6 +24,8 @@ Client work runs in threads via `asyncio.to_thread`: blocking sockets express
 import asyncio
 import socket
 import ssl
+import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -60,7 +62,7 @@ def _read_all(sock: socket.socket) -> bytes:
     while True:
         try:
             chunk = sock.recv(4096)
-        except (ssl.SSLError, OSError):
+        except (ssl.SSLError, ConnectionResetError):
             break
         if not chunk:
             break
@@ -117,6 +119,74 @@ class EchoServer:
         return self._server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+
+class HalfCloseServer:
+    """A peer that responds after EOF or stays silent until released."""
+
+    def __init__(self, response: bytes | None, *, delay: float = 0.0) -> None:
+        self.response = response
+        self.delay = delay
+        self._server: asyncio.AbstractServer | None = None
+        self._release = asyncio.Event()
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+
+    async def _handle(self, reader, writer) -> None:
+        try:
+            await reader.read()
+            if self.response is None:
+                await self._release.wait()
+            else:
+                await asyncio.sleep(self.delay)
+                writer.write(self.response)
+                await writer.drain()
+        finally:
+            writer.close()
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return self._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        self._release.set()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+
+class HeartbeatServer:
+    """Send enough downstream activity to outlive an absolute timeout."""
+
+    def __init__(self) -> None:
+        self._server: asyncio.AbstractServer | None = None
+        self._release = asyncio.Event()
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+
+    async def _handle(self, reader, writer) -> None:
+        try:
+            for _ in range(4):
+                await asyncio.sleep(0.05)
+                writer.write(b"x")
+                await writer.drain()
+            await self._release.wait()
+        finally:
+            writer.close()
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return self._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        self._release.set()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -285,3 +355,239 @@ async def test_reports_an_unreachable_tunnel_target_as_502(proxy):
         return _read_headers(sock)
 
     assert b"502" in await asyncio.to_thread(client)
+
+
+async def test_tunnel_preserves_half_close_for_a_delayed_response(tmp_path, router):
+    peer = HalfCloseServer(b"response-after-eof", delay=0.03)
+    await peer.start()
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+        idle_timeout=0.5,
+    )
+    await proxy.start()
+    try:
+        def client() -> bytes:
+            sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=1)
+            sock.sendall(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+            assert b"200" in _read_headers(sock)
+            sock.sendall(b"request")
+            sock.shutdown(socket.SHUT_WR)
+            return _read_all(sock)
+
+        assert await asyncio.to_thread(client) == b"response-after-eof"
+    finally:
+        await proxy.stop()
+        await peer.stop()
+
+
+async def test_tunnel_releases_a_silent_peer_after_idle_timeout(tmp_path, router):
+    peer = HalfCloseServer(None)
+    await peer.start()
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+        idle_timeout=0.05,
+    )
+    await proxy.start()
+    try:
+        def client() -> bytes:
+            sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=1)
+            sock.sendall(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+            assert b"200" in _read_headers(sock)
+            sock.sendall(b"request")
+            sock.shutdown(socket.SHUT_WR)
+            return sock.recv(1)
+
+        assert await asyncio.to_thread(client) == b""
+    finally:
+        await proxy.stop()
+        await peer.stop()
+
+
+async def test_upstream_bytes_reset_the_shared_idle_deadline(tmp_path, router):
+    peer = HalfCloseServer(None)
+    await peer.start()
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+        idle_timeout=0.15,
+    )
+    await proxy.start()
+    try:
+        def client() -> bytes:
+            sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=1)
+            sock.sendall(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+            assert b"200" in _read_headers(sock)
+            for _ in range(4):
+                sock.sendall(b"x")
+                sock.settimeout(0.02)
+                with pytest.raises(socket.timeout):
+                    sock.recv(1)
+                time.sleep(0.03)
+            sock.settimeout(1)
+            return sock.recv(1)
+
+        assert await asyncio.to_thread(client) == b""
+    finally:
+        await proxy.stop()
+        await peer.stop()
+
+
+async def test_downstream_bytes_reset_the_shared_idle_deadline(tmp_path, router):
+    peer = HeartbeatServer()
+    await peer.start()
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+        idle_timeout=0.15,
+    )
+    await proxy.start()
+    try:
+        def client() -> tuple[bytes, bytes]:
+            sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=1)
+            sock.sendall(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+            assert b"200" in _read_headers(sock)
+            received = b""
+            while len(received) < 4:
+                received += sock.recv(4 - len(received))
+            return received, sock.recv(1)
+
+        assert await asyncio.to_thread(client) == (b"xxxx", b"")
+    finally:
+        await proxy.stop()
+        await peer.stop()
+
+
+async def test_rejects_connections_above_the_active_tunnel_cap(tmp_path, router):
+    peer = HalfCloseServer(None)
+    await peer.start()
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+        idle_timeout=10,
+        max_connections=2,
+    )
+    await proxy.start()
+    clients: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+    try:
+        for _ in range(2):
+            reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
+            writer.write(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+            await writer.drain()
+            assert b"200" in await reader.readuntil(b"\r\n\r\n")
+            clients.append((reader, writer))
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
+        writer.write(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+        await writer.drain()
+        assert b"503" in await reader.readuntil(b"\r\n\r\n")
+        writer.close()
+    finally:
+        for _, writer in clients:
+            writer.close()
+        await proxy.stop()
+        await peer.stop()
+
+
+async def test_stop_closes_active_tunnels_without_waiting_for_idle_timeout(
+    tmp_path, router
+):
+    peer = HalfCloseServer(None)
+    await peer.start()
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+        idle_timeout=10,
+    )
+    await proxy.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
+    try:
+        writer.write(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+        await writer.drain()
+        assert b"200" in await reader.readuntil(b"\r\n\r\n")
+
+        await asyncio.wait_for(proxy.stop(), timeout=0.2)
+
+        assert await asyncio.wait_for(reader.read(), timeout=0.2) == b""
+        assert proxy._connections == set()
+    finally:
+        writer.close()
+        await proxy.stop()
+        await peer.stop()
+
+
+async def test_accept_registers_handler_before_the_event_loop_can_run(
+    tmp_path, router
+):
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+    )
+    reader = asyncio.StreamReader()
+    writer = MagicMock(spec=asyncio.StreamWriter)
+
+    proxy._accept(reader, writer)
+
+    assert len(proxy._connections) == 1
+    await asyncio.wait_for(proxy.stop(), timeout=0.2)
+    assert proxy._connections == set()
+    writer.close.assert_called_once()
+
+
+async def test_eof_does_not_extend_the_byte_idle_deadline(tmp_path, router):
+    peer = HalfCloseServer(None)
+    await peer.start()
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+        idle_timeout=0.3,
+    )
+    await proxy.start()
+    try:
+        def client() -> bytes:
+            sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=1)
+            sock.sendall(f"CONNECT 127.0.0.1:{peer.port} HTTP/1.1\r\n\r\n".encode())
+            assert b"200" in _read_headers(sock)
+            sock.sendall(b"request")
+            time.sleep(0.25)
+            sock.shutdown(socket.SHUT_WR)
+            sock.settimeout(0.15)
+            return sock.recv(1)
+
+        assert await asyncio.to_thread(client) == b""
+    finally:
+        await proxy.stop()
+        await peer.stop()

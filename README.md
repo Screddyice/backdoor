@@ -222,7 +222,10 @@ cd ~/projects/Screddyice/backdoor-service && git fetch origin && git checkout <s
 launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
 ```
 
-A dev-clone process started by hand on the same port hides this completely, because it answers first and serves current code. Kill it and the stale service takes over, which reads as a sudden unexplained regression. Confirm which one is live with `pgrep -fl "uvicorn src.proxy.app"` and compare its interpreter path against the LaunchAgent's.
+A dev-clone process started by hand on the same port hides this completely, because it answers
+first and serves current code. Kill it and the stale service takes over, which reads as a sudden
+unexplained regression. Confirm which one is live with `pgrep -fl "src.proxy.serve"` and compare
+its interpreter path against the LaunchAgent's.
 
 
 
@@ -344,6 +347,29 @@ pool, closes it, and retries the request once. Check `router.log` for
 `Anthropic connection pool exhausted; rotated pool and retrying once`. A second timeout still
 reaches Claude Code so its normal retry and failover behavior stays intact.
 
+**Give the macOS service enough file descriptors.** A CONNECT proxy holds one client socket and
+one upstream socket for each tunnel. Intercepted Anthropic traffic also crosses the loopback
+router. The launchd default of 256 files can run out when several Claude sessions start together,
+which makes new streams fail with `ECONNRESET` and writes `OSError: [Errno 24] Too many open files`
+to the router log. The example LaunchAgent at
+`deploy/com.screddy.backdoor-router.plist.example` sets `NumberOfFiles` to 4096. Existing jobs
+must copy that `SoftResourceLimits` block, switch `ProgramArguments` to
+`python -m src.proxy.serve`, and move the old uvicorn host and port flags into the `HOST` and
+`PORT` environment keys shown in the example. The startup-safe launcher creates bounded logging
+before uvicorn imports the application. Replace every `/Users/you` placeholder before installing
+the file. `kickstart` does not reload a changed plist. Boot out the loaded definition, bootstrap
+the file, then confirm the applied limit:
+
+```bash
+launchctl bootout --wait gui/$(id -u)/com.screddy.backdoor-router
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.screddy.backdoor-router.plist"
+launchctl print gui/$(id -u)/com.screddy.backdoor-router | grep -A3 resource-limits
+```
+
+The example writes application logs to `~/Library/Logs/backdoor-router.log`. Backdoor rotates
+that file at 10 MiB and keeps three backups; launchd output goes to `/dev/null` so it cannot
+create a second, unbounded copy under `/tmp`.
+
 **Only allowlisted hosts are inspected.** `FORWARD_MITM_HOSTS` defaults to `api.anthropic.com`; everything else — Composio, npm, your MCP servers, and the Remote Control bridge to claude.ai — is relayed as opaque bytes, so nothing else can have its TLS broken by a proxy it never asked for.
 
 **About the CA.** Reading a CONNECT tunnel means presenting a certificate for a host you do not own, so Backdoor mints one from a CA at `~/.backdoor/ca` (key `0600`). It is **never** installed into the system keychain: the only thing that trusts it is a process you hand `NODE_EXTRA_CA_CERTS` to. Every other program on the machine rejects anything it signs. Delete the directory to revoke it; it regenerates on next use.
@@ -354,6 +380,8 @@ reaches Claude Code so its normal retry and failover behavior stays intact.
 | `FORWARD_PORT` | `8084` | Port it listens on |
 | `FORWARD_MITM_HOSTS` | `api.anthropic.com` | Hosts to intercept; all others tunnel blind |
 | `FORWARD_ROUTER_PORT` | `8083` | Where intercepted traffic is delivered |
+| `FORWARD_IDLE_TIMEOUT` | `660` | Close a tunnel after both directions remain byte-idle this many seconds |
+| `FORWARD_MAX_CONNECTIONS` | `512` | Reject excess tunnels before they can consume upstream descriptors |
 | `FORWARD_CA_DIR` | `~/.backdoor/ca` | CA and minted leaves |
 
 Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
@@ -389,7 +417,9 @@ git -C ../backdoor-service checkout --detach origin/main
 launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
 ```
 
-The tradeoff is that editing code in your clone no longer deploys. That is the point: a restart can no longer pick up half-finished work, and the router's logs move to the service checkout with it.
+The tradeoff is that editing code in your clone no longer deploys. That is the point: a restart
+can no longer pick up half-finished work. The example LaunchAgent writes the rotating router log
+to `~/Library/Logs/backdoor-router.log`.
 
 One launchd wrinkle if you script that swap: `launchctl bootout` returns before teardown finishes, so an immediate `bootstrap` fails with `Bootstrap failed: 5: Input/output error`. Poll `launchctl print gui/$(id -u)/<label>` until it errors, then bootstrap.
 
