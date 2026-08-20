@@ -57,14 +57,30 @@ def _get_profile_client(profile: str, psettings: Settings) -> ProviderClient:
     return _profile_clients[profile]
 
 
+def _new_upstream_client(settings: Settings) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=settings.anthropic_upstream,
+        timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=5.0),
+    )
+
+
 def _get_upstream(settings: Settings) -> httpx.AsyncClient:
     global _upstream_client
     if _upstream_client is None:
-        _upstream_client = httpx.AsyncClient(
-            base_url=settings.anthropic_upstream,
-            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=5.0),
-        )
+        _upstream_client = _new_upstream_client(settings)
     return _upstream_client
+
+
+def _rotate_upstream(
+    settings: Settings,
+    poisoned: httpx.AsyncClient,
+) -> tuple[httpx.AsyncClient, bool]:
+    """Replace one exhausted shared pool without racing concurrent requests."""
+    global _upstream_client
+    if _upstream_client is poisoned:
+        _upstream_client = _new_upstream_client(settings)
+        return _upstream_client, True
+    return _get_upstream(settings), False
 
 
 # Hop-by-hop / transport headers we must not forward. Note accept-encoding IS
@@ -97,8 +113,21 @@ async def _upstream_send(request: Request, body: bytes, settings: Settings) -> h
     headers.setdefault("accept-encoding", "identity")
     url = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     upstream = _get_upstream(settings)
-    ureq = upstream.build_request(request.method, url, content=body, headers=headers)
-    return await upstream.send(ureq, stream=True)
+    for attempt in range(2):
+        ureq = upstream.build_request(request.method, url, content=body, headers=headers)
+        try:
+            return await upstream.send(ureq, stream=True)
+        except httpx.PoolTimeout:
+            if attempt:
+                raise
+            poisoned = upstream
+            upstream, rotated = _rotate_upstream(settings, poisoned)
+            if rotated:
+                logger.warning(
+                    "Anthropic connection pool exhausted; rotated pool and retrying once"
+                )
+                await poisoned.aclose()
+    raise RuntimeError("unreachable")
 
 
 def _relay_upstream(uresp: httpx.Response) -> StreamingResponse:
