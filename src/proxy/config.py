@@ -48,17 +48,16 @@ class Settings(BaseSettings):
     # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
     failover_profile: str = "local-failover-qwen27"  # default tier
-    # 2, not 3. Measured 2026-08-09 against a dead upstream: Claude Code retries
-    # persistently with backoff (9+ attempts over 107s), so reaching a threshold
-    # is never the problem — the wait is. Three failures cost ~15-20s before the
-    # breaker even asks whether the host is offline, and the model then needs
-    # ~10s to load, so the user stares at errors for ~30s.
+    # Probe on the first transport failure. The connectivity probe remains the
+    # safety gate: local failover opens only when the host is offline. Waiting
+    # for a second Claude retry exposed one avoidable API error before asking
+    # the question that decides whether local failover is allowed.
     #
-    # Dropping to 2 is safe because the threshold was never the real guard: the
+    # Dropping to 1 is safe because the threshold was never the real guard: the
     # connectivity probe is. A run of failures only opens the breaker if a TCP
     # probe to a public address also fails, so a single transient blip still
     # cannot claim the GPU. The third failure bought latency, not safety.
-    failover_threshold: int = 2
+    failover_threshold: int = 1
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
 

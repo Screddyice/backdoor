@@ -117,16 +117,22 @@ async def _upstream_send(request: Request, body: bytes, settings: Settings) -> h
         ureq = upstream.build_request(request.method, url, content=body, headers=headers)
         try:
             return await upstream.send(ureq, stream=True)
-        except httpx.PoolTimeout:
+        except httpx.TransportError as exc:
             if attempt:
                 raise
-            poisoned = upstream
-            upstream, rotated = _rotate_upstream(settings, poisoned)
-            if rotated:
+            if isinstance(exc, httpx.PoolTimeout):
+                poisoned = upstream
+                upstream, rotated = _rotate_upstream(settings, poisoned)
+                if rotated:
+                    logger.warning(
+                        "Anthropic connection pool exhausted; rotated pool and retrying once"
+                    )
+                    await poisoned.aclose()
+            else:
                 logger.warning(
-                    "Anthropic connection pool exhausted; rotated pool and retrying once"
+                    "Anthropic transport failed (%s); retrying once before failover",
+                    type(exc).__name__,
                 )
-                await poisoned.aclose()
     raise RuntimeError("unreachable")
 
 
