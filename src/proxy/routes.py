@@ -58,9 +58,14 @@ def _get_profile_client(profile: str, psettings: Settings) -> ProviderClient:
 
 
 def _new_upstream_client(settings: Settings) -> httpx.AsyncClient:
+    # connect=30: connect covers DNS + TCP + TLS over a path we do not control.
+    # 2026-08-20 a VPN detour (~264ms/hop, high jitter) pushed setup past the
+    # old 10s limit 572 times in one evening, each one a user-visible retry
+    # banner. Claude Code talking to Anthropic directly just waits out a slow
+    # connect, so the router must extend the same tolerance.
     return httpx.AsyncClient(
         base_url=settings.anthropic_upstream,
-        timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=5.0),
+        timeout=httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=5.0),
     )
 
 
@@ -176,6 +181,11 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
     try:
         uresp = await _upstream_send(request, body, settings)
     except httpx.TransportError as e:
+        # Below the breaker threshold this becomes a bare 502 with no other
+        # trace, yet the client renders a retry banner for it — the 2026-08-20
+        # VPN diagnosis meant correlating banners against a log that never
+        # mentioned them. Every transport failure gets a line.
+        logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
         if br.record_failure(type(e).__name__):
             return None
         raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
