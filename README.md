@@ -60,6 +60,27 @@ If you're an individual developer, that's the difference between a credit card b
 
 The harness is free. The intelligence is cheap. That's the whole point.
 
+### Measure it for your own usage
+
+`scripts/claude-savings-report.py` turns the numbers above into a weekly report on *your*
+traffic. It reads Claude Code's own transcript logs (`~/.claude/projects/**/*.jsonl`), separates
+turns actually routed through Backdoor (local Ollama, OpenRouter) from turns that went straight
+to Claude, and reports $ saved against what that same work would have cost at metered API
+pricing.
+
+Prompt caching is tracked as a separate efficiency stat, never counted as dollars saved — on a
+flat-rate subscription plan there's no per-token bill for it to discount off of.
+
+```bash
+python3 scripts/claude-savings-report.py --days 7   # print a report
+python3 scripts/claude-savings-report.py --dry-run   # preview, writes and emails nothing
+```
+
+Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
+`SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it. Every counterfactual — the pricing
+model, the subscription cost, the plan's usage band — is a tunable env var documented in the
+script's own header.
+
 ---
 
 ## What you actually get
