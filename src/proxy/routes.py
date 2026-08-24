@@ -16,6 +16,7 @@ from .config import (
 )
 from .bare import make_bare, parse_keep
 from .failover import FAILOVER_STATUSES, FailoverBreaker
+from . import ollama_admin
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -58,9 +59,14 @@ def _get_profile_client(profile: str, psettings: Settings) -> ProviderClient:
 
 
 def _new_upstream_client(settings: Settings) -> httpx.AsyncClient:
+    # connect=30: connect covers DNS + TCP + TLS over a path we do not control.
+    # 2026-08-20 a VPN detour (~264ms/hop, high jitter) pushed setup past the
+    # old 10s limit 572 times in one evening, each one a user-visible retry
+    # banner. Claude Code talking to Anthropic directly just waits out a slow
+    # connect, so the router must extend the same tolerance.
     return httpx.AsyncClient(
         base_url=settings.anthropic_upstream,
-        timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=5.0),
+        timeout=httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=5.0),
     )
 
 
@@ -146,10 +152,44 @@ def _relay_upstream(uresp: httpx.Response) -> StreamingResponse:
     )
 
 
-async def _anthropic_passthrough(request: Request, body: bytes, settings: Settings):
+async def _guarded_passthrough(request: Request, body: bytes, settings: Settings):
     """Forward a request byte-faithfully to the real Anthropic API and stream
-    the response back untouched (auth headers, SSE framing and all)."""
-    return _relay_upstream(await _upstream_send(request, body, settings))
+    the response back untouched (auth headers, SSE framing and all), catching
+    and counting a transport failure instead of raising it.
+
+    Returns the relayed response, or None when upstream could not be reached
+    and the caller must decide what to serve instead.
+
+    Guards rather than raises because the plain passthrough this replaces was
+    reachable from three handlers that had no `except` around it. A
+    ConnectTimeout there escaped as an unhandled ASGI exception, and uvicorn's
+    only answer to that mid-response is to tear the client connection down —
+    which Claude Code renders as `Connection dropped (ECONNRESET)`, the
+    2026-08-24 incident. The client then retried into the same unguarded
+    handler, so the banner counted to 10 while the router logged tracebacks
+    instead of the one line that says what failed.
+
+    The second half of the bug was quieter and worse: those failures never
+    reached :meth:`FailoverBreaker.record_failure`. /v1/messages/count_tokens
+    fires on nearly every turn, so during a real outage most of the evidence
+    that Anthropic was unreachable was raised and discarded — the breaker
+    counted a fraction of the failures and took correspondingly longer to open,
+    or never reached the threshold inside its window at all. Recording here is
+    evidence-gathering only; the breaker still decides on its own terms, and
+    :func:`internet_reachable` still has the final say on opening.
+
+    Deliberately does NOT call record_success. Closing the breaker obliges the
+    caller to release the local tiers it claimed (see `_try_upstream`), and only
+    the /v1/messages path knows how to do that; a bare success here would close
+    the breaker and leave a qwen tier resident with nothing to unload it.
+    """
+    try:
+        uresp = await _upstream_send(request, body, settings)
+    except httpx.TransportError as e:
+        logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
+        get_breaker(settings).record_failure(type(e).__name__)
+        return None
+    return _relay_upstream(uresp)
 
 
 # ── Cloud→local failover ─────────────────────────────────────────────────────
@@ -182,6 +222,11 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
     try:
         uresp = await _upstream_send(request, body, settings)
     except httpx.TransportError as e:
+        # Below the breaker threshold this becomes a bare 502 with no other
+        # trace, yet the client renders a retry banner for it — the 2026-08-20
+        # VPN diagnosis meant correlating banners against a log that never
+        # mentioned them. Every transport failure gets a line.
+        logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
         if br.record_failure(type(e).__name__):
             return None
         raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
@@ -194,7 +239,19 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         # Below the threshold: relay the error verbatim so the client's own
         # retry/backoff logic still runs (a lone 429 is normal backpressure).
         return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
+    was_open = br.open
     br.record_success()
+    if was_open:
+        # The breaker just closed, so every tier it caused to be loaded is now
+        # dead weight. Release them here rather than leaving it to Ollama's idle
+        # timer: this is the exact moment the GPU stopped being needed, and the
+        # timer is both longer (5m global) and refreshed by every request the
+        # outage generated, so a busy outage releases LATER than a quiet one.
+        # Awaited, not backgrounded — it is a localhost call with a 5s cap, and
+        # a detached task could outlive the request and unload a tier a fresh
+        # outage had already re-claimed.
+        for base_url, model in br.drain_claims():
+            await ollama_admin.unload(base_url, model)
     return _relay_upstream(uresp)
 
 
@@ -253,6 +310,10 @@ async def create_message(
     # Set only when the failover path successfully stripped the harness; it then
     # replaces the parsed request below so the stripped version is what is sent.
     bare_req: MessagesRequest | None = None
+    # True only for requests the BREAKER diverted, never for a deliberate
+    # `/model qwen`. Decides whether the tier this request loads is one the
+    # router may clamp and later evict on its own — see ollama_admin.
+    failed_over = False
 
     if settings.router_mode == "hybrid":
         model = _model_from_body(body)
@@ -260,7 +321,10 @@ async def create_message(
         if profile is None:
             if not settings.failover_to_local:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
-                return await _anthropic_passthrough(request, body, settings)
+                relayed = await _guarded_passthrough(request, body, settings)
+                if relayed is None:
+                    raise HTTPException(status_code=502, detail="Anthropic unreachable")
+                return relayed
             relay = await _try_upstream(request, body, settings)
             if relay is not None:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
@@ -270,6 +334,7 @@ async def create_message(
             # should choose the profile. Sizing on the raw body would escalate to
             # a big-window tier for a session that, once bare, fits the default
             # one comfortably.
+            failed_over = True
             profile = settings.failover_profile
             est = raw_est = None
             try:
@@ -393,6 +458,21 @@ async def create_message(
     provider = settings.provider_model
     logger.info("→ %s [%s] tools=%s in≈%s | %r", provider, mode, len(req.tools or []), est_in, preview)
 
+    if failed_over:
+        # Placed after every escalation branch, so the tier recorded is the one
+        # actually about to serve — a TIER ESCALATE above can swap the model out
+        # from under the profile chosen at the top, and unloading the wrong name
+        # would leave the real 13 GB tier resident.
+        br = get_breaker(get_settings())
+        br.note_claim(settings.provider_base_url, provider)
+        # Re-clamped per request because Ollama resets the timer to the global
+        # OLLAMA_KEEP_ALIVE on every inference call; setting it once at load
+        # would be undone by the second request of the outage.
+        if settings.provider_keep_alive:
+            await ollama_admin.set_keep_alive(
+                settings.provider_base_url, provider, settings.provider_keep_alive
+            )
+
     if req.stream:
         input_tokens = est_in
         return StreamingResponse(
@@ -467,7 +547,15 @@ async def count_tokens(request: Request, settings: Settings = Depends(get_settin
     if settings.router_mode == "hybrid" and _model_from_body(body) not in MODEL_ROUTES:
         # While the failover breaker is open, count locally instead of failing.
         if not (settings.failover_to_local and get_breaker(settings).open):
-            return await _anthropic_passthrough(request, body, settings)
+            relayed = await _guarded_passthrough(request, body, settings)
+            if relayed is not None:
+                return relayed
+            # Upstream is unreachable. Fall through to the local counter rather
+            # than failing the request: counting is arithmetic over the body, so
+            # unlike a completion it needs no model, no tier and no GPU. This is
+            # the one passthrough that can always answer offline, and answering
+            # keeps a session usable through a blip the breaker has not yet
+            # opened on.
     req = TokenCountRequest.model_validate_json(body)
     return TokenCountResponse(input_tokens=count_messages(req.messages, req.system, req.tools))
 
@@ -484,4 +572,9 @@ async def health():
 async def passthrough_any(path: str, request: Request, settings: Settings = Depends(get_settings)):
     if settings.router_mode != "hybrid":
         raise HTTPException(status_code=404, detail="Not found")
-    return await _anthropic_passthrough(request, await request.body(), settings)
+    relayed = await _guarded_passthrough(request, await request.body(), settings)
+    if relayed is None:
+        # No local equivalent for an arbitrary endpoint, so the failure has to
+        # surface — but as a 502 the client can retry, not a dropped connection.
+        raise HTTPException(status_code=502, detail="Anthropic unreachable")
+    return relayed

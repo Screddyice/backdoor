@@ -60,6 +60,27 @@ If you're an individual developer, that's the difference between a credit card b
 
 The harness is free. The intelligence is cheap. That's the whole point.
 
+### Measure it for your own usage
+
+`scripts/claude-savings-report.py` turns the numbers above into a weekly report on *your*
+traffic. It reads Claude Code's own transcript logs (`~/.claude/projects/**/*.jsonl`), separates
+turns actually routed through Backdoor (local Ollama, OpenRouter) from turns that went straight
+to Claude, and reports $ saved against what that same work would have cost at metered API
+pricing.
+
+Prompt caching is tracked as a separate efficiency stat, never counted as dollars saved — on a
+flat-rate subscription plan there's no per-token bill for it to discount off of.
+
+```bash
+python3 scripts/claude-savings-report.py --days 7   # print a report
+python3 scripts/claude-savings-report.py --dry-run   # preview, writes and emails nothing
+```
+
+Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
+`SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it. Every counterfactual — the pricing
+model, the subscription cost, the plan's usage band — is a tunable env var documented in the
+script's own header.
+
 ---
 
 ## What you actually get
@@ -229,6 +250,16 @@ its interpreter path against the LaunchAgent's.
 
 
 
+**`API error · Retrying…` banners in Claude Code, nothing in the router log**
+An upstream transport failure below the failover threshold used to return a bare 502 with no
+trace, so intermittent banners could not be correlated with anything. Every transport failure
+now logs `upstream transport failure (<type>)` at WARNING — grep the router log for that
+before suspecting the proxy stack. The usual culprit is the network path underneath: on
+2026-08-20 a VPN on a distant exit pushed connection setup past the old 10s connect limit
+572 times in one evening. New upstream connections now get 30s to establish — the same
+patience Claude Code shows when talking to Anthropic directly — so a slow path degrades to
+slower turns instead of visible errors.
+
 **`Proxy failed to start`**
 Something is already using port 8082. Either stop the other process or change `PORT=8083` in your `.env`.
 
@@ -276,6 +307,25 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
 > **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
+
+### Every passthrough route feeds the breaker
+
+Four handlers forward to Anthropic: `/v1/messages`, `/v1/messages/count_tokens`, the `/{path:path}` catch-all, and `/v1/messages` again when you set `failover_to_local=false`. All four report a transport failure to the breaker, and none of them let one escape as an unhandled exception.
+
+Until 2026-08-24 only the first did. The other three called the passthrough with no `except` around it, so a `ConnectTimeout` propagated out of the handler, uvicorn dropped the client socket, and Claude Code printed `Connection dropped (ECONNRESET) · Retrying`. Retrying hit the same unguarded handler, so the banner climbed to attempt 8 of 10 while the router log filled with tracebacks rather than the single line naming the failure.
+
+Losing the count was the expensive half. `count_tokens` runs on nearly every turn, so during an outage it produced most of the evidence that Anthropic was unreachable, and every bit of it was raised and thrown away. The breaker saw a fraction of the failures, which pushed it past `failover_window_seconds` before it reached `failover_threshold`.
+
+What each route does now when upstream will not answer:
+
+| Route | Response |
+|---|---|
+| `/v1/messages` (failover on) | Local profile once the breaker opens, `502` below the threshold |
+| `/v1/messages` (failover off) | `502` |
+| `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage |
+| `/{path:path}` | `502` |
+
+Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
 
 ### Forward-proxy mode: failover *and* Remote Control
 
@@ -491,6 +541,33 @@ Set it to the same bound the tier carries in `FAILOVER_LADDER`, so a deliberate 
 
 Sizing happens **after** stripping, matching the failover branch — size the raw body and a bare-able session escalates to the wide 4B tier for no reason, wasting the stronger model. `0` disables the check, which is what the unstripped 64K tiers use.
 
+#### The client has to know the window too
+
+Tier escalation is a reaction. It catches a session that has already outgrown its tier and finds it somewhere wider to land. Nothing in it stops the transcript growing in the first place, and the growth has a cause on the client side.
+
+Claude Code does not recognise the model name `qwen`, so it falls back to assuming a 200K window and sizes auto-compact against that number. The 27B serves 32K. Compaction therefore sat idle through roughly six times the context the model could accept, which is the same 143,490-token session the escalation guard was built to catch, viewed from the other end. The router saw a request too large for its tier. The client saw a session comfortably inside a window that did not exist.
+
+The wrapper now states the real window before launching:
+
+```
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-qwen27
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
+```
+
+Keep the value equal to the profile's actual `num_ctx`. Setting it above the true window restores the original bug in a quieter form, because compaction again waits for a ceiling the model cannot reach. An unknown profile falls back to 32000, the floor, on the principle that compacting early costs a little quality and compacting late costs the session. An explicit `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in the environment still wins, for deliberate experiments.
+
+The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste.
+
+#### Memory is the other half of a small window
+
+A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
+
+This is the one documented exception to the MCP-off rule, and the token arithmetic is why it survives that rule. The global MCP set costs about 142K tokens of schema. The shim exposes `cognee_search` and `cognee_remember` and nothing else, so it costs hundreds. Against a 32K window the first is impossible and the second is affordable.
+
+Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
+
+Degradation is quiet and safe. A missing `COGNEE_API_KEY` falls through to an empty MCP config, so a genuinely offline run still starts. `QWEN_COGNEE=0` forces it off for true-offline work with no network calls at all.
+
 #### The guard has to sit below every routing branch
 
 The paragraph above describes the check on the **hybrid** path, and on its own it does not cover the incident it cites. That pile-up came from a `qwen` wrapper session on `:8082`, which runs `router_mode="profile"` — a mode that translates every request to the single active profile and never enters the hybrid branch at all. A guard living inside that branch cannot see the traffic that actually failed.
@@ -549,6 +626,38 @@ Lean mode now restores both, narrowly:
 - The wrapper runs `auto-pr-push.sh` after the session exits, which is why it no longer `exec`s. That is the same script the Stop hook would have run; it no-ops unless the branch is off trunk, has commits ahead, has no open PR, and belongs to an allowlisted owner, and it refuses any repo with `rs21` in the name.
 
 If you write your own wrapper around `--bare`, assume nothing in `.claude/` applies to that session.
+
+### Releasing the failover tier when the outage ends
+
+Ollama's only release mechanism is one global `OLLAMA_KEEP_ALIVE` (5m here), refreshed by every request. That is the wrong shape for a tier nobody asked for, and it fails worst exactly when it matters most: because each request pushes the timer out, a *busy* outage releases the GPU later than a quiet one.
+
+Measured 2026-08-24 on this host. A ten-minute Anthropic blip opened the breaker at 22:09:31. Seven sessions were live, all long — 242K to 431K tokens post-strip — so every one cleared the ladder's 28K bound and landed on the same `local-failover-256k`:
+
+| | |
+|---|---|
+| Breaker open | 22:09:31 → 22:24:41 (15m 10s) |
+| Requests served locally | 138, peaking at 21/min |
+| GPU allocated | 13.71 GB (9.69 GB in use), 99% utilization |
+| Wired memory | 13.9 GB of 36 GB |
+| Free memory | 25%, with swap at 14.3 GB of 15.36 GB |
+| Tier still resident after close | **~9 minutes** |
+
+Nothing was wrong with the routing. The ladder picked correctly and the breaker closed on time. What was missing was the wiring between "breaker closed" and "tier released", so 9.7 GB of wired memory sat on the machine for nine minutes after the last thing that needed it.
+
+Two guards now, because either alone leaves a hole:
+
+| Guard | Mechanism | Covers |
+|---|---|---|
+| Unload on close | `record_success()` drains the breaker's claims; the caller `POST`s `keep_alive: 0` | The normal case, precisely |
+| `PROVIDER_KEEP_ALIVE` | Failover-only profiles clamp idle residency to `45s` | An outage that ends with sessions abandoned and no successful call to close the breaker |
+
+Both go through Ollama's **native** API. `keep_alive` in a `/v1/chat/completions` body is silently ignored (verified against Ollama 0.32.13) and the model lands on the global default, so the clamp has to be a separate `/api/generate` call. With no `prompt` that call neither generates nor prefills — it returns `done_reason: "load"`, or `"unload"` for `keep_alive: 0`, and only touches the residency timer.
+
+Recovery is not instant. While OPEN the breaker probes upstream once per `failover_probe_seconds` (60s), so it cannot notice Anthropic is back until it is allowed to try. Release lands within about a minute of real recovery, against the nine minutes above.
+
+`PROVIDER_KEEP_ALIVE` is set on `local-failover-256k` and `local-failover-128k` only. Do not set it on a tier reachable through `MODEL_ROUTES`: a deliberate `/model qwen` session that thinks for longer than the clamp would evict its own 17 GB model and reload it next turn, which is slower and more memory churn than leaving it resident. The same rule is why only breaker-diverted requests are claimed at all — the user asked for that tier, so it is not ours to evict.
+
+Everything here is best-effort. A router that cannot reach Ollama's admin endpoint must still route, and the cost of failing is late release, which is the old behaviour rather than an outage.
 
 ### Sizing the failover tier
 

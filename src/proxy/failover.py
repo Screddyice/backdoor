@@ -226,6 +226,9 @@ class FailoverBreaker:
         self._failures = 0
         self._first_failure_at = 0.0
         self._last_probe_at = 0.0
+        # (provider_base_url, model) pairs this breaker has caused to be loaded.
+        # Held so closing can hand them back — see note_claim/drain_claims.
+        self._claims: set[tuple[str, str]] = set()
         self._publish()
 
     def _publish(self) -> None:
@@ -302,8 +305,36 @@ class FailoverBreaker:
                 self._failures = 0
         return self.open
 
+    def note_claim(self, provider_base_url: str, model: str) -> None:
+        """Record that failing over caused `model` to be loaded locally.
+
+        Only meaningful while OPEN. A deliberate `/model qwen` route loads a
+        tier too, but the user asked for that one and it is not ours to evict —
+        the caller is responsible for only reporting failover-path loads.
+        """
+        if model:
+            self._claims.add((provider_base_url, model))
+
+    def drain_claims(self) -> set[tuple[str, str]]:
+        """Take the claimed tiers, clearing them. Caller does the unloading.
+
+        Returning the work instead of doing it keeps this module free of HTTP:
+        the breaker is pure decision logic, tested with a fake clock and no I/O,
+        and adding a network call to it would make every state-machine test
+        need a transport.
+        """
+        claims, self._claims = self._claims, set()
+        return claims
+
     def record_success(self) -> None:
-        """Any non-trigger upstream response: reset, and close if OPEN."""
+        """Any non-trigger upstream response: reset, and close if OPEN.
+
+        Closing leaves the claimed local tiers still resident — the caller must
+        drain_claims() and unload them. This is the moment that matters for
+        memory: the breaker closing is the exact point the GPU is no longer
+        needed, and waiting for Ollama's idle timer instead left ~9.7 GB wired
+        for ~9 minutes past it on 2026-08-24.
+        """
         was_open = self.open
         if was_open:
             logger.warning("failover CLOSED — Anthropic reachable again")
