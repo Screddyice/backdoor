@@ -536,6 +536,33 @@ Set it to the same bound the tier carries in `FAILOVER_LADDER`, so a deliberate 
 
 Sizing happens **after** stripping, matching the failover branch — size the raw body and a bare-able session escalates to the wide 4B tier for no reason, wasting the stronger model. `0` disables the check, which is what the unstripped 64K tiers use.
 
+#### The client has to know the window too
+
+Tier escalation is a reaction. It catches a session that has already outgrown its tier and finds it somewhere wider to land. Nothing in it stops the transcript growing in the first place, and the growth has a cause on the client side.
+
+Claude Code does not recognise the model name `qwen`, so it falls back to assuming a 200K window and sizes auto-compact against that number. The 27B serves 32K. Compaction therefore sat idle through roughly six times the context the model could accept, which is the same 143,490-token session the escalation guard was built to catch, viewed from the other end. The router saw a request too large for its tier. The client saw a session comfortably inside a window that did not exist.
+
+The wrapper now states the real window before launching:
+
+```
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-qwen27
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
+```
+
+Keep the value equal to the profile's actual `num_ctx`. Setting it above the true window restores the original bug in a quieter form, because compaction again waits for a ceiling the model cannot reach. An unknown profile falls back to 32000, the floor, on the principle that compacting early costs a little quality and compacting late costs the session. An explicit `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in the environment still wins, for deliberate experiments.
+
+The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste.
+
+#### Memory is the other half of a small window
+
+A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
+
+This is the one documented exception to the MCP-off rule, and the token arithmetic is why it survives that rule. The global MCP set costs about 142K tokens of schema. The shim exposes `cognee_search` and `cognee_remember` and nothing else, so it costs hundreds. Against a 32K window the first is impossible and the second is affordable.
+
+Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
+
+Degradation is quiet and safe. A missing `COGNEE_API_KEY` falls through to an empty MCP config, so a genuinely offline run still starts. `QWEN_COGNEE=0` forces it off for true-offline work with no network calls at all.
+
 #### The guard has to sit below every routing branch
 
 The paragraph above describes the check on the **hybrid** path, and on its own it does not cover the incident it cites. That pile-up came from a `qwen` wrapper session on `:8082`, which runs `router_mode="profile"` — a mode that translates every request to the single active profile and never enters the hybrid branch at all. A guard living inside that branch cannot see the traffic that actually failed.
