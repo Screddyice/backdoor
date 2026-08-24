@@ -21,6 +21,18 @@ class Settings(BaseSettings):
     provider_top_p: float = 1.0
     provider_reasoning_effort: str = ""
 
+    # Idle residency to clamp this tier to after serving a FAILOVER request, as
+    # an Ollama duration ("45s"). Empty = leave it on Ollama's global
+    # OLLAMA_KEEP_ALIVE (5m here). Local Ollama profiles only; see
+    # src/proxy/ollama_admin.py for why it needs a separate native-API call.
+    #
+    # Set it on tiers that exist ONLY to catch an outage. Do NOT set it on a
+    # tier reachable through MODEL_ROUTES: a deliberate `/model qwen` session
+    # that thinks for longer than the clamp would evict its own 17 GB model and
+    # reload it on the next turn, which is slower and *more* memory churn than
+    # leaving it resident.
+    provider_keep_alive: str = ""
+
     # Router mode:
     #   "profile" (default) — translate EVERY request to the active profile's
     #     OpenAI-compatible backend (classic backdoor behaviour; what the
