@@ -595,6 +595,38 @@ Lean mode now restores both, narrowly:
 
 If you write your own wrapper around `--bare`, assume nothing in `.claude/` applies to that session.
 
+### Releasing the failover tier when the outage ends
+
+Ollama's only release mechanism is one global `OLLAMA_KEEP_ALIVE` (5m here), refreshed by every request. That is the wrong shape for a tier nobody asked for, and it fails worst exactly when it matters most: because each request pushes the timer out, a *busy* outage releases the GPU later than a quiet one.
+
+Measured 2026-08-24 on this host. A ten-minute Anthropic blip opened the breaker at 22:09:31. Seven sessions were live, all long — 242K to 431K tokens post-strip — so every one cleared the ladder's 28K bound and landed on the same `local-failover-256k`:
+
+| | |
+|---|---|
+| Breaker open | 22:09:31 → 22:24:41 (15m 10s) |
+| Requests served locally | 138, peaking at 21/min |
+| GPU allocated | 13.71 GB (9.69 GB in use), 99% utilization |
+| Wired memory | 13.9 GB of 36 GB |
+| Free memory | 25%, with swap at 14.3 GB of 15.36 GB |
+| Tier still resident after close | **~9 minutes** |
+
+Nothing was wrong with the routing. The ladder picked correctly and the breaker closed on time. What was missing was the wiring between "breaker closed" and "tier released", so 9.7 GB of wired memory sat on the machine for nine minutes after the last thing that needed it.
+
+Two guards now, because either alone leaves a hole:
+
+| Guard | Mechanism | Covers |
+|---|---|---|
+| Unload on close | `record_success()` drains the breaker's claims; the caller `POST`s `keep_alive: 0` | The normal case, precisely |
+| `PROVIDER_KEEP_ALIVE` | Failover-only profiles clamp idle residency to `45s` | An outage that ends with sessions abandoned and no successful call to close the breaker |
+
+Both go through Ollama's **native** API. `keep_alive` in a `/v1/chat/completions` body is silently ignored (verified against Ollama 0.32.13) and the model lands on the global default, so the clamp has to be a separate `/api/generate` call. With no `prompt` that call neither generates nor prefills — it returns `done_reason: "load"`, or `"unload"` for `keep_alive: 0`, and only touches the residency timer.
+
+Recovery is not instant. While OPEN the breaker probes upstream once per `failover_probe_seconds` (60s), so it cannot notice Anthropic is back until it is allowed to try. Release lands within about a minute of real recovery, against the nine minutes above.
+
+`PROVIDER_KEEP_ALIVE` is set on `local-failover-256k` and `local-failover-128k` only. Do not set it on a tier reachable through `MODEL_ROUTES`: a deliberate `/model qwen` session that thinks for longer than the clamp would evict its own 17 GB model and reload it next turn, which is slower and more memory churn than leaving it resident. The same rule is why only breaker-diverted requests are claimed at all — the user asked for that tier, so it is not ours to evict.
+
+Everything here is best-effort. A router that cannot reach Ollama's admin endpoint must still route, and the cost of failing is late release, which is the old behaviour rather than an outage.
+
 ### Sizing the failover tier
 
 Ollama caps residency by model count, never by bytes, and Metal allocations are wired and cannot be paged out. Over-commit and this host panics instead of raising OOM. Measure with `ollama ps`, which reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.

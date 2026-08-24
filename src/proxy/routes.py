@@ -16,6 +16,7 @@ from .config import (
 )
 from .bare import make_bare, parse_keep
 from .failover import FAILOVER_STATUSES, FailoverBreaker
+from . import ollama_admin
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -232,7 +233,19 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         # Below the threshold: relay the error verbatim so the client's own
         # retry/backoff logic still runs (a lone 429 is normal backpressure).
         return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
+    was_open = br.open
     br.record_success()
+    if was_open:
+        # The breaker just closed, so every tier it caused to be loaded is now
+        # dead weight. Release them here rather than leaving it to Ollama's idle
+        # timer: this is the exact moment the GPU stopped being needed, and the
+        # timer is both longer (5m global) and refreshed by every request the
+        # outage generated, so a busy outage releases LATER than a quiet one.
+        # Awaited, not backgrounded — it is a localhost call with a 5s cap, and
+        # a detached task could outlive the request and unload a tier a fresh
+        # outage had already re-claimed.
+        for base_url, model in br.drain_claims():
+            await ollama_admin.unload(base_url, model)
     return _relay_upstream(uresp)
 
 
@@ -291,6 +304,10 @@ async def create_message(
     # Set only when the failover path successfully stripped the harness; it then
     # replaces the parsed request below so the stripped version is what is sent.
     bare_req: MessagesRequest | None = None
+    # True only for requests the BREAKER diverted, never for a deliberate
+    # `/model qwen`. Decides whether the tier this request loads is one the
+    # router may clamp and later evict on its own — see ollama_admin.
+    failed_over = False
 
     if settings.router_mode == "hybrid":
         model = _model_from_body(body)
@@ -311,6 +328,7 @@ async def create_message(
             # should choose the profile. Sizing on the raw body would escalate to
             # a big-window tier for a session that, once bare, fits the default
             # one comfortably.
+            failed_over = True
             profile = settings.failover_profile
             est = raw_est = None
             try:
@@ -433,6 +451,21 @@ async def create_message(
     mode = "stream" if req.stream else "complete"
     provider = settings.provider_model
     logger.info("→ %s [%s] tools=%s in≈%s | %r", provider, mode, len(req.tools or []), est_in, preview)
+
+    if failed_over:
+        # Placed after every escalation branch, so the tier recorded is the one
+        # actually about to serve — a TIER ESCALATE above can swap the model out
+        # from under the profile chosen at the top, and unloading the wrong name
+        # would leave the real 13 GB tier resident.
+        br = get_breaker(get_settings())
+        br.note_claim(settings.provider_base_url, provider)
+        # Re-clamped per request because Ollama resets the timer to the global
+        # OLLAMA_KEEP_ALIVE on every inference call; setting it once at load
+        # would be undone by the second request of the outage.
+        if settings.provider_keep_alive:
+            await ollama_admin.set_keep_alive(
+                settings.provider_base_url, provider, settings.provider_keep_alive
+            )
 
     if req.stream:
         input_tokens = est_in
