@@ -145,10 +145,44 @@ def _relay_upstream(uresp: httpx.Response) -> StreamingResponse:
     )
 
 
-async def _anthropic_passthrough(request: Request, body: bytes, settings: Settings):
+async def _guarded_passthrough(request: Request, body: bytes, settings: Settings):
     """Forward a request byte-faithfully to the real Anthropic API and stream
-    the response back untouched (auth headers, SSE framing and all)."""
-    return _relay_upstream(await _upstream_send(request, body, settings))
+    the response back untouched (auth headers, SSE framing and all), catching
+    and counting a transport failure instead of raising it.
+
+    Returns the relayed response, or None when upstream could not be reached
+    and the caller must decide what to serve instead.
+
+    Guards rather than raises because the plain passthrough this replaces was
+    reachable from three handlers that had no `except` around it. A
+    ConnectTimeout there escaped as an unhandled ASGI exception, and uvicorn's
+    only answer to that mid-response is to tear the client connection down —
+    which Claude Code renders as `Connection dropped (ECONNRESET)`, the
+    2026-08-24 incident. The client then retried into the same unguarded
+    handler, so the banner counted to 10 while the router logged tracebacks
+    instead of the one line that says what failed.
+
+    The second half of the bug was quieter and worse: those failures never
+    reached :meth:`FailoverBreaker.record_failure`. /v1/messages/count_tokens
+    fires on nearly every turn, so during a real outage most of the evidence
+    that Anthropic was unreachable was raised and discarded — the breaker
+    counted a fraction of the failures and took correspondingly longer to open,
+    or never reached the threshold inside its window at all. Recording here is
+    evidence-gathering only; the breaker still decides on its own terms, and
+    :func:`internet_reachable` still has the final say on opening.
+
+    Deliberately does NOT call record_success. Closing the breaker obliges the
+    caller to release the local tiers it claimed (see `_try_upstream`), and only
+    the /v1/messages path knows how to do that; a bare success here would close
+    the breaker and leave a qwen tier resident with nothing to unload it.
+    """
+    try:
+        uresp = await _upstream_send(request, body, settings)
+    except httpx.TransportError as e:
+        logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
+        get_breaker(settings).record_failure(type(e).__name__)
+        return None
+    return _relay_upstream(uresp)
 
 
 # ── Cloud→local failover ─────────────────────────────────────────────────────
@@ -264,7 +298,10 @@ async def create_message(
         if profile is None:
             if not settings.failover_to_local:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
-                return await _anthropic_passthrough(request, body, settings)
+                relayed = await _guarded_passthrough(request, body, settings)
+                if relayed is None:
+                    raise HTTPException(status_code=502, detail="Anthropic unreachable")
+                return relayed
             relay = await _try_upstream(request, body, settings)
             if relay is not None:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
@@ -471,7 +508,15 @@ async def count_tokens(request: Request, settings: Settings = Depends(get_settin
     if settings.router_mode == "hybrid" and _model_from_body(body) not in MODEL_ROUTES:
         # While the failover breaker is open, count locally instead of failing.
         if not (settings.failover_to_local and get_breaker(settings).open):
-            return await _anthropic_passthrough(request, body, settings)
+            relayed = await _guarded_passthrough(request, body, settings)
+            if relayed is not None:
+                return relayed
+            # Upstream is unreachable. Fall through to the local counter rather
+            # than failing the request: counting is arithmetic over the body, so
+            # unlike a completion it needs no model, no tier and no GPU. This is
+            # the one passthrough that can always answer offline, and answering
+            # keeps a session usable through a blip the breaker has not yet
+            # opened on.
     req = TokenCountRequest.model_validate_json(body)
     return TokenCountResponse(input_tokens=count_messages(req.messages, req.system, req.tools))
 
@@ -488,4 +533,9 @@ async def health():
 async def passthrough_any(path: str, request: Request, settings: Settings = Depends(get_settings)):
     if settings.router_mode != "hybrid":
         raise HTTPException(status_code=404, detail="Not found")
-    return await _anthropic_passthrough(request, await request.body(), settings)
+    relayed = await _guarded_passthrough(request, await request.body(), settings)
+    if relayed is None:
+        # No local equivalent for an arbitrary endpoint, so the failure has to
+        # surface — but as a 502 the client can retry, not a dropped connection.
+        raise HTTPException(status_code=502, detail="Anthropic unreachable")
+    return relayed

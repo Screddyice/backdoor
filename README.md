@@ -308,6 +308,25 @@ In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the r
 
 > **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
 
+### Every passthrough route feeds the breaker
+
+Four handlers forward to Anthropic: `/v1/messages`, `/v1/messages/count_tokens`, the `/{path:path}` catch-all, and `/v1/messages` again when you set `failover_to_local=false`. All four report a transport failure to the breaker, and none of them let one escape as an unhandled exception.
+
+Until 2026-08-24 only the first did. The other three called the passthrough with no `except` around it, so a `ConnectTimeout` propagated out of the handler, uvicorn dropped the client socket, and Claude Code printed `Connection dropped (ECONNRESET) · Retrying`. Retrying hit the same unguarded handler, so the banner climbed to attempt 8 of 10 while the router log filled with tracebacks rather than the single line naming the failure.
+
+Losing the count was the expensive half. `count_tokens` runs on nearly every turn, so during an outage it produced most of the evidence that Anthropic was unreachable, and every bit of it was raised and thrown away. The breaker saw a fraction of the failures, which pushed it past `failover_window_seconds` before it reached `failover_threshold`.
+
+What each route does now when upstream will not answer:
+
+| Route | Response |
+|---|---|
+| `/v1/messages` (failover on) | Local profile once the breaker opens, `502` below the threshold |
+| `/v1/messages` (failover off) | `502` |
+| `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage |
+| `/{path:path}` | `502` |
+
+Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+
 ### Forward-proxy mode: failover *and* Remote Control
 
 Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
