@@ -1,8 +1,10 @@
 """Async OpenAI-compatible provider client."""
 
+import asyncio
 import json
 import logging
 from typing import AsyncIterator, Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -14,6 +16,8 @@ logger = logging.getLogger(__name__)
 # bytes for several minutes; 120s here silently killed those streams mid-prefill
 # (the client then retried, re-prefilling from scratch — doubling every turn).
 TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=5.0)
+LOCAL_TIMEOUT = httpx.Timeout(connect=120.0, read=600.0, write=60.0, pool=600.0)
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 class ProviderError(Exception):
@@ -26,13 +30,21 @@ class ProviderError(Exception):
 class ProviderClient:
     def __init__(self, settings: Settings):
         self._settings = settings
+        is_local = urlparse(settings.provider_base_url).hostname in _LOCAL_HOSTS
+        self._gate = asyncio.Semaphore(1) if is_local else None
         self._client = httpx.AsyncClient(
             base_url=settings.provider_base_url,
             headers={"Authorization": f"Bearer {settings.provider_api_key}"},
-            timeout=TIMEOUT,
+            timeout=LOCAL_TIMEOUT if is_local else TIMEOUT,
         )
 
     async def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._gate is not None:
+            async with self._gate:
+                return await self._complete(payload)
+        return await self._complete(payload)
+
+    async def _complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = {**payload, "stream": False}
         resp = await self._client.post("/chat/completions", json=payload)
         if resp.status_code != 200:
@@ -40,6 +52,15 @@ class ProviderClient:
         return resp.json()
 
     async def stream(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+        if self._gate is not None:
+            async with self._gate:
+                async for chunk in self._stream(payload):
+                    yield chunk
+            return
+        async for chunk in self._stream(payload):
+            yield chunk
+
+    async def _stream(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         payload = {**payload, "stream": True, "stream_options": {"include_usage": True}}
         async with self._client.stream("POST", "/chat/completions", json=payload) as resp:
             if resp.status_code != 200:

@@ -228,7 +228,12 @@ class _ByteStream(httpx.AsyncByteStream):
 
 
 def _flaky_upstream(fail_times: list[int]) -> httpx.AsyncClient:
-    """Fails the first `fail_times[0]` requests, then answers — an outage that ends."""
+    """Fails the first `fail_times[0]` SENDS, then answers: an outage that ends.
+
+    Counts sends, not client requests. `_upstream_send` retries a transport
+    failure once before giving up, so a caller that wants the breaker to see a
+    failure has to fail both attempts.
+    """
 
     def handler(_request: httpx.Request) -> httpx.Response:
         if fail_times[0] > 0:
@@ -277,7 +282,10 @@ def _huge_request() -> dict:
 
 @pytest.mark.asyncio
 async def test_outage_claims_and_clamps_then_recovery_unloads(monkeypatch, fake_http):
-    routes._upstream_client = _flaky_upstream([1])
+    # 2, not 1: `_upstream_send` absorbs a single transport failure by retrying
+    # once, which is the point of that retry — one blip must not claim the GPU.
+    # An outage fails both attempts, and only then does the breaker hear about it.
+    routes._upstream_client = _flaky_upstream([2])
     # probe_interval=0 so the NEXT request re-probes upstream immediately. In
     # production this is 60s, which is also the real recovery latency: the
     # breaker cannot notice Anthropic is back until it is allowed to try, so

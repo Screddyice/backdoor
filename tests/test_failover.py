@@ -168,7 +168,7 @@ def test_http_statuses_are_not_triggers_by_default():
     assert FAILOVER_STATUSES == set()
 
 
-def test_default_threshold_is_two():
+def test_default_threshold_is_one():
     """A latency contract, so raising it back is a deliberate act.
 
     Measured 2026-08-09: Claude Code retries a dead upstream persistently (9+
@@ -180,8 +180,8 @@ def test_default_threshold_is_two():
     say, so a transient blip still cannot open the breaker at any threshold.
     """
     from src.proxy.config import Settings
-    assert Settings().failover_threshold == 2
-    assert FailoverBreaker().threshold == 2
+    assert Settings().failover_threshold == 1
+    assert FailoverBreaker().threshold == 1
 
 
 def test_statuses_can_be_restored_via_env(monkeypatch):
