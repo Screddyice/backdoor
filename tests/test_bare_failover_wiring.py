@@ -207,14 +207,14 @@ def _route_request(turns: int) -> dict:
     }
 
 
-async def test_small_route_session_stays_on_the_27b(route_app):
-    """The common case must not regress: bare mode makes 32K generous, so a
-    normal `qwen` session keeps the stronger model."""
+async def test_small_route_session_stays_on_the_heavy_tier(route_app):
+    """The common case must not regress: bare mode keeps the prompt small, so a
+    normal `qwen` session keeps the strongest tier rather than escalating."""
     app, _recorder, seen = route_app
     resp = await _post(app, _route_request(turns=1))
 
     assert resp.status_code == 200
-    assert seen[-1] == "local-failover-heavy", seen
+    assert seen[-1] == "local-qwen38-action", seen
 
 
 async def test_profile_mode_oversized_session_escalates(monkeypatch):
