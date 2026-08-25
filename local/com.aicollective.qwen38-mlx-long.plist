@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aicollective.qwen38-mlx-long</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/screddy/.local/bin/mlx_vlm.server</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8080</string>
+    <string>--model</string>
+    <string>/Users/screddy/Models/Qwen3.8-27B-Action-Abliterated-MLX-4bit-v1</string>
+    <string>--max-tokens</string>
+    <string>32768</string>
+    <string>--max-kv-size</string>
+    <string>262144</string>
+    <string>--kv-bits</string>
+    <string>8</string>
+    <string>--kv-quant-scheme</string>
+    <string>uniform</string>
+    <string>--max-num-seqs</string>
+    <string>1</string>
+    <string>--log-level</string>
+    <string>INFO</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>APC_ENABLED</key>
+    <string>1</string>
+    <key>APC_NUM_BLOCKS</key>
+    <string>768</string>
+    <key>APC_BLOCK_SIZE</key>
+    <string>16</string>
+    <key>APC_DEFAULT_TENANT</key>
+    <string>backdoor</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/Users/screddy/Library/Logs/qwen38-mlx-server-long.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/screddy/Library/Logs/qwen38-mlx-server-long.log</string>
+</dict>
+</plist>

@@ -159,7 +159,7 @@ async def test_stripped_size_picks_the_tier(offline_app):
     stripped = count_messages(bare.messages, bare.system, bare.tools)
 
     assert pick_failover_profile(raw) == "local-failover-256k"       # the 4B
-    assert pick_failover_profile(stripped) == "local-failover-qwen27"
+    assert pick_failover_profile(stripped) == "local-failover-heavy"
 
 
 # --- deliberate `/model qwen` must obey the ladder too ---------------------
@@ -214,7 +214,7 @@ async def test_small_route_session_stays_on_the_27b(route_app):
     resp = await _post(app, _route_request(turns=1))
 
     assert resp.status_code == 200
-    assert seen[-1] == "local-failover-qwen27", seen
+    assert seen[-1] == "local-failover-heavy", seen
 
 
 async def test_profile_mode_oversized_session_escalates(monkeypatch):
@@ -238,7 +238,7 @@ async def test_profile_mode_oversized_session_escalates(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.8:27b-bare",
+        provider_model="qwen3.5:9b-64k",
         route_max_input_tokens=28_000,
     )
     try:
@@ -264,7 +264,7 @@ async def test_profile_mode_normal_session_stays_put(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.8:27b-bare",
+        provider_model="qwen3.5:9b-64k",
         route_max_input_tokens=28_000,
     )
     try:
@@ -353,14 +353,14 @@ def test_memory_injected_for_local_provider(monkeypatch):
 
     monkeypatch.setattr(translate, "_hoist_system_messages", lambda m: m)
     import src.proxy.memory as memory
-    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["the 27B tier is qwen3.8:27b-bare"])
+    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["the 27B tier is qwen3.5:9b-64k"])
 
     out = translate._inject_memory(
         [{"role": "system", "content": "You are offline."}, {"role": "user", "content": "which tier?"}],
         _mem_settings(),
     )
     assert memory.BLOCK_OPEN in out[0]["content"]
-    assert "qwen3.8:27b-bare" in out[0]["content"]
+    assert "qwen3.5:9b-64k" in out[0]["content"]
     assert "You are offline." in out[0]["content"], "the real system prompt must survive"
 
 

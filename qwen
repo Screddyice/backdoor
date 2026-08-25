@@ -81,7 +81,7 @@ if [ -z "$PROFILE" ]; then
   if [ "$MODE" = "full" ]; then
     PROFILE="local-qwen35"           # qwen3.5:4b-64k  — harness needs the window
   else
-    PROFILE="local-failover-qwen27"  # qwen3.8:27b-bare — 32K, biggest local brain
+    PROFILE="local-failover-heavy"  # qwen3.5:9b-64k — biggest local brain here
   fi
 fi
 
@@ -93,7 +93,13 @@ fi
 # modelfiles/bare/*.Modelfile). A value LARGER than the real window re-creates
 # the bug, so do not round up. Explicit env wins, for one-off experiments.
 case "$PROFILE" in
-  local-failover-qwen27) QWEN_CTX=32000 ;;   # qwen3.8:27b-bare @ 32K
+  # Held at 32000 across the 27B → 9B step-down even though this tag's window is
+  # 64K. Smaller than the real window is the safe direction (the warning above is
+  # about rounding UP), and it keeps auto-compact firing just past the tier's
+  # 28000 ROUTE_MAX_INPUT_TOKENS escalation bound, which is the relationship the
+  # 27B had. Raising it to 64000 would park long sessions on the 4B 256K tier for
+  # the whole 28K-64K stretch instead of compacting.
+  local-failover-heavy) QWEN_CTX=32000 ;;   # qwen3.5:9b-64k @ 64K, held at 32K
   local-qwen35|local-fast) QWEN_CTX=64000 ;; # qwen3.5:4b-64k  @ 64K
   *) QWEN_CTX=32000 ;;                       # unknown profile: assume the floor
 esac
@@ -327,9 +333,11 @@ done
 # and the collision correspondingly worse. The qwen3.8 swap on 2026-08-16
 # measured 17GB, so the collision eased, but a ~21GB council still does not fit
 # beside it under the ~27GB wired ceiling. Keep the 10m. See the panic note in
-# modelfiles/bare/qwen3.8-27b-bare.Modelfile.
+# modelfiles/bare/qwen3.8-27b-bare.Modelfile. (2026-08-25: the heavy tier is now
+# the ~10-12GB 9B, so the clamp is no longer load-bearing for the council — kept
+# because restoring the 27B tag would silently re-arm the collision.)
 KEEP_ALIVE="30m"
-[ "$PROFILE" = "local-failover-qwen27" ] && KEEP_ALIVE="10m"
+[ "$PROFILE" = "local-failover-heavy" ] && KEEP_ALIVE="10m"
 curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
   -d "{\"model\":\"$MODEL\",\"keep_alive\":\"$KEEP_ALIVE\",\"options\":{\"num_predict\":1},\"messages\":[{\"role\":\"system\",\"content\":\"warmup\"},{\"role\":\"user\",\"content\":\"hi\"}]}" \
   >/dev/null 2>&1 &

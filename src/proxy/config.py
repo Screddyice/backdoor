@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     # (see FAILOVER_LADDER), measured AFTER bare-mode stripping — the size that
     # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
-    failover_profile: str = "local-failover-qwen27"  # default tier
+    failover_profile: str = "local-failover-heavy"  # default tier
     # Probe on the first transport failure. The connectivity probe remains the
     # safety gate: local failover opens only when the host is offline. Waiting
     # for a second Claude retry exposed one avoidable API error before asking
@@ -108,9 +108,10 @@ class Settings(BaseSettings):
     # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
     # deliberate `/model qwen` handed the full unstripped harness to whatever
     # tier the route named. That is fine for the 64K tiers and wrong for a tier
-    # whose window assumes bare mode: qwen3.8:27b-bare is 32K, and a full
+    # whose window assumes bare mode: the heavy tier is bounded at 28K, and a full
     # harness session does not fit — the same over-window regression the
-    # profile header warns about, on a 27B instead of a 4B.
+    # profile header warns about. (Recorded when that tier was a 27B; the bound
+    # outlived the model, and qwen38-action inherits the same constraint.)
     # Set ROUTE_BARE=true on those profiles only. Deliberately reuses the
     # failover_* keep-list and truncation knobs so both paths strip identically;
     # a route that strips differently from failover would be a second behaviour
@@ -202,9 +203,15 @@ def clear_settings_cache():
 # Model names a Claude Code session can request (via `/model <name>` or
 # `--model <name>`) that route to a LOCAL profile in hybrid mode.
 MODEL_ROUTES: dict[str, str] = {
-    "qwen": "local-failover-qwen27",  # qwen3.8:27b-bare — same as backdoor
+    "qwen": "local-failover-heavy",  # qwen3.5:9b-64k — same as backdoor
     "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
     "qwen-9b": "local-qwen-9b",   # qwen3.5:9b-64k — stronger brain for subagents
+    # Name-only tier: Qwen3.8-27B Action-Abliterated on MLX (127.0.0.1:8080, NOT
+    # Ollama). Requires `qwen38 start` first. Reduced-refusal model — kept out of
+    # "qwen", failover_profile, and FAILOVER_LADDER on purpose so it is never
+    # reached by an unattended subagent or an offline failover. The reasoning is
+    # in profiles/local-qwen38-action.env; read it before promoting this.
+    "qwen38-action": "local-qwen38-action",
 }
 
 
@@ -226,7 +233,7 @@ MODEL_ROUTES: dict[str, str] = {
 # still overflows the 27B's 32K window — at which point a weaker model that
 # retains the session beats a stronger one that truncates it.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (28_000, "local-failover-qwen27"),      # qwen3.8:27b-bare (32K window, tools)
+    (28_000, "local-failover-heavy"),      # qwen3.5:9b-64k (64K window, tools)
     (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
 ]
 
