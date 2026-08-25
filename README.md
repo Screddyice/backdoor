@@ -728,6 +728,14 @@ qwen38 status
 qwen38 stop
 ```
 
+Verify it before trusting it:
+
+```
+local/smoke-qwen38.sh
+```
+
+That checks health, generation, and tool calling, in that order. The tool-call check is the one worth caring about: `failover_keep_tools` hands Read, Edit, and Bash definitions to this tier, and a model that stops calling them looks healthy right up until failover gives it real work.
+
 Long mode (`qwen38 start-long`, 262K context) is configured but unproven here. Upstream passed 261,888-token retrieval on an A100, never on this Mac, and the profile guard wants 25GB free disk before it will run.
 
 #### The 27B tier must be GGUF, not int4/MLX

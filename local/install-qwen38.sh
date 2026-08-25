@@ -22,21 +22,29 @@ readonly HERE="${0:A:h}"
 
 die() { print -u2 "$@"; exit 1; }
 
-# 1. Resolve the cache snapshot and pin a stable path to it. The plists cannot
-#    contain a content hash that changes on every model revision.
-[[ -d "$CACHE_REPO/snapshots" ]] || die "Model not downloaded. See step 2 in the header."
-snapshot="$(find "$CACHE_REPO/snapshots" -maxdepth 1 -mindepth 1 -type d | head -1)"
-[[ -n "$snapshot" ]] || die "No snapshot under $CACHE_REPO/snapshots"
+# 1. Locate the weights. Two shapes are supported, because `hf download` is not
+#    reliable on a slow link: it aborts the whole job on one httpx.ReadTimeout
+#    and deletes its own partials. The fallback is a per-file curl with -C -,
+#    which lands a plain directory rather than a cache snapshot.
+#      a) $STABLE_LINK is already a real directory holding the weights.
+#      b) the HF cache holds a snapshot, and $STABLE_LINK becomes a symlink.
+if [[ -d "$STABLE_LINK" && ! -L "$STABLE_LINK" && -e "$STABLE_LINK/config.json" ]]; then
+  snapshot="$STABLE_LINK"
+  print "Using weights already at $STABLE_LINK"
+else
+  [[ -d "$CACHE_REPO/snapshots" ]] || die "Model not downloaded. See step 2 in the header."
+  snapshot="$(find "$CACHE_REPO/snapshots" -maxdepth 1 -mindepth 1 -type d | head -1)"
+  [[ -n "$snapshot" ]] || die "No snapshot under $CACHE_REPO/snapshots"
+  mkdir -p "${HOME}/Models"
+  ln -sfn "$snapshot" "$STABLE_LINK"
+  print "Model pinned: $STABLE_LINK -> $snapshot"
+fi
 
 for required in config.json model.safetensors.index.json tokenizer.json; do
-  [[ -e "$snapshot/$required" ]] || die "Snapshot is missing $required — download incomplete."
+  [[ -e "$snapshot/$required" ]] || die "Weights are missing $required — download incomplete."
 done
 shards="$(find "$snapshot" -name 'model-*-of-*.safetensors' | wc -l | tr -d ' ')"
 [[ "$shards" == "3" ]] || die "Expected 3 safetensors shards, found $shards — download incomplete."
-
-mkdir -p "${HOME}/Models"
-ln -sfn "$snapshot" "$STABLE_LINK"
-print "Model pinned: $STABLE_LINK -> $snapshot"
 
 # 2. Verify against the manifest the artifact ships with, when present. The
 #    upstream README verified this 15-file artifact byte-for-byte against its
