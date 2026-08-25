@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Weekly savings report: what the local-router + llm-jury + caching stack saved.
+"""Weekly savings report: what the local router + prompt caching saved.
 
 Measures, from ~/.claude/projects transcript JSONLs (the authoritative per-turn
 usage record), over the trailing window:
@@ -8,9 +8,13 @@ usage record), over the trailing window:
                   tokens; counterfactual is the same turn at Opus 5 pricing.
   prompt caching  cache_read tokens billed at 0.1x input, net of the 1.25x/2x
                   write premium actually paid.
-  llm-jury        solve runs in the window (from ~/.llmjury/tmp mtimes);
-                  counterfactual is a configurable Opus-token estimate per run,
-                  since the ladder keeps escalations off Opus. Estimate only.
+llm-jury and its OpenRouter ladder are deliberately NOT counted (removed
+2026-08-26). That is a separate system, on a separate provider, running
+different models, with its own billing. This script used to read
+~/.llmjury/.env for OPENROUTER_API_KEY and call the OpenRouter API to fold
+that spend into backdoor's numbers. Backdoor has no business holding another
+system's key, and a report that mixes the two cannot answer either question
+cleanly. If you want llm-jury economics, measure them in llm-jury.
   time            per-session active hours (gaps <= ACTIVE_GAP_MIN count as
                   work), summed across sessions, vs the wall-clock union.
 
@@ -25,7 +29,6 @@ from datetime import datetime, timedelta, timezone
 
 HOME          = os.path.expanduser("~")
 PROJECTS_DIR  = os.path.join(HOME, ".claude", "projects")
-JURY_TMP      = os.path.join(HOME, ".llmjury", "tmp")
 REPORT_DIR    = os.environ.get("SAVINGS_REPORT_DIR",
                                os.path.join(HOME, "projects", "docs", "reports", "claude-savings"))
 ENV_FILE      = os.path.join(HOME, "projects", ".env")
@@ -39,18 +42,11 @@ ACTIVE_GAP_MIN     = float(os.environ.get("SAVINGS_ACTIVE_GAP_MIN", 10))
 COUNTERFACTUAL     = os.environ.get("SAVINGS_COUNTERFACTUAL", "claude-opus-5")
 # Human needs at least as long as the agent's active time to do the same work.
 HOURS_MULTIPLIER   = float(os.environ.get("SAVINGS_HOURS_MULTIPLIER", 1.0))
-# Rough Opus-shaped cost of one llm-jury solve run had it gone straight to Opus.
-JURY_RUN_IN_TOK    = int(os.environ.get("SAVINGS_JURY_RUN_IN_TOK", 20_000))
-JURY_RUN_OUT_TOK   = int(os.environ.get("SAVINGS_JURY_RUN_OUT_TOK", 5_000))
 # --- the $200 plan benchmark ------------------------------------------------
 PLAN_COST_MO       = float(os.environ.get("SAVINGS_PLAN_COST_MO", 200))
 # Anthropic's published guidance for Max 20x: ~24-40 Opus-hours/week.
 PLAN_OPUS_HRS_LO   = float(os.environ.get("SAVINGS_PLAN_OPUS_HRS_LO", 24))
 PLAN_OPUS_HRS_HI   = float(os.environ.get("SAVINGS_PLAN_OPUS_HRS_HI", 40))
-# Opus costs ~35x the open-weight OpenRouter tiers (per the fusion ladder docs),
-# so $1 of measured OpenRouter spend stands in for ~$35 of Opus-equivalent work.
-OPUS_COST_RATIO    = float(os.environ.get("SAVINGS_OPUS_COST_RATIO", 35))
-LLMJURY_ENV        = os.path.join(HOME, ".llmjury", ".env")
 LIMIT_PHRASES      = ("Claude usage limit reached",)
 
 # $ per MTok (input, output). Anthropic first-party rates.
@@ -199,23 +195,6 @@ def scan(days):
     return now, per_model, session_ts, scanned, limit_events
 
 
-def openrouter_weekly():
-    """Measured OpenRouter spend this week from the key endpoint, or None."""
-    try:
-        with open(LLMJURY_ENV) as fh:
-            key = next((l.split("=", 1)[1].strip() for l in fh
-                        if l.startswith("OPENROUTER_API_KEY=")), None)
-        if not key:
-            return None
-        r = subprocess.run(["curl", "-sS", "--max-time", "20",
-                            "-H", f"Authorization: Bearer {key}",
-                            "https://openrouter.ai/api/v1/key"],
-                           capture_output=True, text=True, timeout=30)
-        return json.loads(r.stdout)["data"]["usage_weekly"]
-    except Exception:
-        return None
-
-
 def active_hours(session_ts, gap_min):
     """(sum of per-session active hours, wall-clock union hours)."""
     gap = timedelta(minutes=gap_min)
@@ -245,21 +224,6 @@ def active_hours(session_ts, gap_min):
     if cur_s is not None:
         union_secs += (cur_e - cur_s).total_seconds()
     return per_session_total / 3600.0, union_secs / 3600.0
-
-
-def jury_runs(days):
-    if not os.path.isdir(JURY_TMP):
-        return 0
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    n = 0
-    for name in os.listdir(JURY_TMP):
-        p = os.path.join(JURY_TMP, name)
-        try:
-            if datetime.fromtimestamp(os.path.getmtime(p), timezone.utc) >= cutoff:
-                n += 1
-        except OSError:
-            pass
-    return n
 
 
 def md_to_html(md):
@@ -313,7 +277,6 @@ def build_savings_email_md(s, week_of, today):
         "|---|---|---|",
         f"| Local qwen routing | ${s['local_saved']:,.2f} | "
         f"{s['local_turns']} turns ran free on local hardware instead of the cloud |",
-        f"| OpenRouter / llm-jury ladder | ${s['jury_saved']:,.2f} | "
         f"kept work off {COUNTERFACTUAL} pricing |",
         "",
         f"**Total: ${s['usd_saved']:,.2f} saved.**",
@@ -395,24 +358,7 @@ def main():
     # full-price input tokens effectively avoided
     cache_tok_equiv = int(cache_read_tok * 0.9)
 
-    # 3. OpenRouter ladder — measured spend when the key answers, else the
-    #    per-run estimate from llm-jury tmp dirs
-    n_jury = jury_runs(days)
-    op_in, op_out = price_for(COUNTERFACTUAL, now)
-    or_spent = openrouter_weekly()
-    if or_spent is not None:
-        jury_saved = or_spent * OPUS_COST_RATIO - or_spent
-        jury_in = int(jury_saved / (op_in / 1e6) * 0.8)  # token-equivalent, input-weighted
-        jury_out = 0
-        jury_basis = (f"${or_spent:,.2f} measured OpenRouter spend x {OPUS_COST_RATIO:g}x "
-                      f"Opus cost ratio, net of spend; {n_jury} jury runs (measured $ / est. ratio)")
-    else:
-        jury_in, jury_out = n_jury * JURY_RUN_IN_TOK, n_jury * JURY_RUN_OUT_TOK
-        jury_saved = (jury_in * op_in + jury_out * op_out) / 1e6
-        jury_basis = (f"{n_jury} solve runs kept off {COUNTERFACTUAL}; {JURY_RUN_IN_TOK//1000}K in / "
-                      f"{JURY_RUN_OUT_TOK//1000}K out per run (estimate; OpenRouter key unreachable)")
-
-    # 4. actual cloud spend for context
+    # 3. actual cloud spend for context
     cloud_cost = sum(cost_usd(t, now) for t in cloud.values())
     cloud_turns = sum(t["turns"] for t in cloud.values())
 
@@ -426,8 +372,8 @@ def main():
     # counterfactual against API list price isn't money that ever left (or
     # would have left) your account. It's tracked separately as an efficiency
     # stat (more work fit in the same session/quota), never as dollars.
-    tokens_saved = local_tokens + jury_in + jury_out
-    usd_saved = local_saved + jury_saved
+    tokens_saved = local_tokens
+    usd_saved = local_saved
 
     # plan benchmark
     plan_wk = PLAN_COST_MO * 12 / 52
@@ -440,7 +386,7 @@ def main():
     cache_rate = cache_read_tok / total_input * 100 if total_input else 0.0
     hrs_lo = agent_hours / PLAN_OPUS_HRS_HI if PLAN_OPUS_HRS_HI else 0.0
     hrs_hi = agent_hours / PLAN_OPUS_HRS_LO if PLAN_OPUS_HRS_LO else 0.0
-    off_plan_usd = local_saved + jury_saved
+    off_plan_usd = local_saved
 
     week_of = (now - timedelta(days=days)).strftime("%Y-%m-%d")
     today = now.strftime("%Y-%m-%d")
@@ -448,7 +394,7 @@ def main():
     lines = [
         f"# Claude savings report — week of {week_of} to {today}",
         "",
-        f"**${usd_saved:,.2f} saved this week** (local qwen + OpenRouter ladder; excludes "
+        f"**${usd_saved:,.2f} saved this week** (local qwen routing; excludes "
         f"caching — see note below) · **${cloud_cost:,.2f} of API-equivalent work on a "
         f"${plan_wk:,.0f}/wk subscription ({leverage:,.0f}x)** · **{agent_hours:,.1f} agent-hours**",
         "",
@@ -462,7 +408,7 @@ def main():
         f"{cloud_turns} turns → **{leverage:,.0f}x** the subscription price.",
         f"- What makes that fit inside one plan: **{cache_rate:.1f}% of input tokens came from "
         f"cache** ({fmt_tok(cache_read_tok)} reads), and **${off_plan_usd:,.2f}** of "
-        f"Opus-equivalent work ran off-plan entirely (local qwen + OpenRouter ladder), "
+        f"Opus-equivalent work ran off-plan entirely (local qwen routing), "
         f"touching zero plan quota.",
         f"- Recorded plan-limit hits in transcripts this week: **{limit_events}** "
         f"(undercount — the CLI does not log every throttle).",
@@ -473,8 +419,6 @@ def main():
         "|---|---|---|---|",
         f"| Local qwen routing (:8083) | {fmt_tok(local_tokens)} | ${local_saved:,.2f} | "
         f"{local_turns} turns served locally; counterfactual = {COUNTERFACTUAL} pricing (measured) |",
-        f"| llm-jury / OpenRouter ladder | {fmt_tok(jury_in + jury_out)} | ${jury_saved:,.2f} | "
-        f"{jury_basis} |",
         "",
         f"**Note on caching:** {cache_rate:.1f}% of input tokens this week came from cache "
         f"({fmt_tok(cache_read_tok)} reads, worth ${cache_net:,.2f} against API list price). "
@@ -509,8 +453,8 @@ def main():
     lines += ["", "---",
               f"*Scanned {scanned} transcript files; window {days}d; generated {now.strftime('%Y-%m-%d %H:%M UTC')}. "
               f"Assumption knobs: SAVINGS_COUNTERFACTUAL, SAVINGS_HOURS_MULTIPLIER, "
-              f"SAVINGS_JURY_RUN_IN_TOK/OUT_TOK, SAVINGS_ACTIVE_GAP_MIN, SAVINGS_PLAN_COST_MO, "
-              f"SAVINGS_PLAN_OPUS_HRS_LO/HI, SAVINGS_OPUS_COST_RATIO.*", ""]
+              f"SAVINGS_ACTIVE_GAP_MIN, SAVINGS_PLAN_COST_MO, "
+              f"SAVINGS_PLAN_OPUS_HRS_LO/HI.*", ""]
     report = "\n".join(lines)
 
     print(report)
@@ -529,10 +473,16 @@ def main():
         print(f"\nwritten: {out}", file=sys.stderr)
     if send_email:
         savings = {"usd_saved": usd_saved, "cache_rate": cache_rate,
-                  "local_saved": local_saved, "local_turns": local_turns,
-                  "jury_saved": jury_saved}
+                  "local_saved": local_saved, "local_turns": local_turns}
         sent = send_weekly_email(savings, week_of, today, dry)
-        print(f"email {'sent' if sent else 'FAILED'} to {EMAIL_TO}", file=sys.stderr)
+        # Say "would send" on a dry run. This used to print "email sent to
+        # <address>" unconditionally, because the dry-run branch returns True
+        # before doing anything — so a preview run claimed it had mailed the
+        # report to a real person. Nothing was ever sent; the line was a lie.
+        if dry:
+            print(f"email NOT sent (dry-run) — would go to {EMAIL_TO}", file=sys.stderr)
+        else:
+            print(f"email {'sent' if sent else 'FAILED'} to {EMAIL_TO}", file=sys.stderr)
     if notify:
         msg = (f"${cloud_cost:,.0f} of API-equivalent work on a ${plan_wk:,.0f}/wk plan "
                f"({leverage:,.0f}x), {agent_hours:,.0f} agent-hours, "
