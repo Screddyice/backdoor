@@ -434,7 +434,12 @@ def build_nim_payload(req: MessagesRequest, settings) -> dict[str, Any]:
 # Response conversion (non-streaming)
 # ---------------------------------------------------------------------------
 
-def nim_response_to_anthropic(nim: dict[str, Any], req: MessagesRequest, msg_id: str) -> dict[str, Any]:
+def nim_response_to_anthropic(
+    nim: dict[str, Any],
+    req: MessagesRequest,
+    msg_id: str,
+    strip_inline_thinking: bool = False,
+) -> dict[str, Any]:
     choice = nim["choices"][0]
     finish = choice.get("finish_reason", "end_turn")
     stop_reason = _map_finish_reason(finish)
@@ -455,7 +460,16 @@ def nim_response_to_anthropic(nim: dict[str, Any], req: MessagesRequest, msg_id:
     # reasoning frequently contains JSON the model is talking itself through,
     # and feeding that to extract_text_tool_calls invents tool calls the model
     # never made. See split_inline_thinking for the tag shapes.
-    inline_thinking, text = split_inline_thinking(text)
+    #
+    # Gated on the same per-profile setting as the streaming path. Ungated, this
+    # mangles any answer that legitimately contains the literal characters —
+    # "to close a thinking block you write </think>" is a reasonable thing for a
+    # coding assistant to say, and everything before the tag would be silently
+    # reclassified as reasoning. Only backends known to emit real inline tags
+    # opt in.
+    inline_thinking = ""
+    if strip_inline_thinking:
+        inline_thinking, text = split_inline_thinking(text)
     if inline_thinking:
         reasoning = f"{reasoning}\n{inline_thinking}".strip() if reasoning else inline_thinking
 

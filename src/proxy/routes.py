@@ -500,7 +500,9 @@ async def create_message(
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
-    result = nim_response_to_anthropic(resp, req, msg_id)
+    result = nim_response_to_anthropic(
+        resp, req, msg_id, settings.provider_strip_inline_thinking
+    )
     usage = result.get("usage", {})
     logger.info(
         "← %s [%s] stop=%s out_tokens=%s in_tokens=%s",

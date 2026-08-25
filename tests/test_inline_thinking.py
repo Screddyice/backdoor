@@ -60,7 +60,9 @@ def _nim(content: str) -> dict:
 
 
 def test_non_streaming_moves_thinking_out_of_text():
-    out = nim_response_to_anthropic(_nim("why</think>answer"), _req(), "msg_1")
+    out = nim_response_to_anthropic(
+        _nim("why</think>answer"), _req(), "msg_1", strip_inline_thinking=True
+    )
     kinds = [b["type"] for b in out["content"]]
     assert "thinking" in kinds
     text = "".join(b["text"] for b in out["content"] if b["type"] == "text")
@@ -70,8 +72,25 @@ def test_non_streaming_moves_thinking_out_of_text():
 
 def test_non_streaming_reasoning_only_turn_is_not_empty():
     """Deleting the block would leave an assistant message with no content."""
-    out = nim_response_to_anthropic(_nim("<think>only this</think>"), _req(), "msg_1")
+    out = nim_response_to_anthropic(
+        _nim("<think>only this</think>"), _req(), "msg_1", strip_inline_thinking=True
+    )
     assert out["content"], "turn must not be empty"
+
+
+def test_non_streaming_off_by_default_keeps_literal_tags():
+    """The gate exists so ordinary prose survives.
+
+    "to close a thinking block you write </think>" is a reasonable thing for a
+    coding assistant to say. Ungated, everything before the tag was silently
+    reclassified as reasoning and the visible answer became "at the end."
+    Backends that emit real inline tags opt in per profile.
+    """
+    prose = "To close a thinking block you write </think> at the end."
+    out = nim_response_to_anthropic(_nim(prose), _req(), "msg_1")
+    text = "".join(b["text"] for b in out["content"] if b["type"] == "text")
+    assert text == prose
+    assert not [b for b in out["content"] if b["type"] == "thinking"]
 
 
 # --- streaming ------------------------------------------------------------
