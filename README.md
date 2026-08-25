@@ -714,11 +714,11 @@ Ollama cannot evict this server either, so `qwen38 stop` before an `llmjury solv
 ```
 hf auth login
 HF_HUB_DISABLE_XET=1 hf download ajs-ai/Qwen3.8-27B-Action-Abliterated-MLX-4bit
-uv tool install mlx-vlm
+uv tool install mlx-vlm --with jinja2
 local/install-qwen38.sh
 ```
 
-Two traps live in that download. `hf-xet` 1.6.0 stalls at zero bytes instead of running slow, so turn it off. `HTTPS_PROXY` also points at the backdoor forward proxy on :8084, and its `NO_PROXY` covers github.com but not huggingface.co, which drags a 16GB pull through mitmproxy at about 1 MB/s. The install script verifies the download against the `SOURCE_SHA256SUMS` the artifact ships with and refuses to pin a snapshot that fails.
+Two traps live in that download. `hf-xet` 1.6.0 stalls at zero bytes instead of running slow, so turn it off. `HTTPS_PROXY` also points at the backdoor forward proxy on :8084, and its `NO_PROXY` covers github.com but not huggingface.co, which drags a 16GB pull through mitmproxy at about 1 MB/s. The install script verifies the download against the `SOURCE_SHA256SUMS` the artifact ships with and refuses to pin a snapshot that fails. `README.md` is the one tolerated mismatch, because Hugging Face prepends model-card frontmatter on publish and the manifest predates it. `jinja2` needs `--with` because mlx-vlm does not depend on it, yet `apply_chat_template` calls it: without it the server passes `/health` and fails every completion.
 
 Manual control, for when you want it:
 

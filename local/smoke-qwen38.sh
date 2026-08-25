@@ -13,7 +13,8 @@
 set -uo pipefail
 
 readonly BASE="http://127.0.0.1:8080/v1"
-readonly MODEL="qwen38-action"
+# Must match what the server loaded; it resolves this as a repo_id.
+readonly MODEL="/Users/screddy/Models/Qwen3.8-27B-Action-Abliterated-MLX-4bit-v1"
 fails=0
 
 step() { print "\n=== $1 ==="; }

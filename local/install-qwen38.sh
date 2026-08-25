@@ -9,7 +9,10 @@
 #      not a slow link, it is a stall. Disable it. Also unset HTTPS_PROXY: the
 #      backdoor forward proxy on :8084 is in NO_PROXY for github.com but not for
 #      huggingface.co, and a 16GB pull through mitmproxy crawls.
-#   3. uv tool install mlx-vlm          (provides ~/.local/bin/mlx_vlm.server)
+#   3. uv tool install mlx-vlm --with jinja2
+#      jinja2 is NOT a mlx-vlm dependency but apply_chat_template needs it, so
+#      without --with the server loads, answers /health, and then fails every
+#      completion with 'apply_chat_template requires jinja2 to be installed'.
 #   4. this script
 #
 # Then: `qwen38 start`, and `/model qwen38-action` in a routed session.
@@ -46,14 +49,34 @@ done
 shards="$(find "$snapshot" -name 'model-*-of-*.safetensors' | wc -l | tr -d ' ')"
 [[ "$shards" == "3" ]] || die "Expected 3 safetensors shards, found $shards — download incomplete."
 
-# 2. Verify against the manifest the artifact ships with, when present. The
-#    upstream README verified this 15-file artifact byte-for-byte against its
-#    cloud SHA256SUMS; do the same here rather than trusting the transfer.
+# 2. Verify against the manifest the artifact ships with. The upstream README
+#    verified this 15-file artifact byte-for-byte against its cloud SHA256SUMS;
+#    do the same here rather than trusting a transfer that took five hours and
+#    survived 20-odd dropped connections.
+#
+#    README.md is the one allowed exception. Hugging Face prepends YAML card
+#    frontmatter (license, library_name, pipeline_tag, base_model, tags) when a
+#    repo is published, so the copy on the Hub cannot match a manifest generated
+#    from the source artifact. That is a documentation file and never reaches the
+#    server. EVERY other file, weights included, must match exactly.
 if [[ -f "$snapshot/SOURCE_SHA256SUMS" ]]; then
   print "Verifying SOURCE_SHA256SUMS (this reads ~15GB, give it a minute)..."
-  ( cd "$snapshot" && shasum -a 256 -c SOURCE_SHA256SUMS --quiet ) \
-    && print "Checksums OK." \
-    || die "CHECKSUM MISMATCH. Do not serve this artifact; re-download it."
+  # || true: shasum exits non-zero on ANY mismatch, and `set -e` would abort the
+  # assignment before we can decide whether the mismatch actually matters.
+  results="$( cd "$snapshot" && shasum -a 256 -c SOURCE_SHA256SUMS 2>/dev/null || true )"
+  failed=("${(@f)$(print -r -- "$results" | grep ': FAILED$' | sed 's/: FAILED$//')}")
+  failed=("${(@)failed:#}")   # drop the empty element when nothing failed
+
+  real_failures=("${(@)failed:#README.md}")
+  if (( ${#real_failures} > 0 )); then
+    print -u2 "CHECKSUM MISMATCH on: ${real_failures[*]}"
+    die "Do not serve this artifact; re-download the affected files."
+  fi
+  if (( ${#failed} > 0 )); then
+    print "Checksums OK (README.md differs: HF card frontmatter, expected)."
+  else
+    print "Checksums OK."
+  fi
 else
   print -u2 "WARNING: no SOURCE_SHA256SUMS in the snapshot; skipping verification."
 fi
