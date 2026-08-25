@@ -488,7 +488,8 @@ async def create_message(
     if req.stream:
         input_tokens = est_in
         return StreamingResponse(
-            _stream(client, payload, msg_id, req, input_tokens, provider),
+            _stream(client, payload, msg_id, req, input_tokens, provider,
+                    settings.provider_strip_inline_thinking),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -499,7 +500,9 @@ async def create_message(
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
-    result = nim_response_to_anthropic(resp, req, msg_id)
+    result = nim_response_to_anthropic(
+        resp, req, msg_id, settings.provider_strip_inline_thinking
+    )
     usage = result.get("usage", {})
     logger.info(
         "← %s [%s] stop=%s out_tokens=%s in_tokens=%s",
@@ -518,8 +521,11 @@ async def _stream(
     req: MessagesRequest,
     input_tokens: int,
     provider: str,
+    strip_inline_thinking: bool = False,
 ) -> AsyncIterator[str]:
-    state: dict = {}
+    # Backends that leave <think> tags in `content` rather than filling
+    # `reasoning`; see Settings.provider_strip_inline_thinking.
+    state: dict = {"strip_inline_thinking": strip_inline_thinking}
     pending: asyncio.Task | None = None
     try:
         # Open the SSE conversation immediately and heartbeat while waiting:
