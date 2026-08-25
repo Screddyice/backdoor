@@ -62,7 +62,9 @@ The harness is free. The intelligence is cheap. That's the whole point.
 
 ### Measure it for your own usage
 
-`scripts/claude-savings-report.py` turns the numbers above into a weekly report on *your*
+`scripts/claude-savings-report.py` measures what the local router and prompt caching saved. It deliberately does NOT count llm-jury or its OpenRouter ladder: that is a separate system, on a separate provider, running different models, with its own billing. The script used to read `~/.llmjury/.env` for an API key and call OpenRouter to fold that spend in. Backdoor has no business holding another system's key, and a report mixing the two answers neither question cleanly.
+
+It turns the numbers above into a weekly report on *your*
 traffic. It reads Claude Code's own transcript logs (`~/.claude/projects/**/*.jsonl`), separates
 turns actually routed through Backdoor (local Ollama, OpenRouter) from turns that went straight
 to Claude, and reports $ saved against what that same work would have cost at metered API
