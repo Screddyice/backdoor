@@ -728,6 +728,14 @@ qwen38 status
 qwen38 stop
 ```
 
+#### Thinking traces
+
+This tier leaves `<think>` tags inline in `content` instead of filling a `reasoning` field, and Qwen's chat template pre-fills the opening tag, so the stream starts inside the block. Left alone, a `qwen` turn renders the model's reasoning, a bare `</think>`, and then the real answer.
+
+`PROVIDER_STRIP_INLINE_THINKING=true` in the profile re-homes that into an Anthropic thinking block, on both the streaming and non-streaming paths. It is opt-in per profile because knowing the stream begins inside a block is what makes it free: deltas route straight to a thinking block. Detecting it generically would mean buffering every stream until a closer appeared, delaying first paint on every tier to fix one.
+
+`PROVIDER_REASONING_EFFORT=none` does not help here. That is an Ollama-ism, and `mlx_vlm.server` ignores it.
+
 Verify it before trusting it:
 
 ```

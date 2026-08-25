@@ -21,6 +21,21 @@ class Settings(BaseSettings):
     provider_top_p: float = 1.0
     provider_reasoning_effort: str = ""
 
+    # Strip inline <think>...</think> out of streamed content for backends that
+    # leave the tags in `content` instead of filling a `reasoning` field.
+    # Ollama fills `reasoning` and honors reasoning_effort, so it needs nothing.
+    # mlx_vlm.server does neither, and Qwen's chat template PRE-FILLS the opening
+    # <think> into the assistant turn, so the stream begins inside the block and
+    # the first thing a user sees is the model's reasoning followed by a bare
+    # </think>.
+    #
+    # Opt-in per profile rather than always-on. Knowing the stream starts inside
+    # a thinking block is what makes this free: we can route deltas to a thinking
+    # block immediately. Detecting it generically would mean buffering every
+    # stream until a closer showed up, which would delay first paint for every
+    # tier to fix one.
+    provider_strip_inline_thinking: bool = False
+
     # Idle residency to clamp this tier to after serving a FAILOVER request, as
     # an Ollama duration ("45s"). Empty = leave it on Ollama's global
     # OLLAMA_KEEP_ALIVE (5m here). Local Ollama profiles only; see

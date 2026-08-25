@@ -87,6 +87,60 @@ def extract_text_tool_calls(text: str, tool_names: set[str]) -> list[dict[str, A
     return calls or None
 
 
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+
+
+def split_inline_thinking(text: str) -> tuple[str, str]:
+    """Split inline <think> blocks out of content. Returns (thinking, text).
+
+    Ollama reports reasoning in a separate `reasoning` field, which both response
+    paths already handle. mlx_vlm.server does not: it leaves the tags inline in
+    `content`, so a `qwen` turn rendered the model's reasoning, a bare
+    `</think>`, and then the real answer. PROVIDER_REASONING_EFFORT=none does not
+    help, because that is an Ollama-ism the MLX server ignores.
+
+    Three shapes, and the second is the common one:
+
+    1. `<think>reasoning</think>answer` — both tags present.
+    2. `reasoning</think>answer` — closer only. Qwen's chat template pre-fills
+       the opening `<think>` into the assistant turn, so the model never emits
+       it and the content STARTS inside the block. This is what leaked.
+    3. `<think>reasoning` — unterminated, usually a max_tokens cutoff.
+
+    Thinking is extracted rather than deleted, matching how the `reasoning`
+    field is treated: a reasoning-only turn that gets deleted becomes an empty
+    assistant message, which is worse than a visible thought.
+    """
+    if THINK_CLOSE not in text and THINK_OPEN not in text:
+        return "", text
+
+    thinking_parts: list[str] = []
+
+    # Case 2: a closer with no opener before it means content began inside the
+    # block. Everything up to the first closer is thinking.
+    first_close = text.find(THINK_CLOSE)
+    first_open = text.find(THINK_OPEN)
+    if first_close != -1 and (first_open == -1 or first_close < first_open):
+        thinking_parts.append(text[:first_close])
+        text = text[first_close + len(THINK_CLOSE):]
+
+    # Cases 1 and 3: paired blocks, then any unterminated tail.
+    while THINK_OPEN in text:
+        start = text.index(THINK_OPEN)
+        rest = text[start + len(THINK_OPEN):]
+        if THINK_CLOSE in rest:
+            end = rest.index(THINK_CLOSE)
+            thinking_parts.append(rest[:end])
+            text = text[:start] + rest[end + len(THINK_CLOSE):]
+        else:
+            thinking_parts.append(rest)
+            text = text[:start]
+            break
+
+    return "\n".join(p.strip() for p in thinking_parts if p.strip()).strip(), text.strip()
+
+
 def _tool_names(req: MessagesRequest) -> set[str]:
     return {t.name for t in (req.tools or [])}
 
@@ -395,6 +449,16 @@ def nim_response_to_anthropic(nim: dict[str, Any], req: MessagesRequest, msg_id:
     # block instead of dropping it — a reasoning-only turn otherwise becomes an
     # EMPTY assistant message and Claude Code shows/returns nothing.
     reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+
+    # mlx_vlm.server leaves <think> tags inline in `content` instead of filling
+    # `reasoning`. Split them out BEFORE the embedded-tool-call scan below:
+    # reasoning frequently contains JSON the model is talking itself through,
+    # and feeding that to extract_text_tool_calls invents tool calls the model
+    # never made. See split_inline_thinking for the tag shapes.
+    inline_thinking, text = split_inline_thinking(text)
+    if inline_thinking:
+        reasoning = f"{reasoning}\n{inline_thinking}".strip() if reasoning else inline_thinking
+
     if reasoning and not text and not structured_tool_calls:
         # Reasoning-only turn (qwen3.5 does this intermittently): the model put
         # its answer in reasoning and emitted no text. Promote it so the turn
@@ -501,6 +565,9 @@ def start_stream_events(
     state["text_decision"] = None
     state["buf"] = ""
     state["thinking_open"] = False
+    state.setdefault("strip_inline_thinking", False)
+    state["inline_think_done"] = False
+    state["think_carry"] = ""
     return [
         _sse("message_start", {
             "type": "message_start",
@@ -565,6 +632,37 @@ def stream_openai_to_anthropic(
 
     # Text delta
     text = delta.get("content")
+
+    # Backends that leave <think> tags inline (mlx_vlm.server) rather than
+    # filling `reasoning`. The stream STARTS inside the block because Qwen's
+    # template pre-fills the opening tag, so route deltas to a thinking block
+    # until the closer arrives. See provider_strip_inline_thinking.
+    if text and state.get("strip_inline_thinking") and not state.get("inline_think_done"):
+        buf = state.get("think_carry", "") + text
+        state["think_carry"] = ""
+        if buf.lstrip().startswith(THINK_OPEN):
+            buf = buf.lstrip()[len(THINK_OPEN):]
+        if THINK_CLOSE in buf:
+            thought, buf = buf.split(THINK_CLOSE, 1)
+            state["inline_think_done"] = True
+            if thought.strip():
+                events.extend(_thinking_deltas(state, thought))
+            _close_thinking_block(events, state)
+            text = buf
+        else:
+            # Hold back a tail that could be a tag split across chunks, so
+            # "</thi" + "nk>" is not emitted as visible text.
+            keep = 0
+            for n in range(1, len(THINK_CLOSE)):
+                if buf.endswith(THINK_CLOSE[:n]):
+                    keep = n
+            if keep:
+                state["think_carry"] = buf[-keep:]
+                buf = buf[:-keep]
+            if buf:
+                events.extend(_thinking_deltas(state, buf))
+            return events
+
     if text:
         _close_thinking_block(events, state)
         if not state["tool_mode"] or state["text_decision"] == "text":
@@ -692,6 +790,24 @@ def stream_openai_to_anthropic(
         }))
         events.append(_sse("message_stop", {"type": "message_stop"}))
 
+    return events
+
+
+def _thinking_deltas(state: dict, thought: str) -> list[str]:
+    """Emit thinking deltas, opening the block on first use."""
+    events: list[str] = []
+    if not state.get("thinking_open"):
+        state["thinking_open"] = True
+        events.append(_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": state["block_index"],
+            "content_block": {"type": "thinking", "thinking": ""},
+        }))
+    events.append(_sse("content_block_delta", {
+        "type": "content_block_delta",
+        "index": state["block_index"],
+        "delta": {"type": "thinking_delta", "thinking": thought},
+    }))
     return events
 
 
