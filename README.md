@@ -515,7 +515,9 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
-| `qwen` | `local-failover-qwen27` | `qwen3.8:27b-bare` | 32K | yes |
+| `qwen` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | 64K | yes |
+| `qwen38-action` | `local-qwen38-action` | the same tier, named directly | 64K | yes |
+| `qwen-stock` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
 | `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
 
@@ -536,7 +538,7 @@ ROUTE_MAX_INPUT_TOKENS=28000
 Set it to the same bound the tier carries in `FAILOVER_LADDER`, so a deliberate route and a failover size that tier identically. Over it, the request escalates through the same ladder rather than failing:
 
 ```
-⇢ ROUTE ESCALATE [local-failover-qwen27 → local-failover-256k] in≈143490 over 28000
+⇢ ROUTE ESCALATE [local-failover-heavy → local-failover-256k] in≈143490 over 28000
 ```
 
 Sizing happens **after** stripping, matching the failover branch — size the raw body and a bare-able session escalates to the wide 4B tier for no reason, wasting the stronger model. `0` disables the check, which is what the unstripped 64K tiers use.
@@ -550,7 +552,7 @@ Claude Code does not recognise the model name `qwen`, so it falls back to assumi
 The wrapper now states the real window before launching:
 
 ```
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-qwen27
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-heavy
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
 ```
 
@@ -594,7 +596,8 @@ The wrapper warms its tier at launch so the first turn skips the cold load, then
 
 | Profile | `keep_alive` |
 |---|---|
-| `local-failover-qwen27` | **10m** |
+| `local-failover-heavy` | **10m** |
+| `local-qwen38-action` | n/a, not an Ollama tag |
 | every other profile | 30m |
 
 Thirty idle minutes of a resident 27B is thirty minutes in which `llmjury solve` can collide with it, and neither side will refuse: Ollama counts models, not bytes. Ten minutes still spans an active session and returns the GPU sooner. Failover has a stronger interlock and does not need this — llm-jury reads `~/.backdoor/failover-state.json` and stands down while the breaker is open — but a deliberate `qwen` session writes no such file, so the shorter hold is the only thing bounding the overlap.
@@ -605,9 +608,9 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-failover-qwen27` | `qwen3.8:27b-bare` | `--bare` client-side holds the prompt near 945 tokens, so 32K is roomy |
+| `qwen`, `qwen lean` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | `--bare` client-side holds the prompt near 945 tokens |
 | `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
-| `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the 27B costs more GPU than the task is worth |
+| `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the heavy tier costs more GPU than the task is worth |
 
 The wrapper prints the tier it resolved at launch. Read that line if you are unsure which model you got.
 
@@ -667,7 +670,8 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 
 | Tier | Params | On disk | Resident | Tools | Notes |
 |---|---|---|---|---|---|
-| `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Default, 32K window. GGUF + vision projector — see below |
+| `qwen3.5:9b-64k` | 9B | 6.6 GB | ~10-12 GB | yes | Default heavy tier since 2026-08-25 |
+| `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Removed 2026-08-25 to free disk. Modelfile kept; see below |
 | `qwen3.5:27b-bare` | 27.8B | 17.4 GB | 23 GB | yes | Predecessor, removed 2026-08-16 |
 | `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
 | `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
@@ -684,6 +688,55 @@ ollama run qwen3.8:27b-bare "hi" >/dev/null && ollama ps   # resident + CONTEXT 
 The second check is the one that catches the old MLX failure: that build sat at a lazily-allocated ~15 GB floor and grew toward 32 GB as a session filled its window. A GGUF load allocates KV up front, so a resident number that does not move under load is the proof the window is enforced. 3.8 held at 17 GB after an 8K-token fill.
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
+
+### The default local brain is `qwen38-action`
+
+Qwen3.8-27B Action-Abliterated comes from `ajsai47/qwen38-action-abliterated-research`: a pinned Qwen3.8-27B checkpoint trained on action contracts, then put through a bounded refusal-direction ablation. Its model card records a 92.5% HarmBench direct-request attack-success rate, and StrongREJECT assistance on forbidden prompts at 87.22% against the base model's 10.54%. Capability held flat, with 62.50% on a frozen 280-item MMLU-Pro sample, matching upstream.
+
+Since 2026-08-25 it backs `/model qwen`, the `qwen` wrapper's default and lean modes, and cloud-to-local failover. `qwen38-action` names the same tier directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
+
+Read the model card before you lean on it. Reduced refusal is not permission, and it says so itself: the card puts unsupervised execution with destructive, financial, credential, or otherwise high-impact tools out of scope, and this wiring puts the model on exactly those paths. Failover fires with nobody watching, and `local-worker` gets dispatched with Bash and Write. Scoped tool permissions and reading what an unattended agent actually did are the controls now, because the model is no longer one of them.
+
+#### It is the one tier nothing loads lazily
+
+Every other local tier is an Ollama tag that loads on first request and gets evicted on a timer. This one is a launchd job holding about 19GB, up or absent, with nothing in between. Pointing failover at a tier that cannot start itself would break the fallback in the one situation it exists for, so `src/proxy/mlx_admin.py` probes `127.0.0.1:8080/health`, runs `launchctl kickstart` when it finds nothing, and waits up to 90 seconds for the weights to load. When the server will not come up, the request goes to `local-failover-heavy` and the log says so:
+
+```
+⇢ MLX FALLBACK [local-qwen38-action → local-failover-heavy] /v1/messages
+```
+
+That fallback is why `local-failover-heavy` still exists. Deleting it because `qwen` points elsewhere now would leave an offline host with no answer at all.
+
+Ollama cannot evict this server either, so `qwen38 stop` before an `llmjury solve` run rather than letting a 19GB server and a 21GB council fight over a 36GB host.
+
+#### Setup
+
+```
+hf auth login
+HF_HUB_DISABLE_XET=1 hf download ajs-ai/Qwen3.8-27B-Action-Abliterated-MLX-4bit
+uv tool install mlx-vlm --with jinja2
+local/install-qwen38.sh
+```
+
+Two traps live in that download. `hf-xet` 1.6.0 stalls at zero bytes instead of running slow, so turn it off. `HTTPS_PROXY` also points at the backdoor forward proxy on :8084, and its `NO_PROXY` covers github.com but not huggingface.co, which drags a 16GB pull through mitmproxy at about 1 MB/s. The install script verifies the download against the `SOURCE_SHA256SUMS` the artifact ships with and refuses to pin a snapshot that fails. `README.md` is the one tolerated mismatch, because Hugging Face prepends model-card frontmatter on publish and the manifest predates it. `jinja2` needs `--with` because mlx-vlm does not depend on it, yet `apply_chat_template` calls it: without it the server passes `/health` and fails every completion.
+
+Manual control, for when you want it:
+
+```
+qwen38 start     # 65,536 context, 8-bit KV, ~19GB resident
+qwen38 status
+qwen38 stop
+```
+
+Verify it before trusting it:
+
+```
+local/smoke-qwen38.sh
+```
+
+That checks health, generation, and tool calling, in that order. The tool-call check is the one worth caring about: `failover_keep_tools` hands Read, Edit, and Bash definitions to this tier, and a model that stops calling them looks healthy right up until failover gives it real work.
+
+Long mode (`qwen38 start-long`, 262K context) is configured but unproven here. Upstream passed 261,888-token retrieval on an A100, never on this Mac, and the profile guard wants 25GB free disk before it will run.
 
 #### The 27B tier must be GGUF, not int4/MLX
 

@@ -16,7 +16,7 @@ from .config import (
 )
 from .bare import make_bare, parse_keep
 from .failover import FAILOVER_STATUSES, FailoverBreaker
-from . import ollama_admin
+from . import mlx_admin, ollama_admin
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -402,6 +402,18 @@ async def create_message(
                 # Unstripped may overflow the window, but that surfaces as an
                 # honest provider error rather than a request we dropped here.
                 logger.exception("route bare-mode failed; sending unstripped to %s", profile)
+
+        # The MLX tier is the one local profile nothing loads lazily: it is a
+        # launchd job that is either up or absent. Start it, or hand the request
+        # to the Ollama tier instead of failing. Every other profile is a no-op
+        # here. See src/proxy/mlx_admin.py.
+        served_by = await mlx_admin.resolve_profile(profile)
+        if served_by != profile:
+            logger.warning(
+                "⇢ MLX FALLBACK [%s → %s] %s", profile, served_by, request.url.path,
+            )
+            profile = served_by
+            settings = load_profile_settings(profile)
 
         # Built last: the escalation above can change which profile serves this
         # request, and the client must follow the profile actually chosen.

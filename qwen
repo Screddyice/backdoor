@@ -81,7 +81,7 @@ if [ -z "$PROFILE" ]; then
   if [ "$MODE" = "full" ]; then
     PROFILE="local-qwen35"           # qwen3.5:4b-64k  — harness needs the window
   else
-    PROFILE="local-failover-qwen27"  # qwen3.8:27b-bare — 32K, biggest local brain
+    PROFILE="local-qwen38-action"    # abliterated 27B on MLX — biggest local brain
   fi
 fi
 
@@ -93,7 +93,14 @@ fi
 # modelfiles/bare/*.Modelfile). A value LARGER than the real window re-creates
 # the bug, so do not round up. Explicit env wins, for one-off experiments.
 case "$PROFILE" in
-  local-failover-qwen27) QWEN_CTX=32000 ;;   # qwen3.8:27b-bare @ 32K
+  # Both heavy tiers are held at 32000 even though each serves a 64K window.
+  # Smaller than the real window is the safe direction (the warning above is
+  # about rounding UP), and it keeps auto-compact firing just past the 28000
+  # ROUTE_MAX_INPUT_TOKENS escalation bound both profiles carry. Raising it to
+  # 64000 would park long sessions on the 4B 256K tier for the whole 28K-64K
+  # stretch instead of compacting.
+  local-qwen38-action) QWEN_CTX=32000 ;;    # MLX 27B @ 64K, held at 32K
+  local-failover-heavy) QWEN_CTX=32000 ;;   # qwen3.5:9b-64k @ 64K, held at 32K
   local-qwen35|local-fast) QWEN_CTX=64000 ;; # qwen3.5:4b-64k  @ 64K
   *) QWEN_CTX=32000 ;;                       # unknown profile: assume the floor
 esac
@@ -113,18 +120,31 @@ fi
 # 2. Verify the model for this profile is actually pulled (offline-ready).
 #    Query the API with a small retry — `ollama list` can race a fresh daemon.
 MODEL="$(grep -E '^PROVIDER_MODEL=' "$HOME/backdoor/profiles/$PROFILE.env" | cut -d= -f2-)"
-present=""
-for _ in 1 2 3 4 5; do
-  # match "MODEL" or "MODEL:tag" in the API's JSON name field
-  if curl -sf http://127.0.0.1:11434/api/tags 2>/dev/null | grep -qE "\"${MODEL}(:[^\"]*)?\""; then
-    present=1; break
+if [ "$PROFILE" = "local-qwen38-action" ]; then
+  # The MLX tier has no Ollama tag to find — PROVIDER_MODEL is a label the
+  # mlx_vlm server answers to, and /api/tags will never list it. Checking for it
+  # there would fail every launch. The readiness check that matters is whether
+  # the weights are on disk; the server itself gets started further down.
+  if [ ! -e "$HOME/Models/Qwen3.8-27B-Action-Abliterated-MLX-4bit-v1/config.json" ]; then
+    echo "WARNING: the MLX artifact is not installed."
+    echo "Run backdoor/local/install-qwen38.sh (see its header for the download), or"
+    echo "use 'qwen fast' / '/model qwen-stock' for an Ollama tier in the meantime."
+    exit 1
   fi
-  sleep 1
-done
-if [ -z "$present" ]; then
-  echo "WARNING: model '$MODEL' is not available yet."
-  echo "Pull/build it WHILE ONLINE (see profiles/README-local.md), then retry."
-  exit 1
+else
+  present=""
+  for _ in 1 2 3 4 5; do
+    # match "MODEL" or "MODEL:tag" in the API's JSON name field
+    if curl -sf http://127.0.0.1:11434/api/tags 2>/dev/null | grep -qE "\"${MODEL}(:[^\"]*)?\""; then
+      present=1; break
+    fi
+    sleep 1
+  done
+  if [ -z "$present" ]; then
+    echo "WARNING: model '$MODEL' is not available yet."
+    echo "Pull/build it WHILE ONLINE (see profiles/README-local.md), then retry."
+    exit 1
+  fi
 fi
 
 # 3. MCP defaults: OFF in every mode now. MCP tool schemas are huge (~142K
@@ -327,12 +347,31 @@ done
 # and the collision correspondingly worse. The qwen3.8 swap on 2026-08-16
 # measured 17GB, so the collision eased, but a ~21GB council still does not fit
 # beside it under the ~27GB wired ceiling. Keep the 10m. See the panic note in
-# modelfiles/bare/qwen3.8-27b-bare.Modelfile.
-KEEP_ALIVE="30m"
-[ "$PROFILE" = "local-failover-qwen27" ] && KEEP_ALIVE="10m"
-curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
-  -d "{\"model\":\"$MODEL\",\"keep_alive\":\"$KEEP_ALIVE\",\"options\":{\"num_predict\":1},\"messages\":[{\"role\":\"system\",\"content\":\"warmup\"},{\"role\":\"user\",\"content\":\"hi\"}]}" \
-  >/dev/null 2>&1 &
+# modelfiles/bare/qwen3.8-27b-bare.Modelfile. (2026-08-25: the heavy tier is now
+# the ~10-12GB 9B, so the clamp is no longer load-bearing for the council — kept
+# because restoring the 27B tag would silently re-arm the collision.)
+#
+# The MLX tier is the exception to all of the above. It is not an Ollama tag, so
+# there is no keep_alive to clamp and no lazy load to warm: the server is either
+# running or it is not. Start it in the foreground instead, because a `qwen`
+# session that races a 15GiB weight load just fails its first turn. The router
+# does the same thing on its own path (src/proxy/mlx_admin.py) for sessions that
+# never touch this wrapper.
+if [ "$PROFILE" = "local-qwen38-action" ]; then
+  if command -v qwen38 >/dev/null 2>&1; then
+    qwen38 start || {
+      echo "qwen: MLX server would not start; the router will fall back to the 9B." >&2
+    }
+  else
+    echo "qwen: qwen38 helper not on PATH — run backdoor/local/install-qwen38.sh." >&2
+  fi
+else
+  KEEP_ALIVE="30m"
+  [ "$PROFILE" = "local-failover-heavy" ] && KEEP_ALIVE="10m"
+  curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
+    -d "{\"model\":\"$MODEL\",\"keep_alive\":\"$KEEP_ALIVE\",\"options\":{\"num_predict\":1},\"messages\":[{\"role\":\"system\",\"content\":\"warmup\"},{\"role\":\"user\",\"content\":\"hi\"}]}" \
+    >/dev/null 2>&1 &
+fi
 
 if [ "${MCP_ARGS[2]:-}" = "$HOME/backdoor/empty-mcp.json" ]; then
   MCP_NOTE="offline"

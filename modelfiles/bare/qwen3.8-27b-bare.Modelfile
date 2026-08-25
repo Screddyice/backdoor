@@ -1,5 +1,5 @@
 # qwen3.8:27b-bare — the cloud→local failover brain (profiles/
-# local-failover-qwen27.env). "bare" is the whole point: NO baked system prompt,
+# local-failover-heavy.env). "bare" is the whole point: NO baked system prompt,
 # 32K window, and a model that can still call tools.
 #
 # Upgraded 2026-08-16 from qwen3.5:27b-bare. Note the version jump skips 3.7:

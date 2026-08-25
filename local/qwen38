@@ -1,0 +1,278 @@
+#!/bin/zsh
+# qwen38 — start/stop the Qwen3.8-27B Action-Abliterated MLX server (127.0.0.1:8080).
+#
+# VENDORED from ajsai47/qwen38-action-abliterated-research (local/qwen38), with
+# the author's hardcoded /Users/ajsai47 paths replaced by ${HOME}. Re-vendor
+# rather than diverge if upstream changes.
+#
+# This is the ONLY local tier that does not run on Ollama — Ollama's MLX engine
+# ignores num_ctx and loads a 262144 window. See profiles/local-qwen38-action.env.
+#
+# The server is not started on demand: run `qwen38 start` before
+# `/model qwen38-action`, and `qwen38 stop` before any llm-jury council work —
+# it holds ~19GB that Ollama cannot evict.
+set -eu
+
+# NOTE: opencode is not installed on this host, so the `opencode` /
+# `opencode-long` subcommands will fail here. start/stop/status/logs — the
+# paths backdoor actually needs — do not touch it.
+readonly OPENCODE_BIN="/opt/homebrew/bin/opencode"
+readonly DAILY_LABEL="com.aicollective.qwen38-mlx"
+readonly LONG_LABEL="com.aicollective.qwen38-mlx-long"
+readonly LAUNCH_AGENT_DIR="${HOME}/Library/LaunchAgents"
+readonly DAILY_LOG="${HOME}/Library/Logs/qwen38-mlx-server.log"
+readonly LONG_LOG="${HOME}/Library/Logs/qwen38-mlx-server-long.log"
+readonly HEALTH_URL="http://127.0.0.1:8080/health"
+readonly MIN_DAILY_DISK_KIB=$((15 * 1024 * 1024))
+readonly MIN_LONG_DISK_KIB=$((25 * 1024 * 1024))
+typeset -g STARTED_HERE=0
+typeset -g AUTO_STOP=0
+
+label_for() {
+  [[ "$1" == "long" ]] && print -r -- "$LONG_LABEL" || print -r -- "$DAILY_LABEL"
+}
+
+plist_for() {
+  print -r -- "${LAUNCH_AGENT_DIR}/$(label_for "$1").plist"
+}
+
+service_for() {
+  print -r -- "gui/$(id -u)/$(label_for "$1")"
+}
+
+log_for() {
+  [[ "$1" == "long" ]] && print -r -- "$LONG_LOG" || print -r -- "$DAILY_LOG"
+}
+
+service_pid() {
+  launchctl print "$(service_for "$1")" 2>/dev/null |
+    awk '/^[[:space:]]*pid = / { print $3; exit }'
+}
+
+ensure_loaded() {
+  local profile="$1"
+  local plist service
+  plist="$(plist_for "$profile")"
+  service="$(service_for "$profile")"
+  [[ -f "$plist" ]] || {
+    print -u2 "Missing $plist. Reinstall the Qwen3.8 LaunchAgents."
+    return 1
+  }
+  if ! launchctl print "$service" >/dev/null 2>&1; then
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+  fi
+}
+
+available_disk_kib() {
+  df -Pk "${HOME}" | awk 'NR == 2 { print $4 }'
+}
+
+free_memory_percent() {
+  memory_pressure -Q 2>/dev/null |
+    awk -F': ' '/System-wide memory free percentage/ { gsub(/%/, "", $2); print $2 }'
+}
+
+check_safety() {
+  local profile="$1"
+  local disk_kib min_disk_kib memory_percent min_memory_percent
+  disk_kib="$(available_disk_kib)"
+  memory_percent="$(free_memory_percent)"
+
+  if [[ "$profile" == "long" ]]; then
+    min_disk_kib="$MIN_LONG_DISK_KIB"
+    min_memory_percent=45
+  else
+    min_disk_kib="$MIN_DAILY_DISK_KIB"
+    min_memory_percent=20
+  fi
+
+  if (( disk_kib < min_disk_kib )); then
+    print -u2 "Refusing to start: only $((disk_kib / 1024 / 1024)) GiB disk is free; ${profile} mode requires at least $((min_disk_kib / 1024 / 1024)) GiB."
+    print -u2 "Set QWEN38_FORCE=1 only if you accept swap and disk-pressure risk."
+    [[ "${QWEN38_FORCE:-0}" == "1" ]] || return 1
+  fi
+
+  if [[ -n "$memory_percent" ]] && (( memory_percent < min_memory_percent )); then
+    print -u2 "Refusing to start: memory headroom is ${memory_percent}%; ${profile} mode requires at least ${min_memory_percent}%."
+    print -u2 "Close memory-heavy applications or set QWEN38_FORCE=1 to override."
+    [[ "${QWEN38_FORCE:-0}" == "1" ]] || return 1
+  fi
+
+  if [[ "$profile" == "long" ]]; then
+    print "Long mode exposes 262K context. Close memory-heavy applications and monitor swap."
+  fi
+}
+
+active_profile() {
+  local profile
+  for profile in daily long; do
+    if [[ -n "$(service_pid "$profile")" ]]; then
+      print -r -- "$profile"
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_server() {
+  local profile="${1:-daily}"
+  local active pid service log
+  STARTED_HERE=0
+
+  active="$(active_profile || true)"
+  if [[ -n "$active" ]]; then
+    pid="$(service_pid "$active")"
+    if [[ "$active" == "$profile" ]] && curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; then
+      print "Qwen3.8 ${profile} server is already running (PID $pid)."
+      return 0
+    fi
+    print -u2 "Qwen3.8 ${active} mode is already running. Use 'qwen38 stop' before switching profiles."
+    return 1
+  fi
+
+  if curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; then
+    print -u2 "Port 8080 already has an unmanaged server. Stop it before using this helper."
+    return 1
+  fi
+
+  check_safety "$profile"
+  log="$(log_for "$profile")"
+  mkdir -p -- "${log:h}"
+  ensure_loaded "$profile"
+  service="$(service_for "$profile")"
+  launchctl kickstart "$service"
+
+  local attempt
+  for attempt in {1..60}; do
+    if curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; then
+      pid="$(service_pid "$profile")"
+      STARTED_HERE=1
+      if [[ "$profile" == "long" ]]; then
+        print "Qwen3.8 long server is ready (PID $pid, 262K context, 8-bit KV, prefix cache)."
+      else
+        print "Qwen3.8 daily server is ready (PID $pid, 64K context, 8-bit KV, prefix cache)."
+      fi
+      return 0
+    fi
+    sleep 1
+  done
+
+  print -u2 "Qwen3.8 ${profile} server did not become ready within 60 seconds. See $log"
+  return 1
+}
+
+stop_profile() {
+  local profile="$1"
+  local pid service
+  pid="$(service_pid "$profile")"
+  [[ -n "$pid" ]] || return 0
+  service="$(service_for "$profile")"
+  launchctl kill SIGTERM "$service"
+
+  local attempt
+  for attempt in {1..30}; do
+    [[ -z "$(service_pid "$profile")" ]] && return 0
+    sleep 1
+  done
+  print -u2 "Qwen3.8 ${profile} server did not stop cleanly; PID $pid is still running."
+  return 1
+}
+
+stop_server() {
+  local had_server=0
+  [[ -n "$(service_pid daily)" ]] && had_server=1
+  [[ -n "$(service_pid long)" ]] && had_server=1
+  stop_profile daily
+  stop_profile long
+  if (( had_server )); then
+    print "Qwen3.8 server stopped."
+  else
+    print "Qwen3.8 server is not running."
+  fi
+}
+
+show_status() {
+  local profile pid
+  profile="$(active_profile || true)"
+  if [[ -z "$profile" ]]; then
+    print "stopped"
+    return 0
+  fi
+  pid="$(service_pid "$profile")"
+  print "running: ${profile} (PID $pid)"
+  curl -fsS --max-time 2 "$HEALTH_URL" || true
+  print
+}
+
+run_opencode() {
+  local profile="$1"
+  local model="$2"
+  shift 2
+  start_server "$profile"
+  AUTO_STOP="$STARTED_HERE"
+
+  cleanup() {
+    if (( AUTO_STOP )); then
+      AUTO_STOP=0
+      stop_server >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup EXIT HUP INT TERM
+  set +e
+  "$OPENCODE_BIN" --model "$model" "$@"
+  local rc="$?"
+  set -e
+  cleanup
+  trap - EXIT HUP INT TERM
+  return "$rc"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: qwen38 COMMAND [arguments...]
+
+  start             Start safe daily mode: 64K context, 8-bit KV
+  start-long        Start explicit long mode: 262K context, 8-bit KV
+  stop              Unload either profile and recover unified memory
+  status            Show the active profile and MLX health
+  logs              Follow the daily-mode server log
+  logs-long         Follow the long-mode server log
+  opencode          Run OpenCode in daily mode; auto-stop when it exits
+  opencode-long     Run OpenCode in 262K mode; auto-stop when it exits
+EOF
+}
+
+case "${1:-}" in
+  start)
+    start_server daily
+    ;;
+  start-long)
+    start_server long
+    ;;
+  stop)
+    stop_server
+    ;;
+  status)
+    show_status
+    ;;
+  logs)
+    touch "$DAILY_LOG"
+    tail -f "$DAILY_LOG"
+    ;;
+  logs-long)
+    touch "$LONG_LOG"
+    tail -f "$LONG_LOG"
+    ;;
+  opencode)
+    shift
+    run_opencode daily mlx/qwen38-local "$@"
+    ;;
+  opencode-long)
+    shift
+    run_opencode long mlx/qwen38-local-262k "$@"
+    ;;
+  *)
+    usage
+    [[ -n "${1:-}" ]] && return 2 || return 0
+    ;;
+esac
