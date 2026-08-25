@@ -159,7 +159,7 @@ async def test_stripped_size_picks_the_tier(offline_app):
     stripped = count_messages(bare.messages, bare.system, bare.tools)
 
     assert pick_failover_profile(raw) == "local-failover-256k"       # the 4B
-    assert pick_failover_profile(stripped) == "local-failover-heavy"
+    assert pick_failover_profile(stripped) == "local-qwen38-action"
 
 
 # --- deliberate `/model qwen` must obey the ladder too ---------------------

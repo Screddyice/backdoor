@@ -464,8 +464,8 @@ from src.proxy.config import pick_failover_profile, FAILOVER_LADDER
 def test_ladder_normal_session_gets_the_strong_tool_capable_tier():
     """The common case after bare-mode stripping: a small prompt, so the
     strongest local model rather than the widest-window one."""
-    assert pick_failover_profile(0) == "local-failover-heavy"
-    assert pick_failover_profile(28_000) == "local-failover-heavy"
+    assert pick_failover_profile(0) == "local-qwen38-action"
+    assert pick_failover_profile(28_000) == "local-qwen38-action"
 
 
 def test_ladder_oversize_session_falls_back_to_the_wide_4b():

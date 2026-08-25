@@ -59,7 +59,11 @@ class Settings(BaseSettings):
     # (see FAILOVER_LADDER), measured AFTER bare-mode stripping — the size that
     # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
-    failover_profile: str = "local-failover-heavy"  # default tier
+    # 2026-08-25: the abliterated 27B on MLX, by explicit decision. It is not
+    # lazily loaded like the Ollama tiers, so routes.py starts it on demand and
+    # drops to local-failover-heavy (9B) when it will not come up. See
+    # src/proxy/mlx_admin.py.
+    failover_profile: str = "local-qwen38-action"  # default tier
     # Probe on the first transport failure. The connectivity probe remains the
     # safety gate: local failover opens only when the host is offline. Waiting
     # for a second Claude retry exposed one avoidable API error before asking
@@ -203,15 +207,15 @@ def clear_settings_cache():
 # Model names a Claude Code session can request (via `/model <name>` or
 # `--model <name>`) that route to a LOCAL profile in hybrid mode.
 MODEL_ROUTES: dict[str, str] = {
-    "qwen": "local-failover-heavy",  # qwen3.5:9b-64k — same as backdoor
+    "qwen": "local-qwen38-action",  # Qwen3.8-27B Action-Abliterated (MLX) — same as backdoor
     "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
     "qwen-9b": "local-qwen-9b",   # qwen3.5:9b-64k — stronger brain for subagents
-    # Name-only tier: Qwen3.8-27B Action-Abliterated on MLX (127.0.0.1:8080, NOT
-    # Ollama). Requires `qwen38 start` first. Reduced-refusal model — kept out of
-    # "qwen", failover_profile, and FAILOVER_LADDER on purpose so it is never
-    # reached by an unattended subagent or an offline failover. The reasoning is
-    # in profiles/local-qwen38-action.env; read it before promoting this.
+    # Explicit alias for the same tier "qwen" now points at, kept so a session
+    # can name the model rather than the slot.
     "qwen38-action": "local-qwen38-action",
+    # The stock 9B, still reachable by name. This is what to type when you want
+    # a model with its refusal behaviour intact.
+    "qwen-stock": "local-failover-heavy",
 }
 
 
@@ -233,7 +237,7 @@ MODEL_ROUTES: dict[str, str] = {
 # still overflows the 27B's 32K window — at which point a weaker model that
 # retains the session beats a stronger one that truncates it.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (28_000, "local-failover-heavy"),      # qwen3.5:9b-64k (64K window, tools)
+    (28_000, "local-qwen38-action"),        # abliterated 27B on MLX (64K, tools)
     (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
 ]
 

@@ -515,10 +515,11 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
-| `qwen` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
+| `qwen` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | 64K | yes |
+| `qwen38-action` | `local-qwen38-action` | the same tier, named directly | 64K | yes |
+| `qwen-stock` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
 | `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
-| `qwen38-action` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | 64K | yes |
 
 Stripping reuses the `failover_*` keep-list and truncation budget, so both paths build the same request shape. A route that stripped differently from failover would be a second behaviour to keep in sync for no gain.
 
@@ -596,6 +597,7 @@ The wrapper warms its tier at launch so the first turn skips the cold load, then
 | Profile | `keep_alive` |
 |---|---|
 | `local-failover-heavy` | **10m** |
+| `local-qwen38-action` | n/a, not an Ollama tag |
 | every other profile | 30m |
 
 Thirty idle minutes of a resident 27B is thirty minutes in which `llmjury solve` can collide with it, and neither side will refuse: Ollama counts models, not bytes. Ten minutes still spans an active session and returns the GPU sooner. Failover has a stronger interlock and does not need this — llm-jury reads `~/.backdoor/failover-state.json` and stands down while the breaker is open — but a deliberate `qwen` session writes no such file, so the shorter hold is the only thing bounding the overlap.
@@ -606,7 +608,7 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-failover-heavy` | `qwen3.5:9b-64k` | `--bare` client-side holds the prompt near 945 tokens |
+| `qwen`, `qwen lean` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | `--bare` client-side holds the prompt near 945 tokens |
 | `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
 | `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the heavy tier costs more GPU than the task is worth |
 
@@ -687,15 +689,27 @@ The second check is the one that catches the old MLX failure: that build sat at 
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
 
-### `qwen38-action`: a reduced-refusal tier you ask for by name
+### The default local brain is `qwen38-action`
 
 Qwen3.8-27B Action-Abliterated comes from `ajsai47/qwen38-action-abliterated-research`: a pinned Qwen3.8-27B checkpoint trained on action contracts, then put through a bounded refusal-direction ablation. Its model card records a 92.5% HarmBench direct-request attack-success rate, and StrongREJECT assistance on forbidden prompts at 87.22% against the base model's 10.54%. Capability held flat, with 62.50% on a frozen 280-item MMLU-Pro sample, matching upstream.
 
-That first number decides how the tier is wired. You reach it by typing `/model qwen38-action`, and nothing else routes there. It stays out of `MODEL_ROUTES["qwen"]`, out of `failover_profile`, and out of `FAILOVER_LADDER`, so an offline host and a `model: qwen` subagent both land on the stock 9B instead. The model card puts unsupervised tool use out of scope, and `local-worker` is dispatched unattended with Bash and Write. `tests/test_qwen38_action_containment.py` turns that boundary into a build failure if someone rewires any of the three.
+Since 2026-08-25 it backs `/model qwen`, the `qwen` wrapper's default and lean modes, and cloud-to-local failover. `qwen38-action` names the same tier directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
 
-It also skips Ollama. The artifact ships as MLX 4-bit, and the section below covers what Ollama's MLX engine does with a `num_ctx` it ignores. `mlx_vlm.server` honors `--max-kv-size`, so the window it reports is the window you get. One consequence: Ollama cannot evict this server to make room, and it holds about 19GB while loaded.
+Read the model card before you lean on it. Reduced refusal is not permission, and it says so itself: the card puts unsupervised execution with destructive, financial, credential, or otherwise high-impact tools out of scope, and this wiring puts the model on exactly those paths. Failover fires with nobody watching, and `local-worker` gets dispatched with Bash and Write. Scoped tool permissions and reading what an unattended agent actually did are the controls now, because the model is no longer one of them.
 
-Setup runs once:
+#### It is the one tier nothing loads lazily
+
+Every other local tier is an Ollama tag that loads on first request and gets evicted on a timer. This one is a launchd job holding about 19GB, up or absent, with nothing in between. Pointing failover at a tier that cannot start itself would break the fallback in the one situation it exists for, so `src/proxy/mlx_admin.py` probes `127.0.0.1:8080/health`, runs `launchctl kickstart` when it finds nothing, and waits up to 90 seconds for the weights to load. When the server will not come up, the request goes to `local-failover-heavy` and the log says so:
+
+```
+⇢ MLX FALLBACK [local-qwen38-action → local-failover-heavy] /v1/messages
+```
+
+That fallback is why `local-failover-heavy` still exists. Deleting it because `qwen` points elsewhere now would leave an offline host with no answer at all.
+
+Ollama cannot evict this server either, so `qwen38 stop` before an `llmjury solve` run rather than letting a 19GB server and a 21GB council fight over a 36GB host.
+
+#### Setup
 
 ```
 hf auth login
@@ -706,15 +720,15 @@ local/install-qwen38.sh
 
 Two traps live in that download. `hf-xet` 1.6.0 stalls at zero bytes instead of running slow, so turn it off. `HTTPS_PROXY` also points at the backdoor forward proxy on :8084, and its `NO_PROXY` covers github.com but not huggingface.co, which drags a 16GB pull through mitmproxy at about 1 MB/s. The install script verifies the download against the `SOURCE_SHA256SUMS` the artifact ships with and refuses to pin a snapshot that fails.
 
-Start the server before you route to it:
+Manual control, for when you want it:
 
 ```
 qwen38 start     # 65,536 context, 8-bit KV, ~19GB resident
 qwen38 status
-qwen38 stop      # before any llmjury solve
+qwen38 stop
 ```
 
-Nothing starts it on demand, so routing to a stopped server returns a connection error. Long mode (`qwen38 start-long`, 262K context) is configured but unproven here. Upstream passed 261,888-token retrieval on an A100, never on this Mac, and the profile guard wants 25GB free disk before it will run.
+Long mode (`qwen38 start-long`, 262K context) is configured but unproven here. Upstream passed 261,888-token retrieval on an A100, never on this Mac, and the profile guard wants 25GB free disk before it will run.
 
 #### The 27B tier must be GGUF, not int4/MLX
 
