@@ -142,10 +142,56 @@ async def _upstream_send(request: Request, body: bytes, settings: Settings) -> h
     raise RuntimeError("unreachable")
 
 
-def _relay_upstream(uresp: httpx.Response) -> StreamingResponse:
+async def _relay_body(uresp: httpx.Response, settings: Settings) -> AsyncIterator[bytes]:
+    """Stream the upstream body through, counting a mid-stream death.
+
+    `_try_upstream` only guards up to the headers-received stage. Once headers
+    are on the wire the response is committed: FastAPI has sent 200 and the
+    client is reading a body, so there is no longer anything to substitute — the
+    local model cannot take over a turn the client is already halfway through.
+    That part is unavoidable, and the connection still dies.
+
+    What was avoidable is that it died SILENTLY. `aiter_raw()` went straight
+    into StreamingResponse, so a transport error inside it escaped to uvicorn,
+    whose only answer mid-response is to tear the connection down — rendered by
+    Claude Code as `The response stopped arriving. The response above may be
+    incomplete.` — and it never reached :meth:`FailoverBreaker.record_failure`.
+
+    That is the same two-part bug `_guarded_passthrough` was written for on
+    2026-08-24, one layer further downstream, and it cost a 2026-08-26 23:17
+    incident its entire diagnostic trail: the router logged NOTHING for the
+    failed turn, because the only code that logs and counts had already
+    returned successfully three minutes earlier.
+
+    Counting it matters even though this request is lost. A truncated stream is
+    a strong signal that the next request is about to fail the same way, and the
+    client retries within seconds; feeding it to the breaker is what lets that
+    retry be served locally instead of truncating again. The breaker still
+    decides on its own terms — `record_failure` runs the connectivity probe, so
+    a stream Anthropic dropped while this host is online relays the failure
+    rather than claiming the GPU.
+
+    A client disconnect must NOT be counted: that is `asyncio.CancelledError` /
+    `GeneratorExit`, neither of which is an `httpx.TransportError`, so both pass
+    through untouched.
+    """
+    try:
+        async for chunk in uresp.aiter_raw():
+            yield chunk
+    except httpx.TransportError as exc:
+        logger.warning(
+            "upstream stream died mid-response after %d byte(s) (%s): %s — "
+            "headers were already sent, so this turn cannot be failed over",
+            uresp.num_bytes_downloaded, type(exc).__name__, exc,
+        )
+        get_breaker(settings).record_failure(type(exc).__name__)
+        raise
+
+
+def _relay_upstream(uresp: httpx.Response, settings: Settings) -> StreamingResponse:
     resp_headers = {k: v for k, v in uresp.headers.items() if k.lower() not in _SKIP_RESP_HEADERS}
     return StreamingResponse(
-        uresp.aiter_raw(),
+        _relay_body(uresp, settings),
         status_code=uresp.status_code,
         headers=resp_headers,
         background=BackgroundTask(uresp.aclose),
@@ -189,7 +235,7 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
         logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
         get_breaker(settings).record_failure(type(e).__name__)
         return None
-    return _relay_upstream(uresp)
+    return _relay_upstream(uresp, settings)
 
 
 # ── Cloud→local failover ─────────────────────────────────────────────────────
@@ -208,6 +254,106 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
             probe_interval=settings.failover_probe_seconds,
         )
     return _breaker
+
+
+# Failover responses still being generated, and the tiers whose release is
+# waiting on them. See _release_claims for why the two cannot be independent.
+_failover_inflight: int = 0
+_deferred_unloads: set[tuple[str, str]] = set()
+
+
+async def _release_claims(br: FailoverBreaker, settings: Settings) -> None:
+    """Hand back the local tiers a closing breaker no longer needs.
+
+    Releasing on close is precise where Ollama's global 5m idle timer is not,
+    and the timer is refreshed by every request an outage generates, so a busy
+    outage releases LATER than a quiet one. That is why this exists.
+
+    But "the breaker closed" is not the same as "nothing is using the tier". The
+    breaker closes on the first upstream SUCCESS, and that success is a
+    different, newer request than the failover streams still running — a local
+    tier prefilling a large session emits nothing for minutes, so a stream
+    dispatched during the outage is routinely still open when the outage ends.
+    Unloading underneath it evicts the model that stream is mid-generation on.
+
+    Observed 2026-08-26: a failover stream opened at 23:10:34 was still running
+    when the breaker closed at 23:14:17 and unloaded `qwen3.5:4b-256k` in the
+    same 62ms window; the stream then produced nothing until it died on the
+    600-second read timeout at 23:20:38.
+
+    So the unload waits for the last in-flight failover response, and is dropped
+    entirely if a FRESH outage re-opened the breaker while it waited — that tier
+    is claimed again and releasing it would evict a model now in use.
+    """
+    claims = br.drain_claims()
+    if not claims:
+        return
+    if _failover_inflight:
+        # Deferred, not backgrounded: a detached task cannot see a later
+        # re-open, and would unload a tier the next outage had re-claimed.
+        _deferred_unloads.update(claims)
+        logger.info(
+            "breaker closed with %d failover response(s) still streaming — "
+            "deferring release of %s",
+            _failover_inflight, ", ".join(sorted(m for _, m in claims)),
+        )
+        return
+    for base_url, model in claims:
+        await ollama_admin.unload(base_url, model)
+
+
+def _failover_stream_started() -> None:
+    global _failover_inflight
+    _failover_inflight += 1
+
+
+def _failover_stream_ended() -> set[tuple[str, str]]:
+    """Drop this response from the in-flight count; return any tiers now due.
+
+    Split from the unloading itself, and deliberately free of `await`, because
+    the only caller is a `finally` inside an async generator: entered on normal
+    completion, on error, and on the `aclose()` a client disconnect triggers.
+    Decrementing before any suspension point means a cancellation landing on the
+    release cannot leave the count permanently elevated — and an elevated count
+    would defer every future unload forever, which is a worse failure than the
+    race this fixes.
+    """
+    global _failover_inflight, _deferred_unloads
+    _failover_inflight = max(0, _failover_inflight - 1)
+    if _failover_inflight or not _deferred_unloads:
+        return set()
+    claims, _deferred_unloads = _deferred_unloads, set()
+    return claims
+
+
+async def _release_deferred(
+    claims: set[tuple[str, str]], settings: Settings
+) -> None:
+    """Unload tiers whose release waited for the last failover response."""
+    if get_breaker(settings).open:
+        # Re-opened while we waited: the tier is claimed again, and the new
+        # outage's own close is what should release it.
+        logger.info("failover re-opened while releasing — leaving tiers resident")
+        return
+    for base_url, model in claims:
+        await ollama_admin.unload(base_url, model)
+
+
+async def _tracked_failover_stream(
+    inner: AsyncIterator[str], settings: Settings
+) -> AsyncIterator[str]:
+    """Hold a failover response's tier claim open for as long as it generates."""
+    _failover_stream_started()
+    try:
+        async for event in inner:
+            yield event
+    finally:
+        due = _failover_stream_ended()
+        if due:
+            try:
+                await _release_deferred(due, settings)
+            except Exception:  # release is housekeeping; never mask the response
+                logger.exception("deferred tier release failed")
 
 
 async def _try_upstream(request: Request, body: bytes, settings: Settings):
@@ -243,16 +389,9 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
     br.record_success()
     if was_open:
         # The breaker just closed, so every tier it caused to be loaded is now
-        # dead weight. Release them here rather than leaving it to Ollama's idle
-        # timer: this is the exact moment the GPU stopped being needed, and the
-        # timer is both longer (5m global) and refreshed by every request the
-        # outage generated, so a busy outage releases LATER than a quiet one.
-        # Awaited, not backgrounded — it is a localhost call with a 5s cap, and
-        # a detached task could outlive the request and unload a tier a fresh
-        # outage had already re-claimed.
-        for base_url, model in br.drain_claims():
-            await ollama_admin.unload(base_url, model)
-    return _relay_upstream(uresp)
+        # dead weight — unless a failover response is still generating from one.
+        await _release_claims(br, settings)
+    return _relay_upstream(uresp, settings)
 
 
 def _model_from_body(body: bytes) -> str:
@@ -487,9 +626,15 @@ async def create_message(
 
     if req.stream:
         input_tokens = est_in
+        body = _stream(client, payload, msg_id, req, input_tokens, provider,
+                       settings.provider_strip_inline_thinking)
+        if failed_over:
+            # Only the failover path: a deliberate `/model qwen` loads a tier
+            # too, but the breaker never claimed it and closing must not
+            # release it, so it has nothing to hold open.
+            body = _tracked_failover_stream(body, get_settings())
         return StreamingResponse(
-            _stream(client, payload, msg_id, req, input_tokens, provider,
-                    settings.provider_strip_inline_thinking),
+            body,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
