@@ -349,3 +349,130 @@ async def test_deliberate_model_route_is_never_claimed(monkeypatch, fake_http):
         app.dependency_overrides.clear()
         routes._upstream_client = None
         routes._breaker = None
+
+
+# --------------------------------------------------------------------------
+# Releasing must wait for responses that are still generating
+# --------------------------------------------------------------------------
+# The breaker closes on the first upstream SUCCESS, and that success is a newer,
+# different request than the failover streams still running. A local tier
+# prefilling a large session emits nothing for minutes, so a stream dispatched
+# during the outage is routinely still open when the outage ends — and the close
+# was unloading the model out from under it.
+#
+# Observed 2026-08-26: a failover stream opened at 23:10:34 was still running
+# when the breaker closed at 23:14:17 and released `qwen3.5:4b-256k` in the same
+# 62ms window. That stream then produced nothing until it died on the
+# 600-second read timeout at 23:20:38.
+
+@pytest.fixture
+def quiet_inflight():
+    """Reset the module-level in-flight bookkeeping around each test."""
+    from src.proxy import routes
+
+    routes._failover_inflight = 0
+    routes._deferred_unloads = set()
+    try:
+        yield routes
+    finally:
+        routes._failover_inflight = 0
+        routes._deferred_unloads = set()
+        routes._breaker = None
+
+
+def _unloads(fake_http):
+    return [b["model"] for _, b in fake_http.calls if b["keep_alive"] == 0]
+
+
+@pytest.mark.asyncio
+async def test_close_defers_release_while_a_failover_stream_is_open(
+    quiet_inflight, fake_http
+):
+    routes = quiet_inflight
+    br = make_breaker()
+    br.record_failure("ConnectError")
+    br.record_failure("ConnectError")
+    assert br.open
+    br.note_claim(OLLAMA, "qwen3.5:4b-256k")
+
+    routes._failover_stream_started()  # a response is mid-generation on that tier
+    br.record_success()
+    await routes._release_claims(br, Settings(router_mode="hybrid"))
+
+    assert _unloads(fake_http) == [], "unloaded a tier a live stream was using"
+    assert routes._deferred_unloads == {(OLLAMA, "qwen3.5:4b-256k")}
+
+
+@pytest.mark.asyncio
+async def test_last_stream_out_releases_the_deferred_tier(quiet_inflight, fake_http):
+    routes = quiet_inflight
+    br = make_breaker()
+    br.record_failure("ConnectError")
+    br.record_failure("ConnectError")
+    br.note_claim(OLLAMA, "qwen3.5:4b-256k")
+    settings = Settings(router_mode="hybrid")
+
+    routes._failover_stream_started()
+    routes._failover_stream_started()  # two sessions failed over onto one tier
+    br.record_success()
+    await routes._release_claims(br, settings)
+
+    due = routes._failover_stream_ended()
+    assert due == set(), "released while the second stream was still generating"
+    assert _unloads(fake_http) == []
+
+    due = routes._failover_stream_ended()
+    assert due == {(OLLAMA, "qwen3.5:4b-256k")}
+    routes._breaker = br  # _release_deferred re-checks the live breaker
+    await routes._release_deferred(due, settings)
+    assert _unloads(fake_http) == ["qwen3.5:4b-256k"]
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_outage_keeps_the_tier_resident(quiet_inflight, fake_http):
+    """Re-opening while we waited means the tier is claimed again.
+
+    Unloading here would evict a model the NEW outage is already serving from,
+    which is the same bug in the other direction.
+    """
+    routes = quiet_inflight
+    br = make_breaker()
+    br.record_failure("ConnectError")
+    br.record_failure("ConnectError")
+    br.note_claim(OLLAMA, "qwen3.5:4b-256k")
+    settings = Settings(router_mode="hybrid")
+
+    routes._failover_stream_started()
+    br.record_success()
+    await routes._release_claims(br, settings)
+
+    br.record_failure("ConnectError")  # the network drops again
+    br.record_failure("ConnectError")
+    assert br.open
+
+    due = routes._failover_stream_ended()
+    routes._breaker = br
+    await routes._release_deferred(due, settings)
+    assert _unloads(fake_http) == []
+
+
+@pytest.mark.asyncio
+async def test_tracked_stream_clears_its_slot_on_error(quiet_inflight):
+    """The count must come back down however the response ends.
+
+    A stream that raises is the common case here — the 2026-08-26 one died on a
+    read timeout — and a leaked slot would defer every later unload forever,
+    which is worse than the race being fixed.
+    """
+    routes = quiet_inflight
+
+    async def boom():
+        yield "event: ping\n\n"
+        raise httpx.ReadTimeout("upstream went away")
+
+    tracked = routes._tracked_failover_stream(boom(), Settings(router_mode="hybrid"))
+    assert await tracked.__anext__() == "event: ping\n\n"
+    assert routes._failover_inflight == 1
+    with pytest.raises(httpx.ReadTimeout):
+        await tracked.__anext__()
+    assert routes._failover_inflight == 0

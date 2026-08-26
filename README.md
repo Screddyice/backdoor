@@ -358,6 +358,26 @@ What each route does now when upstream will not answer:
 
 Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
 
+### A stream that dies after the headers
+
+The guard above stops at the headers. Once Anthropic answers `200` and Backdoor starts relaying the body, that response is committed: your client is already reading it, and no local model can take over a turn halfway through.
+
+Two incidents on 2026-08-26, at 23:17 and 23:47, both surfaced in Claude Code as `The response stopped arriving. The response above may be incomplete.` The router log said nothing about either one. Its last word on both turns was the `→ passthrough` line that started them.
+
+`aiter_raw()` went into `StreamingResponse` bare, so a transport error inside the body escaped to uvicorn, which answers mid-response by dropping the client socket. The breaker never heard about it, which mattered on the retry: your client comes back within seconds, and a breaker that counted nothing has no reason to serve that retry locally.
+
+Backdoor cannot rescue the truncated request. It now does the two things still available to it:
+
+| | |
+|---|---|
+| Logs it | `upstream stream died mid-response after N byte(s)`, with the exception name and how far the body got |
+| Counts it | `record_failure()`, so the retry can be served locally instead of truncating again |
+
+A dead stream still runs the connectivity probe before anything opens. If Anthropic dropped your stream while this host is online, Backdoor relays the failure and leaves the GPU alone.
+
+Hanging up yourself does not count. `CancelledError` and `GeneratorExit` are not `httpx.TransportError`, so pressing Ctrl-C never pushes the breaker toward claiming the GPU.
+
+
 ### Forward-proxy mode: failover *and* Remote Control
 
 Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
@@ -684,8 +704,15 @@ Two guards now, because either alone leaves a hole:
 |---|---|---|
 | Unload on close | `record_success()` drains the breaker's claims; the caller `POST`s `keep_alive: 0` | The normal case, precisely |
 | `PROVIDER_KEEP_ALIVE` | Failover-only profiles clamp idle residency to `45s` | An outage that ends with sessions abandoned and no successful call to close the breaker |
+| Wait for live streams | The unload defers while any failover response is still generating | A breaker that closes while a slow local prefill is mid-answer |
 
 Both go through Ollama's **native** API. `keep_alive` in a `/v1/chat/completions` body is silently ignored (verified against Ollama 0.32.13) and the model lands on the global default, so the clamp has to be a separate `/api/generate` call. With no `prompt` that call neither generates nor prefills — it returns `done_reason: "load"`, or `"unload"` for `keep_alive: 0`, and only touches the residency timer.
+
+Closing the breaker does not mean the tier is idle. The breaker closes on the first upstream success, and that success is a newer request than the failover streams still running. A local tier prefilling a 386K-token session emits nothing for minutes, so a stream dispatched during the outage is often still open when the outage ends.
+
+On 2026-08-26 a failover stream opened at 23:10:34. The breaker closed at 23:14:17 and released `qwen3.5:4b-256k` inside the same 62ms window, while that stream was still generating. It produced nothing after that and died on the 600-second read timeout at 23:20:38.
+
+Backdoor now counts the failover responses that are still generating and holds the unload until the last one finishes. If a fresh outage re-opens the breaker while an unload waits, it drops the unload: that tier is claimed again, and releasing it would evict a model the new outage is already serving from.
 
 Recovery is not instant. While OPEN the breaker probes upstream once per `failover_probe_seconds` (60s), so it cannot notice Anthropic is back until it is allowed to try. Release lands within about a minute of real recovery, against the nine minutes above.
 
