@@ -237,6 +237,35 @@ Ollama 0.32 rejects any system message at index > 0, including a payload that al
 plutil -p ~/Library/LaunchAgents/com.screddy.backdoor-router.plist | grep WorkingDirectory
 ```
 
+**Every Claude session shows "Waiting for API response - check your network"**
+The proxy is down, and one likely reason used to be that it could not start at all. Check first:
+
+```
+lsof -iTCP:8084 -sTCP:LISTEN -P
+curl -sk -m 6 --proxy http://127.0.0.1:8084 https://api.anthropic.com/v1/models -o /dev/null -w "%{http_code}\n"
+```
+
+A `401` in under a second is healthy: that is the correct unauthenticated answer, and it proves
+the whole path works. If nothing listens on 8084, read `~/Library/Logs/backdoor-router.log` for
+`backdoor failed during startup`.
+
+Until 2026-08-26 that message usually meant tiktoken. `src/proxy/tokens.py` built its encoder at
+import time, so starting the proxy required downloading `cl100k_base.tiktoken` from
+`openaipublic.blob.core.windows.net`. tiktoken caches to a temp directory macOS prunes, so the
+download returned on its own schedule, and a DNS failure while the Mac woke or a VPN settled
+raised inside `import` - before uvicorn could load the app. launchd relaunched into the same
+failure. Because every terminal Claude session on the machine proxies through :8084, all of them
+sat in retry backoff at once. On 2026-08-26 that cost seven hours: two failed starts at 08:10 and
+no proxy until 15:10.
+
+The encoder now loads on first use instead of at import, caches under `~/.backdoor/tiktoken` so it
+survives temp pruning, and falls back to a characters-per-token estimate if it cannot be built.
+Token counts only pick a local-model failover profile, so an estimate costs precision at a routing
+threshold and nothing else. Override the cache location with `TIKTOKEN_CACHE_DIR`.
+
+A restart still severs requests already in flight. Those sessions recover on their next retry, or
+at once with Esc and resend.
+
 **The router is serving code you did not just edit**
 The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), in detached HEAD, not from your dev clone. Editing the dev clone changes nothing until you deploy:
 
