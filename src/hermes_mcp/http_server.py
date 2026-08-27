@@ -1,16 +1,14 @@
 """MCPServer app exposing Hermes gateways over streamable HTTP.
 
 Two auth boundaries, deliberately distinct. Callers authenticate to the bridge
-with HERMES_MCP_KEY. The bridge authenticates to each gateway with that
-gateway's own key, named by the registry and read from the environment. A
-caller never holds a gateway key.
+with either its static bearer key or its browser OAuth flow. The bridge then
+authenticates to each gateway with that gateway's own key, named by the registry
+and read from the environment. A caller never holds a gateway key.
 
-The boot guard mirrors the one Hermes applies to its own API server. This
-process binds loopback too, but a tunnel publishes it beyond the host, while
-the gateway API servers it fronts are never exposed at all — so a weak key
-here is the one weak key that actually reaches the network. A bridge that
-boots with a weak key and rejects requests later is a bridge someone
-eventually "fixes" by turning the auth off.
+The static-key boot guard mirrors the one Hermes applies to its own API server.
+OAuth mode applies its own issuer, password, redirect, and state-file guards.
+The process binds loopback while a reverse proxy publishes it; the gateway API
+servers it fronts stay private.
 
 Note: the installed mcp SDK (mcp==2.0.0) renamed FastMCP to MCPServer and
 dropped `mcp.server.fastmcp`; MCPServer is used here in its place. Its public
@@ -25,10 +23,11 @@ import logging
 import os
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
-from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
+from .oauth import OAuthSettings, SingleUserOAuthProvider
 from .registry import Profile, load_registry
 from .tools import register_tools
 
@@ -137,16 +136,13 @@ class _BridgeTokenVerifier(TokenVerifier):
 
 
 def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
-    """Build the MCPServer app. Applies the boot guard before registering anything,
-    then wires per-request bearer auth (via token_verifier) so every request after
-    boot is checked too, not just the process's own startup.
+    """Build the MCPServer app in OAuth mode or static bearer mode.
 
-    auth_server_provider and resource_server_url are both left unset, so the SDK
-    mounts no OAuth discovery/authorization routes; issuer_url is a required
-    AuthSettings field but is never read in that configuration, so it holds an
-    inert placeholder rather than a real issuer.
+    HERMES_MCP_OAUTH_ISSUER selects the browser connector path and mounts OAuth
+    discovery, registration, login, token, and protected-resource routes. When
+    it is absent, the original HERMES_MCP_KEY boot guard and token verifier stay
+    in force.
     """
-    key = require_bridge_key()
     if registry is None:
         registry = load_registry()
     logger.info(
@@ -154,11 +150,34 @@ def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
         len(registry),
         ", ".join(f"{n}:{p.tier}" for n, p in sorted(registry.items())),
     )
-    mcp = MCPServer(
-        "hermes-mcp",
-        token_verifier=_BridgeTokenVerifier(key),
-        auth=AuthSettings(issuer_url="http://localhost", resource_server_url=None),
-    )
+    if os.environ.get("HERMES_MCP_OAUTH_ISSUER", "").strip():
+        oauth_settings = OAuthSettings.from_env()
+        provider = SingleUserOAuthProvider(oauth_settings)
+        mcp = MCPServer(
+            "hermes-mcp",
+            auth_server_provider=provider,
+            auth=AuthSettings(
+                issuer_url=oauth_settings.issuer,
+                resource_server_url=oauth_settings.resource_url,
+                required_scopes=[oauth_settings.scope],
+                client_registration_options=ClientRegistrationOptions(
+                    enabled=True,
+                    valid_scopes=[oauth_settings.scope],
+                    default_scopes=[oauth_settings.scope],
+                ),
+            ),
+        )
+
+        @mcp.custom_route("/login", methods=["GET", "POST"])
+        async def oauth_login(request):
+            return await provider.handle_login(request)
+    else:
+        key = require_bridge_key()
+        mcp = MCPServer(
+            "hermes-mcp",
+            token_verifier=_BridgeTokenVerifier(key),
+            auth=AuthSettings(issuer_url="http://localhost", resource_server_url=None),
+        )
     register_tools(mcp, registry)
     return mcp
 

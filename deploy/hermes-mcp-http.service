@@ -12,8 +12,17 @@
 # holds real values and this repo is public. It must define, one KEY=value
 # per line:
 #   HERMES_MCP_KEY=<a long, random string>
-#     Required. Boot refuses on missing, short (<16 chars), or
-#     placeholder-looking values — never a real value in this repo.
+#     Required in static bearer mode. Boot refuses on missing, short (<16
+#     chars), or placeholder-looking values — never a real value in this repo.
+#   HERMES_MCP_OAUTH_ISSUER=https://hermes.example.com
+#     Optional. Selects browser OAuth mode instead of static bearer mode.
+#   HERMES_MCP_OAUTH_PASSWORD=<a long, random password>
+#     Required in OAuth mode. The owner enters it on the authorization page.
+#   HERMES_MCP_OAUTH_REDIRECT_HOSTS=claude.ai,claude.com
+#     Required in OAuth mode. Dynamic registrations may redirect only to these
+#     hosts or their subdomains.
+#   HERMES_MCP_OAUTH_STATE_PATH=<path to a private state file>
+#     Optional. Persists dynamic client registrations and rotating tokens.
 #   HERMES_MCP_ALLOWED_HOSTS=<comma-separated extra Host values>
 #     Optional. Example: bridge.example.com:443,other.example.com:*
 #     Unset or empty leaves today's behavior unchanged: the SDK's own
@@ -37,8 +46,8 @@
 #   Per-profile gateway keys, one per profile's key_env field in the registry
 #     (deploy/registry.example.toml shows the shape).
 #
-# The MCP endpoint is served at path /mcp on that host and port, so a reverse
-# proxy or tunnel in front of this unit routes /mcp and nothing else.
+# The MCP endpoint is served at /mcp. OAuth deployments also proxy /login,
+# /authorize, /token, /register, and /.well-known/oauth-* to this process.
 
 [Unit]
 Description=Hermes MCP bridge — HTTP MCP surface for Hermes gateways
