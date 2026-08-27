@@ -591,8 +591,9 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
-| `qwen` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | 64K | yes |
-| `qwen38-action` | `local-qwen38-action` | the same tier, named directly | 64K | yes |
+| `qwen` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | 32K | yes |
+| `qwen38-obliterated` | `local-qwen38-obliterated` | the same tier, named directly | 32K | yes |
+| `qwen38-action` | `local-qwen38-action` | action-tuned MLX rollback | 64K | yes |
 | `qwen-stock` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
 | `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
@@ -629,12 +630,15 @@ The wrapper now states the real window before launching:
 
 ```
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-heavy
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-qwen38-obliterated
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
 ```
 
 Keep the value equal to the profile's actual `num_ctx`. Setting it above the true window restores the original bug in a quieter form, because compaction again waits for a ceiling the model cannot reach. An unknown profile falls back to 32000, the floor, on the principle that compacting early costs a little quality and compacting late costs the session. An explicit `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in the environment still wins, for deliberate experiments.
 
 The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste.
+
+The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF, whose bundled chat template closes an empty thinking block before generation. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
 
 #### Memory is the other half of a small window
 
@@ -672,6 +676,7 @@ The wrapper warms its tier at launch so the first turn skips the cold load, then
 
 | Profile | `keep_alive` |
 |---|---|
+| `local-qwen38-obliterated` | **10m** |
 | `local-failover-heavy` | **10m** |
 | `local-qwen38-action` | n/a, not an Ollama tag |
 | every other profile | 30m |
@@ -684,7 +689,7 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | `--bare` client-side holds the prompt near 945 tokens |
+| `qwen`, `qwen lean` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | `--bare` keeps the prompt small and the no-thinking template keeps compaction textual |
 | `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
 | `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the heavy tier costs more GPU than the task is worth |
 
@@ -772,11 +777,27 @@ The second check is the one that catches the old MLX failure: that build sat at 
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
 
-### The default local brain is `qwen38-action`
+### The default local brain is `qwen38-obliterated`
+
+The default `qwen` route now runs `OBLITERATUS/Qwen3.8-27B-OBLITERATED` Q4_K_M through Ollama's GGUF engine. It uses the same standalone path as the earlier stock `qwen3.8:27b-bare` tier: a 32,768-token context clamp, bare client prompt, and no separately managed MLX server. The source model card reports 82.3% MMLU against stock's 84.5%, 20/20 tested cyber and code tasks, and 7/8 advanced agent tasks. Those are publisher measurements, not local verification.
+
+Install and build the local tag:
+
+```bash
+ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M
+ollama create qwen3.8:27b-obliterated \
+  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
+```
+
+The Modelfile inherits the GGUF's no-thinking chat template, clamps `num_ctx` to 32,768, and sets the publisher's required `repeat_penalty` to 1.15. `profiles/local-qwen38-obliterated.env` leaves inline-thinking stripping off. If the model emits thinking markup, Claude Code receives text instead of another empty compact response.
+
+The 27B GGUF and the 27B MLX server cannot share memory safely. Before the router serves `local-qwen38-obliterated`, `mlx_admin` stops either managed MLX profile and waits for port 8080 to go quiet. If the server cannot stop, the router selects `local-fast` and logs the collision instead of loading both 27B runtimes.
+
+### The action-tuned rollback is `qwen38-action`
 
 Qwen3.8-27B Action-Abliterated comes from `ajsai47/qwen38-action-abliterated-research`: a pinned Qwen3.8-27B checkpoint trained on action contracts, then put through a bounded refusal-direction ablation. Its model card records a 92.5% HarmBench direct-request attack-success rate, and StrongREJECT assistance on forbidden prompts at 87.22% against the base model's 10.54%. Capability held flat, with 62.50% on a frozen 280-item MMLU-Pro sample, matching upstream.
 
-Since 2026-08-25 it backs `/model qwen`, the `qwen` wrapper's default and lean modes, and cloud-to-local failover. `qwen38-action` names the same tier directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
+From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. `qwen38-action` still names this checkpoint directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
 
 Read the model card before you lean on it. Reduced refusal is not permission, and it says so itself: the card puts unsupervised execution with destructive, financial, credential, or otherwise high-impact tools out of scope, and this wiring puts the model on exactly those paths. Failover fires with nobody watching, and `local-worker` gets dispatched with Bash and Write. Scoped tool permissions and reading what an unattended agent actually did are the controls now, because the model is no longer one of them.
 

@@ -159,7 +159,7 @@ async def test_stripped_size_picks_the_tier(offline_app):
     stripped = count_messages(bare.messages, bare.system, bare.tools)
 
     assert pick_failover_profile(raw) == "local-failover-256k"       # the 4B
-    assert pick_failover_profile(stripped) == "local-qwen38-action"
+    assert pick_failover_profile(stripped) == "local-qwen38-obliterated"
 
 
 # --- deliberate `/model qwen` must obey the ladder too ---------------------
@@ -214,7 +214,7 @@ async def test_small_route_session_stays_on_the_heavy_tier(route_app):
     resp = await _post(app, _route_request(turns=1))
 
     assert resp.status_code == 200
-    assert seen[-1] == "local-qwen38-action", seen
+    assert seen[-1] == "local-qwen38-obliterated", seen
 
 
 async def test_profile_mode_oversized_session_escalates(monkeypatch):

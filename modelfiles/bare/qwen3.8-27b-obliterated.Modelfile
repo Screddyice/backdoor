@@ -1,0 +1,13 @@
+# Qwen3.8-27B OBLITERATED Q4_K_M, served through Ollama's GGUF/llama.cpp path.
+# The source GGUF carries its own no-thinking chat template.  Do not replace it
+# here: Claude Code compaction needs ordinary response text, and the inherited
+# template suppresses the thinking-only response that broke the MLX tier.
+#
+# Build after pulling the remote tag:
+#   ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M
+#   ollama create qwen3.8:27b-obliterated \
+#     -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
+
+FROM hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M
+PARAMETER num_ctx 32768
+PARAMETER repeat_penalty 1.15

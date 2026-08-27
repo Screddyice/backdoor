@@ -1,10 +1,9 @@
-"""The MLX tier is the default local brain, and it always has a way to answer.
+"""The action-tuned MLX tier remains reachable as an explicit rollback.
 
-Shawn moved `/model qwen`, the `qwen` wrapper, and offline failover onto
-Qwen3.8-27B Action-Abliterated on 2026-08-25. That model is a bounded
-refusal-direction ablation (92.5% HarmBench direct-request ASR per its own card),
-and the decision to put it on the unattended paths was made explicitly. These
-tests pin the wiring so a later edit is a deliberate act rather than a drift.
+Qwen3.8-27B Action-Abliterated is a bounded refusal-direction ablation (92.5%
+HarmBench direct-request ASR per its own card).  It moved off the unattended
+paths after its MLX backend returned an empty compaction summary, but the
+measured action checkpoint stays available by name.
 
 The load-bearing test in this file is test_fallback_profile_is_a_lazy_ollama_tier.
 Unlike every other local tier, this one does not load on demand: it is a launchd
@@ -16,15 +15,11 @@ a dead session. mlx_admin starts it and drops to the 9B when it cannot.
 from pathlib import Path
 
 from src.proxy import mlx_admin
-from src.proxy.config import FAILOVER_LADDER, MODEL_ROUTES, Settings
+from src.proxy.config import MODEL_ROUTES
 
 ACTION_PROFILE = "local-qwen38-action"
 FALLBACK_PROFILE = "local-failover-heavy"
 PROFILES = Path(__file__).resolve().parents[1] / "profiles"
-
-
-def test_default_qwen_route_is_the_mlx_tier() -> None:
-    assert MODEL_ROUTES["qwen"] == ACTION_PROFILE
 
 
 def test_reachable_by_its_own_name_too() -> None:
@@ -34,14 +29,6 @@ def test_reachable_by_its_own_name_too() -> None:
 def test_stock_refusal_tier_is_still_reachable() -> None:
     """`/model qwen-stock` is the documented way back to an unablated model."""
     assert MODEL_ROUTES["qwen-stock"] == FALLBACK_PROFILE
-
-
-def test_failover_profile_is_the_mlx_tier() -> None:
-    assert Settings().failover_profile == ACTION_PROFILE
-
-
-def test_failover_ladder_uses_the_mlx_tier() -> None:
-    assert FAILOVER_LADDER[0][1] == ACTION_PROFILE
 
 
 def test_fallback_profile_is_a_lazy_ollama_tier() -> None:

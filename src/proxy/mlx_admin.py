@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 
 import httpx
 
@@ -38,10 +39,17 @@ logger = logging.getLogger(__name__)
 MLX_PROFILE = "local-qwen38-action"
 MLX_HEALTH_URL = "http://127.0.0.1:8080/health"
 MLX_LAUNCHD_LABEL = "com.aicollective.qwen38-mlx"
+MLX_LONG_LAUNCHD_LABEL = "com.aicollective.qwen38-mlx-long"
 
 # Where a request goes when the MLX server will not come up. The 9B on Ollama
 # loads lazily and needs no supervision, which is exactly what a fallback wants.
 MLX_FALLBACK_PROFILE = "local-failover-heavy"
+
+# These Ollama profiles are large enough that loading them beside the MLX 27B
+# can cross the host's Metal wired-memory ceiling.  resolve_profile enforces
+# the transition before either runtime serves a request.
+OLLAMA_EXCLUSIVE_PROFILES = {"local-qwen38-obliterated"}
+OLLAMA_COLLISION_FALLBACK_PROFILE = "local-fast"
 
 # Cold weight load measured at ~12s upstream for the 15GiB 4-bit artifact. The
 # ceiling is generous because the alternative to waiting is failing, but it is
@@ -49,6 +57,7 @@ MLX_FALLBACK_PROFILE = "local-failover-heavy"
 START_TIMEOUT_SECONDS = 90.0
 PROBE_TIMEOUT_SECONDS = 2.0
 POLL_INTERVAL_SECONDS = 1.5
+STOP_TIMEOUT_SECONDS = 30.0
 
 
 async def is_healthy(timeout: float = PROBE_TIMEOUT_SECONDS) -> bool:
@@ -90,6 +99,76 @@ async def _kickstart() -> bool:
     return True
 
 
+async def _service_pid(label: str) -> int | None:
+    """Return a launchd job's active PID, or None when it is not running."""
+    service = f"gui/{os.getuid()}/{label}"
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "launchctl",
+            "print",
+            service,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await process.communicate()
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    match = re.search(rb"^\s*pid = (\d+)\s*$", stdout, re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+async def stop_running(timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
+    """Stop either managed MLX profile before a large Ollama model loads.
+
+    An unmanaged server on the same port fails closed.  Loading another 27B
+    beside a process we cannot name is the exact memory collision this guard
+    exists to prevent.
+    """
+    labels = (MLX_LAUNCHD_LABEL, MLX_LONG_LAUNCHD_LABEL)
+    running = [label for label in labels if await _service_pid(label) is not None]
+    if not running:
+        return not await is_healthy()
+
+    for label in running:
+        service = f"gui/{os.getuid()}/{label}"
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "launchctl",
+                "kill",
+                "SIGTERM",
+                service,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+        except OSError as exc:
+            logger.warning("mlx: could not stop %s: %s", service, exc)
+            return False
+        if process.returncode != 0:
+            logger.warning(
+                "mlx: launchctl kill %s exited %s: %s",
+                service,
+                process.returncode,
+                stderr.decode(errors="replace").strip(),
+            )
+            return False
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        remaining = [label for label in labels if await _service_pid(label) is not None]
+        if not remaining:
+            if not await is_healthy():
+                logger.info("mlx: stopped before loading the Ollama 27B tier")
+                return True
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    logger.warning("mlx: server did not stop within %.0fs", timeout)
+    return False
+
+
 async def ensure_running(timeout: float = START_TIMEOUT_SECONDS) -> bool:
     """Return True when the MLX server is serving, starting it if needed."""
     if await is_healthy():
@@ -117,6 +196,16 @@ async def resolve_profile(profile: str) -> str:
     Any other profile passes through untouched, so this is safe to call on every
     routed request.
     """
+    if profile in OLLAMA_EXCLUSIVE_PROFILES:
+        if await stop_running():
+            return profile
+        logger.warning(
+            "mlx: refusing to load %s while the MLX 27B is still resident; "
+            "falling back to %s",
+            profile,
+            OLLAMA_COLLISION_FALLBACK_PROFILE,
+        )
+        return OLLAMA_COLLISION_FALLBACK_PROFILE
     if profile != MLX_PROFILE:
         return profile
     if await ensure_running():

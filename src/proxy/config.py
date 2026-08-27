@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     # lazily loaded like the Ollama tiers, so routes.py starts it on demand and
     # drops to local-failover-heavy (9B) when it will not come up. See
     # src/proxy/mlx_admin.py.
-    failover_profile: str = "local-qwen38-action"  # default tier
+    failover_profile: str = "local-qwen38-obliterated"  # default tier
     # Probe on the first transport failure. The connectivity probe remains the
     # safety gate: local failover opens only when the host is offline. Waiting
     # for a second Claude retry exposed one avoidable API error before asking
@@ -237,11 +237,11 @@ def resolve_model_route(model: str | None) -> str | None:
 
 
 MODEL_ROUTES: dict[str, str] = {
-    "qwen": "local-qwen38-action",  # Qwen3.8-27B Action-Abliterated (MLX) — same as backdoor
+    "qwen": "local-qwen38-obliterated",  # Qwen3.8-27B OBLITERATED GGUF on Ollama
     "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
     "qwen-9b": "local-qwen-9b",   # qwen3.5:9b-64k — stronger brain for subagents
-    # Explicit alias for the same tier "qwen" now points at, kept so a session
-    # can name the model rather than the slot.
+    "qwen38-obliterated": "local-qwen38-obliterated",
+    # Keep the action-tuned MLX checkpoint reachable as an explicit rollback.
     "qwen38-action": "local-qwen38-action",
     # The stock 9B, still reachable by name. This is what to type when you want
     # a model with its refusal behaviour intact.
@@ -267,7 +267,7 @@ MODEL_ROUTES: dict[str, str] = {
 # still overflows the 27B's 32K window — at which point a weaker model that
 # retains the session beats a stronger one that truncates it.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (28_000, "local-qwen38-action"),        # abliterated 27B on MLX (64K, tools)
+    (28_000, "local-qwen38-obliterated"),   # obliterated 27B GGUF (32K, tools)
     (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
 ]
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# qwen — launch Claude Code against a fully-offline local LLM (Qwen3.5 4B).
+# qwen: launch Claude Code against a fully offline local Qwen model.
 # (alias: claude-local)
 #
 #   Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
 #
 # Everything runs on-device. No internet required once models are pulled.
 #
-# Modes (model per mode changed 2026-08-11 — the default is now the 27B):
+# Modes (default changed 2026-08-28 to the obliterated 27B GGUF):
 #   qwen            LEAN (default, 2026-07-09). Minimal prompt (~945 tok) on
-#                   Qwen3.5 27B @ 32K: --bare, harness slash-commands on demand,
+#                   Qwen3.8 OBLITERATED 27B @ 32K: --bare, harness commands,
 #                   no auto hooks, MCP off. The 27B is affordable here ONLY
 #                   because lean keeps the prompt tiny; 23GB resident, so it
 #                   cannot co-reside with the fusion council (~21GB) on this
@@ -70,7 +70,7 @@ done
 # (QWEN_FULL/QWEN_LEAN) cannot leave a profile that contradicts it. `fast` is
 # the one explicit pin and wins outright.
 #
-# Default/lean is the 27B as of 2026-08-11. It is only viable because lean mode
+# Default/lean is the GGUF 27B as of 2026-08-28. It is viable because lean mode
 # passes --bare: the prompt is ~945 tokens against a 32K window. Full mode's
 # ~29K harness prompt does NOT fit that window with room left to converse, so it
 # stays on the 4B @ 64K — the tier the 2026-07-09 prefill revert chose for
@@ -81,7 +81,7 @@ if [ -z "$PROFILE" ]; then
   if [ "$MODE" = "full" ]; then
     PROFILE="local-qwen35"           # qwen3.5:4b-64k  — harness needs the window
   else
-    PROFILE="local-qwen38-action"    # abliterated 27B on MLX — biggest local brain
+    PROFILE="local-qwen38-obliterated" # obliterated 27B GGUF on Ollama
   fi
 fi
 
@@ -93,12 +93,14 @@ fi
 # modelfiles/bare/*.Modelfile). A value LARGER than the real window re-creates
 # the bug, so do not round up. Explicit env wins, for one-off experiments.
 case "$PROFILE" in
-  # Both heavy tiers are held at 32000 even though each serves a 64K window.
+  # The GGUF tier serves 32K. The two 64K rollback tiers are held at 32K so
+  # compaction fires near their 28K escalation bound.
   # Smaller than the real window is the safe direction (the warning above is
   # about rounding UP), and it keeps auto-compact firing just past the 28000
   # ROUTE_MAX_INPUT_TOKENS escalation bound both profiles carry. Raising it to
   # 64000 would park long sessions on the 4B 256K tier for the whole 28K-64K
   # stretch instead of compacting.
+  local-qwen38-obliterated) QWEN_CTX=32000 ;; # GGUF 27B @ 32K
   local-qwen38-action) QWEN_CTX=32000 ;;    # MLX 27B @ 64K, held at 32K
   local-failover-heavy) QWEN_CTX=32000 ;;   # qwen3.5:9b-64k @ 64K, held at 32K
   local-qwen35|local-fast) QWEN_CTX=64000 ;; # qwen3.5:4b-64k  @ 64K
@@ -336,7 +338,7 @@ done
 # looked like an offline hang. keep_alive 30m holds it warm for the session
 # (still unloads afterward, so battery use on a plane stays bounded).
 #
-# keep_alive is shorter for the 27B on purpose. At **23GB resident** it and a
+# keep_alive is shorter for the 27B on purpose. At 17GB resident it and a
 # fusion council (~21GB) cannot both be loaded on this 36GB host — 44GB against
 # a ~27GB Metal wired ceiling — and OLLAMA_MAX_LOADED_MODELS caps by model
 # COUNT, not bytes, so nothing upstream will refuse that combination. Holding a
@@ -347,9 +349,7 @@ done
 # and the collision correspondingly worse. The qwen3.8 swap on 2026-08-16
 # measured 17GB, so the collision eased, but a ~21GB council still does not fit
 # beside it under the ~27GB wired ceiling. Keep the 10m. See the panic note in
-# modelfiles/bare/qwen3.8-27b-bare.Modelfile. (2026-08-25: the heavy tier is now
-# the ~10-12GB 9B, so the clamp is no longer load-bearing for the council — kept
-# because restoring the 27B tag would silently re-arm the collision.)
+# modelfiles/bare/qwen3.8-27b-obliterated.Modelfile.
 #
 # The MLX tier is the exception to all of the above. It is not an Ollama tag, so
 # there is no keep_alive to clamp and no lazy load to warm: the server is either
@@ -367,6 +367,7 @@ if [ "$PROFILE" = "local-qwen38-action" ]; then
   fi
 else
   KEEP_ALIVE="30m"
+  [ "$PROFILE" = "local-qwen38-obliterated" ] && KEEP_ALIVE="10m"
   [ "$PROFILE" = "local-failover-heavy" ] && KEEP_ALIVE="10m"
   curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
     -d "{\"model\":\"$MODEL\",\"keep_alive\":\"$KEEP_ALIVE\",\"options\":{\"num_predict\":1},\"messages\":[{\"role\":\"system\",\"content\":\"warmup\"},{\"role\":\"user\",\"content\":\"hi\"}]}" \
