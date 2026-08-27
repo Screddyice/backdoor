@@ -221,6 +221,21 @@ def clear_settings_cache():
 
 # Model names a Claude Code session can request (via `/model <name>` or
 # `--model <name>`) that route to a LOCAL profile in hybrid mode.
+def resolve_model_route(model: str | None) -> str | None:
+    """MODEL_ROUTES lookup that is not defeated by capitalisation.
+
+    `MODEL_ROUTES.get(model)` is a plain dict lookup, so `/model Qwen` missed
+    and the session silently stayed on the cloud model -- the one failure mode
+    where nothing is reported, because a passthrough is a legitimate outcome.
+    Model names are identifiers a person types, not data, so case is not
+    meaningful here. Surrounding whitespace is stripped for the same reason.
+    """
+
+    if not model:
+        return None
+    return MODEL_ROUTES.get(model.strip().lower())
+
+
 MODEL_ROUTES: dict[str, str] = {
     "qwen": "local-qwen38-action",  # Qwen3.8-27B Action-Abliterated (MLX) — same as backdoor
     "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
