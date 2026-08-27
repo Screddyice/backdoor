@@ -543,10 +543,10 @@ async def create_message(
                 # honest provider error rather than a request we dropped here.
                 logger.exception("route bare-mode failed; sending unstripped to %s", profile)
 
-        # The MLX tier is the one local profile nothing loads lazily: it is a
-        # launchd job that is either up or absent. Start it, or hand the request
-        # to the Ollama tier instead of failing. Every other profile is a no-op
-        # here. See src/proxy/mlx_admin.py.
+        # The profile supervisor owns the boundary between the MLX 27B and
+        # memory-exclusive Ollama tiers. It starts MLX on demand, stops MLX
+        # before the Ollama 27B loads, or returns a smaller safe fallback when
+        # either transition fails. See src/proxy/mlx_admin.py.
         served_by = await mlx_admin.resolve_profile(profile)
         if served_by != profile:
             logger.warning(
