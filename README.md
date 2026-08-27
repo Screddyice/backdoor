@@ -591,8 +591,9 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
-| `qwen` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | 64K | yes |
-| `qwen38-action` | `local-qwen38-action` | the same tier, named directly | 64K | yes |
+| `qwen` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | 32K | yes |
+| `qwen38-obliterated` | `local-qwen38-obliterated` | the same tier, named directly | 32K | yes |
+| `qwen38-action` | `local-qwen38-action` | action-tuned MLX rollback | 64K | yes |
 | `qwen-stock` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
 | `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
@@ -608,13 +609,13 @@ Observed 2026-08-12: a `qwen` session sent **143,490 tokens at the 27B's 32K win
 Tiers now declare the largest post-strip session they will take:
 
 ```
-ROUTE_MAX_INPUT_TOKENS=28000
+ROUTE_MAX_INPUT_TOKENS=27000
 ```
 
 Set it to the same bound the tier carries in `FAILOVER_LADDER`, so a deliberate route and a failover size that tier identically. Over it, the request escalates through the same ladder rather than failing:
 
 ```
-⇢ ROUTE ESCALATE [local-failover-heavy → local-failover-256k] in≈143490 over 28000
+⇢ ROUTE ESCALATE [local-qwen38-obliterated → local-failover-256k] in≈143490 over 27000
 ```
 
 Sizing happens **after** stripping, matching the failover branch — size the raw body and a bare-able session escalates to the wide 4B tier for no reason, wasting the stronger model. `0` disables the check, which is what the unstripped 64K tiers use.
@@ -629,12 +630,15 @@ The wrapper now states the real window before launching:
 
 ```
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-heavy
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-qwen38-obliterated
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
 ```
 
 Keep the value equal to the profile's actual `num_ctx`. Setting it above the true window restores the original bug in a quieter form, because compaction again waits for a ceiling the model cannot reach. An unknown profile falls back to 32000, the floor, on the principle that compacting early costs a little quality and compacting late costs the session. An explicit `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in the environment still wins, for deliberate experiments.
 
-The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste.
+The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste. The obliterated tier also caps generation at 4,096 tokens, so its 27K input ceiling leaves room for output and template overhead inside the 32,768-token runtime window.
+
+The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF. Its OpenAI endpoint returned an ordinary answer alongside internal reasoning in live compaction testing. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
 
 #### Memory is the other half of a small window
 
@@ -653,7 +657,7 @@ The paragraph above describes the check on the **hybrid** path, and on its own i
 So the tier check runs **after every routing branch has chosen**, where no path can skip it:
 
 ```
-⇢ TIER ESCALATE [qwen3.8:27b-bare → qwen3.5:4b-256k] in≈143490 over 28000
+⇢ TIER ESCALATE [qwen3.8:27b-obliterated → qwen3.5:4b-256k] in≈143490 over 27000
 ```
 
 Three properties make that placement safe:
@@ -662,9 +666,11 @@ Three properties make that placement safe:
 - **It cannot fire twice.** The wide tiers leave `ROUTE_MAX_INPUT_TOKENS` unset, so once the hybrid branch has escalated, the backstop finds nothing to do.
 - **Escalation failure is not request failure.** If the wider profile cannot be loaded, the request continues on its original tier and surfaces an honest provider error, which is what it did before.
 
+The runtime interlock follows the same placement rule. Profiles that manage a large runtime set `RUNTIME_PROFILE`, and the router resolves it after both routing branches and size escalation. That keeps the hybrid `/model qwen` path and the wrapper's profile-mode path under the same MLX/Ollama exclusion guard.
+
 The general lesson: `router_mode` is a real fork in this file, and a guard is only as good as the branch it sits in. Verify a fix against the mode the failure actually used, not the one you were reading when you wrote it.
 
-Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at **23GB** and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. This Qwen3.8 GGUF measures **17GB** resident and a fusion council is roughly 21GB. They do not both fit under this host's wired-memory ceiling, and Ollama caps by model count, so nothing upstream refuses the combination.
 
 ### Keeping the 27B warm without starving the council
 
@@ -672,6 +678,7 @@ The wrapper warms its tier at launch so the first turn skips the cold load, then
 
 | Profile | `keep_alive` |
 |---|---|
+| `local-qwen38-obliterated` | **10m** |
 | `local-failover-heavy` | **10m** |
 | `local-qwen38-action` | n/a, not an Ollama tag |
 | every other profile | 30m |
@@ -684,7 +691,7 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-qwen38-action` | Qwen3.8-27B Action-Abliterated (MLX) | `--bare` client-side holds the prompt near 945 tokens |
+| `qwen`, `qwen lean` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | `--bare` keeps the prompt small and the OpenAI endpoint returns textual compaction output |
 | `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
 | `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the heavy tier costs more GPU than the task is worth |
 
@@ -772,11 +779,27 @@ The second check is the one that catches the old MLX failure: that build sat at 
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
 
-### The default local brain is `qwen38-action`
+### The default local brain is `qwen38-obliterated`
+
+The default `qwen` route now runs `OBLITERATUS/Qwen3.8-27B-OBLITERATED` Q4_K_M through Ollama's GGUF engine. It uses the same standalone path as the earlier stock `qwen3.8:27b-bare` tier: a 32,768-token context clamp, bare client prompt, and no separately managed MLX server. The source model card reports 82.3% MMLU against stock's 84.5%, 20/20 tested cyber and code tasks, and 7/8 advanced agent tasks. Those are publisher measurements, not local verification.
+
+Install and build the local tag:
+
+```bash
+ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M
+ollama create qwen3.8:27b-obliterated \
+  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
+```
+
+The bundled GGUF template does not advertise tools, so Ollama rejects Claude Code requests with `does not support tools`. The Modelfile installs the tool-capable template from the stock local `qwen3:8b` tag, clamps `num_ctx` to 32,768, and sets the publisher's required `repeat_penalty` to 1.15. Live checks must cover both tool-call serialization and a non-empty compact response before this tag is used as the default.
+
+The 27B GGUF and the 27B MLX server cannot share memory safely. Before the router serves `local-qwen38-obliterated`, `mlx_admin` stops either managed MLX profile and waits for port 8080 to go quiet. If the server cannot stop, the router selects `local-fast` and logs the collision instead of loading both 27B runtimes.
+
+### The action-tuned rollback is `qwen38-action`
 
 Qwen3.8-27B Action-Abliterated comes from `ajsai47/qwen38-action-abliterated-research`: a pinned Qwen3.8-27B checkpoint trained on action contracts, then put through a bounded refusal-direction ablation. Its model card records a 92.5% HarmBench direct-request attack-success rate, and StrongREJECT assistance on forbidden prompts at 87.22% against the base model's 10.54%. Capability held flat, with 62.50% on a frozen 280-item MMLU-Pro sample, matching upstream.
 
-Since 2026-08-25 it backs `/model qwen`, the `qwen` wrapper's default and lean modes, and cloud-to-local failover. `qwen38-action` names the same tier directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
+From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. `qwen38-action` still names this checkpoint directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
 
 Read the model card before you lean on it. Reduced refusal is not permission, and it says so itself: the card puts unsupervised execution with destructive, financial, credential, or otherwise high-impact tools out of scope, and this wiring puts the model on exactly those paths. Failover fires with nobody watching, and `local-worker` gets dispatched with Bash and Write. Scoped tool permissions and reading what an unattended agent actually did are the controls now, because the model is no longer one of them.
 

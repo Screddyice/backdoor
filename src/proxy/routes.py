@@ -543,18 +543,6 @@ async def create_message(
                 # honest provider error rather than a request we dropped here.
                 logger.exception("route bare-mode failed; sending unstripped to %s", profile)
 
-        # The MLX tier is the one local profile nothing loads lazily: it is a
-        # launchd job that is either up or absent. Start it, or hand the request
-        # to the Ollama tier instead of failing. Every other profile is a no-op
-        # here. See src/proxy/mlx_admin.py.
-        served_by = await mlx_admin.resolve_profile(profile)
-        if served_by != profile:
-            logger.warning(
-                "⇢ MLX FALLBACK [%s → %s] %s", profile, served_by, request.url.path,
-            )
-            profile = served_by
-            settings = load_profile_settings(profile)
-
         # Built last: the escalation above can change which profile serves this
         # request, and the client must follow the profile actually chosen.
         client = _get_profile_client(profile, settings)
@@ -601,6 +589,20 @@ async def create_message(
             # it to the original tier reproduces the old behaviour — an honest
             # provider error — which beats dropping it here.
             logger.exception("tier escalation failed; staying on %s", settings.provider_model)
+
+    # Runtime supervision must sit after BOTH router-mode branches and after
+    # size escalation. The qwen wrapper uses profile mode on :8082, so keeping
+    # this inside the hybrid branch lets its first real request bypass the
+    # MLX/Ollama memory interlock whenever direct warmup was skipped.
+    if settings.runtime_profile:
+        served_by = await mlx_admin.resolve_profile(settings.runtime_profile)
+        if served_by != settings.runtime_profile:
+            logger.warning(
+                "⇢ RUNTIME FALLBACK [%s → %s] %s",
+                settings.runtime_profile, served_by, request.url.path,
+            )
+            settings = load_profile_settings(served_by)
+            client = _get_profile_client(served_by, settings)
 
     payload = build_nim_payload(req, settings)
     msg_id = f"msg_{uuid.uuid4().hex}"

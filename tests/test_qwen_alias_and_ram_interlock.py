@@ -33,7 +33,9 @@ def test_model_qwen_resolves_however_it_is_capitalised(typed):
     assert resolve_model_route(typed) == MODEL_ROUTES["qwen"]
 
 
-@pytest.mark.parametrize("typed", ["Qwen-Fast", "QWEN-9B", "Qwen38-Action"])
+@pytest.mark.parametrize(
+    "typed", ["Qwen-Fast", "QWEN-9B", "Qwen38-Action", "Qwen38-Obliterated"]
+)
 def test_the_other_local_tiers_are_case_insensitive_too(typed):
     assert resolve_model_route(typed) == MODEL_ROUTES[typed.strip().lower()]
 
@@ -82,6 +84,83 @@ async def test_a_non_mlx_profile_never_touches_ollama_residency(monkeypatch):
     # gratuitous churn.
     assert await _REAL_RESOLVE_PROFILE("local-fast") == "local-fast"
     assert called is False
+
+
+@pytest.mark.anyio
+async def test_engaging_the_exclusive_ollama_27b_stops_mlx_first(monkeypatch):
+    stopped = False
+
+    async def stop_running():
+        nonlocal stopped
+        stopped = True
+        return True
+
+    monkeypatch.setattr(mlx_admin, "stop_running", stop_running, raising=False)
+
+    profile = "local-qwen38-obliterated"
+    assert await _REAL_RESOLVE_PROFILE(profile) == profile
+    assert stopped is True
+
+
+@pytest.mark.anyio
+async def test_exclusive_ollama_27b_falls_back_when_mlx_will_not_stop(monkeypatch):
+    async def cannot_stop():
+        return False
+
+    monkeypatch.setattr(mlx_admin, "stop_running", cannot_stop, raising=False)
+
+    assert await _REAL_RESOLVE_PROFILE("local-qwen38-obliterated") == "local-fast"
+
+
+@pytest.mark.anyio
+async def test_stop_running_terminates_the_managed_daily_service(monkeypatch):
+    pids = {mlx_admin.MLX_LAUNCHD_LABEL: 1234, mlx_admin.MLX_LONG_LAUNCHD_LABEL: None}
+    calls: list[tuple[str, ...]] = []
+
+    async def service_pid(label):
+        return pids[label]
+
+    async def healthy():
+        return False
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            pids[mlx_admin.MLX_LAUNCHD_LABEL] = None
+            return b"", b""
+
+    async def subprocess(*args, **kwargs):
+        calls.append(args)
+        return Process()
+
+    monkeypatch.setattr(mlx_admin, "_service_pid", service_pid)
+    monkeypatch.setattr(mlx_admin, "is_healthy", healthy)
+    monkeypatch.setattr(mlx_admin.asyncio, "create_subprocess_exec", subprocess)
+
+    assert await mlx_admin.stop_running(timeout=0.1)
+    assert calls == [
+        (
+            "launchctl",
+            "kill",
+            "SIGTERM",
+            f"gui/{mlx_admin.os.getuid()}/{mlx_admin.MLX_LAUNCHD_LABEL}",
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_stop_running_rejects_an_unmanaged_healthy_server(monkeypatch):
+    async def no_pid(_label):
+        return None
+
+    async def healthy():
+        return True
+
+    monkeypatch.setattr(mlx_admin, "_service_pid", no_pid)
+    monkeypatch.setattr(mlx_admin, "is_healthy", healthy)
+
+    assert not await mlx_admin.stop_running(timeout=0.1)
 
 
 @pytest.mark.anyio
