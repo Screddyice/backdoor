@@ -18,6 +18,9 @@
 #     Optional. Selects browser OAuth mode instead of static bearer mode.
 #   HERMES_MCP_OAUTH_PASSWORD=<a long, random password>
 #     Required in OAuth mode. The owner enters it on the authorization page.
+#   HERMES_MCP_OAUTH_REDIRECT_HOSTS=claude.ai,claude.com
+#     Required in OAuth mode. Dynamic registrations may redirect only to these
+#     hosts or their subdomains.
 #   HERMES_MCP_OAUTH_STATE_PATH=<path to a private state file>
 #     Optional. Persists dynamic client registrations and rotating tokens.
 #   HERMES_MCP_ALLOWED_HOSTS=<comma-separated extra Host values>

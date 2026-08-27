@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -43,43 +44,53 @@ def _oauth_env(monkeypatch, state_path: Path) -> None:
     monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", ISSUER)
     monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", PASSWORD)
     monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(state_path))
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "client.example")
 
 
-def _register(client: TestClient) -> dict:
+def _register(
+    client: TestClient, redirect_uri: str = REDIRECT_URI, expected_status: int = 201
+) -> dict:
     response = client.post(
         "/register",
         json={
             "client_name": "Claude",
-            "redirect_uris": [REDIRECT_URI],
+            "redirect_uris": [redirect_uri],
             "token_endpoint_auth_method": "client_secret_post",
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
             "scope": "hermes",
         },
     )
-    assert response.status_code == 201
+    assert response.status_code == expected_status
     return response.json()
 
 
-def _authorize(client: TestClient, registration: dict) -> tuple[str, str]:
+def _authorize(
+    client: TestClient,
+    registration: dict,
+    *,
+    resource: str | None = f"{ISSUER}/mcp",
+) -> tuple[str, str]:
     verifier = "oauth-test-verifier-with-enough-entropy-0123456789"
     challenge = (
         base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
         .decode()
         .rstrip("=")
     )
+    params = {
+        "client_id": registration["client_id"],
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "claude-state",
+        "scope": "hermes",
+    }
+    if resource is not None:
+        params["resource"] = resource
     response = client.get(
         "/authorize",
-        params={
-            "client_id": registration["client_id"],
-            "redirect_uri": REDIRECT_URI,
-            "response_type": "code",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": "claude-state",
-            "scope": "hermes",
-            "resource": f"{ISSUER}/mcp",
-        },
+        params=params,
         follow_redirects=False,
     )
     assert response.status_code == 302
@@ -94,6 +105,17 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
     app = server.streamable_http_app(stateless_http=True, json_response=True)
 
     with TestClient(app, base_url=ISSUER) as client:
+        missing_auth = client.post("/mcp", json=INITIALIZE_BODY, headers=ACCEPT_HEADERS)
+        assert missing_auth.status_code == 401
+        assert "resource_metadata=" in missing_auth.headers["www-authenticate"]
+
+        invalid_auth = client.post(
+            "/mcp",
+            json=INITIALIZE_BODY,
+            headers={**ACCEPT_HEADERS, "Authorization": "Bearer not-a-token"},
+        )
+        assert invalid_auth.status_code == 401
+
         metadata = client.get("/.well-known/oauth-authorization-server")
         assert metadata.status_code == 200
         assert metadata.json()["issuer"] == f"{ISSUER}/"
@@ -125,10 +147,17 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
             )
         throttled = client.post(
             "/login",
-            data={"state": login_state, "password": PASSWORD},
+            data={"state": login_state, "password": "wrong-password"},
             follow_redirects=False,
         )
         assert throttled.status_code == 429
+
+        still_approved = client.post(
+            "/login",
+            data={"state": login_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert still_approved.status_code == 302
 
         # Use a fresh server to keep the remainder of the OAuth flow independent
         # of the deliberate brute-force lockout above.
@@ -198,8 +227,208 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
             },
         )
         assert refreshed.status_code == 200
-        assert refreshed.json()["access_token"] != tokens["access_token"]
-        assert refreshed.json()["refresh_token"] != tokens["refresh_token"]
+        refreshed_tokens = refreshed.json()
+        assert refreshed_tokens["access_token"] != tokens["access_token"]
+        assert refreshed_tokens["refresh_token"] != tokens["refresh_token"]
+
+        replayed_refresh = client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+                "client_id": registration["client_id"],
+                "client_secret": registration["client_secret"],
+                "scope": "hermes",
+            },
+        )
+        assert replayed_refresh.status_code == 400
+        assert replayed_refresh.json()["error"] == "invalid_grant"
+
+        initialized = client.post(
+            "/mcp",
+            json=INITIALIZE_BODY,
+            headers={
+                **ACCEPT_HEADERS,
+                "Authorization": f"Bearer {refreshed_tokens['access_token']}",
+            },
+        )
+        assert initialized.status_code == 200
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert (
+        persisted["access_tokens"][refreshed_tokens["access_token"]]["resource"]
+        == f"{ISSUER}/mcp"
+    )
+
+
+def test_login_throttle_is_global_but_never_blocks_the_correct_password(
+    monkeypatch, tmp_path
+):
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        attacker = _register(client)
+        attacker_state, _ = _authorize(client, attacker)
+        owner = _register(client)
+        owner_state, _ = _authorize(client, owner)
+
+        for _ in range(5):
+            response = client.post(
+                "/login",
+                data={"state": attacker_state, "password": "wrong-password"},
+                follow_redirects=False,
+            )
+            assert response.status_code == 401
+
+        throttled_wrong = client.post(
+            "/login",
+            data={"state": owner_state, "password": "wrong-password"},
+            follow_redirects=False,
+        )
+        assert throttled_wrong.status_code == 429
+
+        approved = client.post(
+            "/login",
+            data={"state": owner_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert approved.status_code == 302
+
+
+def test_registration_rejects_unapproved_redirect_and_is_bounded(monkeypatch, tmp_path):
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "client.example")
+    monkeypatch.setattr("src.hermes_mcp.oauth.MAX_REGISTERED_CLIENTS", 1)
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        rejected = _register(
+            client, "https://attacker.example/callback", expected_status=400
+        )
+        assert rejected["error"] == "invalid_redirect_uri"
+
+        first = _register(client)
+        second = _register(client)
+        persisted = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+        assert len(persisted["clients"]) == 1
+        assert first["client_id"] not in persisted["clients"]
+        assert second["client_id"] in persisted["clients"]
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "evil://client.example/callback",
+        "javascript://client.example/callback",
+        "ftp://client.example/callback",
+        "http://client.example/callback",
+    ],
+)
+def test_registration_rejects_unsafe_redirect_schemes(
+    monkeypatch, tmp_path, redirect_uri
+):
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        rejected = _register(client, redirect_uri, expected_status=400)
+        assert rejected["error"] == "invalid_redirect_uri"
+
+
+def test_one_client_has_one_pending_state_and_one_failure_budget(monkeypatch, tmp_path):
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        registration = _register(client)
+        old_state, _ = _authorize(client, registration)
+        new_state, _ = _authorize(client, registration)
+
+        assert client.get("/login", params={"state": old_state}).status_code == 400
+        assert client.get("/login", params={"state": new_state}).status_code == 200
+
+        for _ in range(5):
+            response = client.post(
+                "/login",
+                data={"state": new_state, "password": "wrong-password"},
+                follow_redirects=False,
+            )
+            assert response.status_code == 401
+
+        rotated_state, _ = _authorize(client, registration)
+        throttled = client.post(
+            "/login",
+            data={"state": rotated_state, "password": "wrong-password"},
+            follow_redirects=False,
+        )
+        assert throttled.status_code == 429
+
+        approved = client.post(
+            "/login",
+            data={"state": rotated_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert approved.status_code == 302
+
+
+def test_authorization_enforces_resource_and_pkce_code_is_single_use(
+    monkeypatch, tmp_path
+):
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        registration = _register(client)
+        wrong_resource = client.get(
+            "/authorize",
+            params={
+                "client_id": registration["client_id"],
+                "redirect_uri": REDIRECT_URI,
+                "response_type": "code",
+                "code_challenge": "challenge",
+                "code_challenge_method": "S256",
+                "scope": "hermes",
+                "resource": "https://attacker.example/mcp",
+            },
+            follow_redirects=False,
+        )
+        assert wrong_resource.status_code == 302
+        assert parse_qs(urlparse(wrong_resource.headers["location"]).query)[
+            "error"
+        ] == ["invalid_target"]
+
+        login_state, verifier = _authorize(client, registration)
+        approved = client.post(
+            "/login",
+            data={"state": login_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": registration["client_id"],
+            "client_secret": registration["client_secret"],
+            "resource": f"{ISSUER}/mcp",
+        }
+        bad_pkce = client.post(
+            "/token", data={**token_data, "code_verifier": "incorrect-verifier"}
+        )
+        assert bad_pkce.status_code == 400
+        assert bad_pkce.json()["error"] == "invalid_grant"
+
+        issued = client.post("/token", data={**token_data, "code_verifier": verifier})
+        assert issued.status_code == 200
+        replayed = client.post("/token", data={**token_data, "code_verifier": verifier})
+        assert replayed.status_code == 400
+        assert replayed.json()["error"] == "invalid_grant"
 
 
 @pytest.mark.parametrize("password", [None, "short", "aaaaaaaaaaaaaaaa"])
@@ -221,6 +450,38 @@ def test_oauth_mode_refuses_a_missing_or_weak_login_password(
 def test_oauth_mode_refuses_plain_http_for_a_public_issuer(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_MCP_KEY", raising=False)
     monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "http://hermes.example.com")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", PASSWORD)
+    monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
+
+    with pytest.raises(OAuthConfigError):
+        build_server(REGISTRY)
+
+
+def test_oauth_mode_refuses_an_insecure_existing_state_file(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        '{"clients":{},"access_tokens":{},"refresh_tokens":{}}', encoding="utf-8"
+    )
+    state_path.chmod(0o644)
+    _oauth_env(monkeypatch, state_path)
+
+    with pytest.raises(OAuthConfigError):
+        build_server(REGISTRY)
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "https://hermes.example.com/nested",
+        "https://hermes.example.com?tenant=one",
+        "https://user:password@hermes.example.com",
+    ],
+)
+def test_oauth_mode_refuses_issuer_parts_that_do_not_match_root_routes(
+    monkeypatch, tmp_path, issuer
+):
+    monkeypatch.delenv("HERMES_MCP_KEY", raising=False)
+    monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", issuer)
     monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", PASSWORD)
     monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
 

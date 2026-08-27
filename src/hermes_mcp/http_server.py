@@ -1,16 +1,14 @@
 """MCPServer app exposing Hermes gateways over streamable HTTP.
 
 Two auth boundaries, deliberately distinct. Callers authenticate to the bridge
-with HERMES_MCP_KEY. The bridge authenticates to each gateway with that
-gateway's own key, named by the registry and read from the environment. A
-caller never holds a gateway key.
+with either its static bearer key or its browser OAuth flow. The bridge then
+authenticates to each gateway with that gateway's own key, named by the registry
+and read from the environment. A caller never holds a gateway key.
 
-The boot guard mirrors the one Hermes applies to its own API server. This
-process binds loopback too, but a tunnel publishes it beyond the host, while
-the gateway API servers it fronts are never exposed at all — so a weak key
-here is the one weak key that actually reaches the network. A bridge that
-boots with a weak key and rejects requests later is a bridge someone
-eventually "fixes" by turning the auth off.
+The static-key boot guard mirrors the one Hermes applies to its own API server.
+OAuth mode applies its own issuer, password, redirect, and state-file guards.
+The process binds loopback while a reverse proxy publishes it; the gateway API
+servers it fronts stay private.
 
 Note: the installed mcp SDK (mcp==2.0.0) renamed FastMCP to MCPServer and
 dropped `mcp.server.fastmcp`; MCPServer is used here in its place. Its public

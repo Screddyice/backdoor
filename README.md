@@ -1028,9 +1028,10 @@ Larger changes get written down before they get built. Specs live in [`docs/spec
 The bridge ships as `src/hermes_mcp/`, a sibling concern that never touches
 `src/proxy/`. It is off by default everywhere: the service is not installed by
 this repo, and `qwen` attaches it only when `QWEN_HERMES=1`. Configure it with
-a registry file (`deploy/registry.example.toml`) and a `HERMES_MCP_KEY`; the
-server refuses to start on a missing, short, or placeholder key. Deployment
-identifiers live outside this repo, the way `profiles/*.env` already does.
+a registry file (`deploy/registry.example.toml`) and one authentication mode.
+Static bearer deployments set `HERMES_MCP_KEY`; browser connector deployments
+set the OAuth issuer, password, and redirect-host allowlist described below.
+Deployment identifiers live outside this repo, the way `profiles/*.env` already does.
 
 Approved specs get an implementation plan before any code, in
 [`docs/superpowers/plans/`](docs/superpowers/plans/). A plan is task-by-task and test-first, with
@@ -1074,6 +1075,7 @@ the repository.
 | `HERMES_MCP_KEY` | Static only | Bearer key callers must present. Boot refuses on a missing, short (under 16 characters), or placeholder-looking value |
 | `HERMES_MCP_OAUTH_ISSUER` | OAuth only | Public HTTPS origin for the bridge, such as `https://hermes.example.com`. When set, OAuth replaces static bearer authentication and `HERMES_MCP_KEY` is not required |
 | `HERMES_MCP_OAUTH_PASSWORD` | OAuth only | Password Shawn enters on the connector authorization page. Boot refuses missing, short, or placeholder-shaped values |
+| `HERMES_MCP_OAUTH_REDIRECT_HOSTS` | OAuth only | Comma-separated redirect-host allowlist for dynamic registration, such as `claude.ai,claude.com`. Registrations for other hosts are refused |
 | `HERMES_MCP_OAUTH_STATE_PATH` | No | Mode-600 JSON file holding OAuth client registrations and tokens. Defaults to `~/.config/hermes-mcp/oauth-state.json` |
 | `HERMES_MCP_REGISTRY` | No | Path to the profile registry TOML. Defaults to `~/.config/hermes-mcp/registry.toml` |
 | `HERMES_MCP_HOST` | No | Address the bridge binds. Defaults to `127.0.0.1`. A non-loopback address turns **off** the SDK's automatic loopback-only DNS-rebinding protection, so `HERMES_MCP_ALLOWED_HOSTS` is **required** with one: the bridge refuses to start on a non-loopback bind with an empty allowlist rather than serving unprotected. Loopback (`127.0.0.1`, `localhost`, `::1`) needs no allowlist |
