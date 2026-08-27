@@ -21,6 +21,31 @@
 
 ---
 
+## `/model Qwen` and the RAM interlock
+
+Model names are matched case-insensitively. `MODEL_ROUTES.get(model)` was a
+plain dict lookup, so `/model Qwen` missed and the session silently stayed on
+the cloud model -- the one failure mode nothing reports, because a passthrough
+is a legitimate outcome. `qwen`, `Qwen`, `QWEN` and surrounding whitespace all
+resolve to the same tier now, as do the other local names.
+
+**Engaging the MLX Qwen3.8-27B tier evicts every resident Ollama model first.**
+That tier holds roughly 17 GB and an llm-jury council holds roughly 21 GB; this
+host has 36 GB with a wired ceiling near 27, so the two cannot co-reside.
+Getting it wrong has kernel-panicked this Mac twice, and nothing enforced it --
+`mlx_admin` carried a comment saying it was "bounded by `qwen38 stop`", which is
+a person remembering, not a guard.
+
+The eviction is logged at warning level, never silent: a jury run losing its
+council mid-flight should be explainable from the log rather than looking like a
+crash. It is a no-op when Ollama holds nothing, and a failure to evict is logged
+and the request proceeds -- refusing to answer would trade a memory risk for a
+certain outage.
+
+**Scope.** The guard fires when the tier is engaged THROUGH THE ROUTER. Starting
+the MLX server by hand with `qwen38 start` and separately loading a council
+still collides; the router is not in that path.
+
 ## The problem
 
 Claude Code is genuinely in a league of its own as a coding agent. The tool use, the agentic loops, the way it navigates a codebase — nothing else comes close.

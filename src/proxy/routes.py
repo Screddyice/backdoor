@@ -13,6 +13,7 @@ from starlette.background import BackgroundTask
 
 from .config import (
     MODEL_ROUTES, Settings, get_settings, load_profile_settings, pick_failover_profile,
+    resolve_model_route,
 )
 from .bare import make_bare, parse_keep
 from .failover import FAILOVER_STATUSES, FailoverBreaker
@@ -317,7 +318,7 @@ async def create_message(
 
     if settings.router_mode == "hybrid":
         model = _model_from_body(body)
-        profile = MODEL_ROUTES.get(model)
+        profile = resolve_model_route(model)
         if profile is None:
             if not settings.failover_to_local:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)

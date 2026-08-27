@@ -31,6 +31,8 @@ import os
 
 import httpx
 
+from . import ollama_admin
+
 logger = logging.getLogger(__name__)
 
 MLX_PROFILE = "local-qwen38-action"
@@ -118,6 +120,22 @@ async def resolve_profile(profile: str) -> str:
     if profile != MLX_PROFILE:
         return profile
     if await ensure_running():
+        # The MLX tier is about to hold ~17 GB. An llm-jury council in Ollama
+        # holds ~21 GB, and this host has 36 GB with a wired ceiling near 27, so
+        # the two cannot co-reside -- getting it wrong has kernel-panicked this
+        # machine twice. Nothing enforced it: the note above said "bounded by
+        # `qwen38 stop`", which is a person remembering.
+        #
+        # Evicting is safe to do unconditionally here because this branch is
+        # only reached when the MLX tier is confirmed running and about to
+        # serve. It is a no-op when Ollama holds nothing, which is the normal
+        # case, and never blocks the request: a failure to evict is logged and
+        # the request proceeds, because refusing to answer would trade a memory
+        # risk for a certain outage.
+        try:
+            await ollama_admin.evict_all(reason="MLX Qwen3.8 tier is serving")
+        except Exception as error:  # noqa: BLE001 - housekeeping must not fail a request
+            logger.warning("mlx: could not clear Ollama residency: %s", error)
         return profile
     logger.warning(
         "mlx: %s unavailable, falling back to %s. Run `qwen38 start` to restore it.",

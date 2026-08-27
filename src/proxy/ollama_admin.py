@@ -36,6 +36,7 @@ behaviour (release on the global timer), which is degraded, not broken.
 """
 
 import logging
+import os
 
 from httpx import AsyncClient
 
@@ -44,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Bound as a module attribute, not reached through `httpx.`, so a test can
 # replace THIS name without patching the httpx module every other component
 # (including the test's own ASGI client) is sharing.
-__all__ = ["native_base", "is_ollama", "set_keep_alive", "unload"]
+__all__ = ["native_base", "is_ollama", "set_keep_alive", "unload", "resident_models", "evict_all"]
 
 # Short: this is an out-of-band housekeeping call on localhost, and blocking a
 # real request behind it would trade the problem for a worse one.
@@ -108,3 +109,70 @@ async def unload(provider_base_url: str, model: str) -> bool:
     if ok:
         logger.warning("released local tier %s — failover no longer needed", model)
     return ok
+
+
+# Where a local Ollama listens when no profile named it. Profiles carry their
+# own base URL, but the MLX tier is not an Ollama profile and still needs to
+# reach the server to clear it.
+DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+if not DEFAULT_OLLAMA_BASE.startswith("http"):
+    DEFAULT_OLLAMA_BASE = f"http://{DEFAULT_OLLAMA_BASE}"
+
+
+async def resident_models(base_url: str = DEFAULT_OLLAMA_BASE) -> list[str]:
+    """Models currently holding GPU memory, per Ollama's /api/ps.
+
+    Empty on any failure. A router that cannot see the server must not conclude
+    the GPU is busy and start evicting things it cannot name.
+    """
+
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    try:
+        # AsyncClient via the module attribute, matching _admin_call: a test
+        # replaces THIS name rather than patching httpx globally.
+        async with AsyncClient(timeout=ADMIN_TIMEOUT) as client:
+            response = await client.get(f"{root}/api/ps")
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as error:  # noqa: BLE001 - any failure means "cannot tell"
+        logger.debug("ollama: could not read residency: %s", error)
+        return []
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return []
+    return [m["name"] for m in models if isinstance(m, dict) and isinstance(m.get("name"), str)]
+
+
+async def evict_all(base_url: str = DEFAULT_OLLAMA_BASE, *, reason: str = "") -> list[str]:
+    """Unload every resident Ollama model. Returns the names actually evicted.
+
+    THIS EXISTS TO STOP THE HOST PANICKING. The MLX Qwen3.8-27B tier holds
+    roughly 17 GB and an llm-jury council holds roughly 21 GB; this machine has
+    36 GB with a wired ceiling near 27 GB, so the two cannot co-reside. Getting
+    that wrong has kernel-panicked this Mac twice, and nothing enforced it --
+    mlx_admin only carried a comment saying it was "bounded by `qwen38 stop`",
+    which is a person remembering, not a guard.
+
+    Eviction is LOGGED at warning level, never silently: a jury run losing its
+    council mid-flight should be explainable from the log rather than looking
+    like the council crashed.
+    """
+
+    names = await resident_models(base_url)
+    if not names:
+        return []
+    logger.warning(
+        "ollama: evicting %d resident model(s) to free GPU memory%s: %s",
+        len(names),
+        f" ({reason})" if reason else "",
+        ", ".join(names),
+    )
+    evicted: list[str] = []
+    for name in names:
+        if await unload(base_url, name):
+            evicted.append(name)
+        else:
+            logger.warning("ollama: could not evict %s; memory pressure may persist", name)
+    return evicted
