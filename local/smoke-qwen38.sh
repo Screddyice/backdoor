@@ -52,7 +52,7 @@ fi
 
 step "4. router path"
 if curl -fsS --max-time 5 http://127.0.0.1:8083/health >/dev/null 2>&1; then
-  ok "router is up on 8083 (check proxy.log for '→ local [qwen → local-qwen38-action]')"
+  ok "router is up on 8083 (check proxy.log for '→ local [qwen → local-qwen38-obliterated]')"
 else
   print "SKIP: router not running on 8083"
 fi
