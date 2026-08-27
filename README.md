@@ -638,7 +638,7 @@ Keep the value equal to the profile's actual `num_ctx`. Setting it above the tru
 
 The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste.
 
-The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF, whose bundled chat template closes an empty thinking block before generation. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
+The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF. Its OpenAI endpoint returned an ordinary answer alongside internal reasoning in live compaction testing. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
 
 #### Memory is the other half of a small window
 
@@ -689,7 +689,7 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | `--bare` keeps the prompt small and the no-thinking template keeps compaction textual |
+| `qwen`, `qwen lean` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | `--bare` keeps the prompt small and the OpenAI endpoint returns textual compaction output |
 | `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
 | `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the heavy tier costs more GPU than the task is worth |
 
@@ -789,7 +789,7 @@ ollama create qwen3.8:27b-obliterated \
   -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
 ```
 
-The Modelfile inherits the GGUF's no-thinking chat template, clamps `num_ctx` to 32,768, and sets the publisher's required `repeat_penalty` to 1.15. `profiles/local-qwen38-obliterated.env` leaves inline-thinking stripping off. If the model emits thinking markup, Claude Code receives text instead of another empty compact response.
+The bundled GGUF template does not advertise tools, so Ollama rejects Claude Code requests with `does not support tools`. The Modelfile installs the tool-capable template from the stock local `qwen3:8b` tag, clamps `num_ctx` to 32,768, and sets the publisher's required `repeat_penalty` to 1.15. Live checks must cover both tool-call serialization and a non-empty compact response before this tag is used as the default.
 
 The 27B GGUF and the 27B MLX server cannot share memory safely. Before the router serves `local-qwen38-obliterated`, `mlx_admin` stops either managed MLX profile and waits for port 8080 to go quiet. If the server cannot stop, the router selects `local-fast` and logs the collision instead of loading both 27B runtimes.
 

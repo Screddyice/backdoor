@@ -48,12 +48,15 @@ def test_profile_uses_local_ollama_without_thinking_stripping() -> None:
     assert not [line for line in settings if line.startswith("PROVIDER_STRIP_INLINE_THINKING=")]
 
 
-def test_modelfile_clamps_context_and_inherits_the_gguf_template() -> None:
+def test_modelfile_clamps_context_and_installs_the_tool_template() -> None:
     text = (ROOT / "modelfiles" / "bare" / "qwen3.8-27b-obliterated.Modelfile").read_text()
     assert "FROM hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M" in text
     assert "PARAMETER num_ctx 32768" in text
     assert "PARAMETER repeat_penalty 1.15" in text
-    assert "TEMPLATE " not in text
+    assert "TEMPLATE " in text
+    assert ".Tools" in text
+    assert "<tool_call>" in text
+    assert ".ToolCalls" in text
 
 
 def test_ollama_27b_profile_is_memory_exclusive_with_mlx() -> None:
