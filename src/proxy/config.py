@@ -127,10 +127,9 @@ class Settings(BaseSettings):
     # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
     # deliberate `/model qwen` handed the full unstripped harness to whatever
     # tier the route named. That is fine for the 64K tiers and wrong for a tier
-    # whose window assumes bare mode: the heavy tier is bounded at 28K, and a full
+    # whose window assumes bare mode: the default tier is bounded at 27K, and a full
     # harness session does not fit — the same over-window regression the
-    # profile header warns about. (Recorded when that tier was a 27B; the bound
-    # outlived the model, and qwen38-action inherits the same constraint.)
+    # profile header warns about.
     # Set ROUTE_BARE=true on those profiles only. Deliberately reuses the
     # failover_* keep-list and truncation knobs so both paths strip identically;
     # a route that strips differently from failover would be a second behaviour
@@ -154,6 +153,11 @@ class Settings(BaseSettings):
     # deliberate route and a failover size the tier identically. Over it, the
     # request escalates through that ladder instead of failing.
     route_max_input_tokens: int = 0
+
+    # Optional runtime identity for profiles whose server lifecycle must be
+    # supervised before a request can load weights. Unlike the hybrid router's
+    # local `profile` variable, this survives `bd switch` into profile mode.
+    runtime_profile: str = ""
 
     # Request optimizations — avoid burning provider quota on Claude Code housekeeping calls
     skip_quota_probes: bool = True
@@ -267,7 +271,7 @@ MODEL_ROUTES: dict[str, str] = {
 # still overflows the 27B's 32K window — at which point a weaker model that
 # retains the session beats a stronger one that truncates it.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (28_000, "local-qwen38-obliterated"),   # obliterated 27B GGUF (32K, tools)
+    (27_000, "local-qwen38-obliterated"),   # 27K in + 4K out + template reserve
     (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
 ]
 

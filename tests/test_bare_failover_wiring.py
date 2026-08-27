@@ -276,6 +276,42 @@ async def test_profile_mode_normal_session_stays_put(monkeypatch):
     assert not seen, f"small session was needlessly escalated to {seen}"
 
 
+async def test_profile_mode_runs_the_runtime_interlock_before_provider_call(monkeypatch):
+    """The qwen wrapper runs profile mode, so the MLX guard must run there too."""
+    recorder = RecordingClient()
+    resolved: list[str] = []
+    seen: list[str] = []
+
+    async def _fallback(profile):
+        resolved.append(profile)
+        return "local-fast"
+
+    monkeypatch.setattr(routes.mlx_admin, "resolve_profile", _fallback)
+    monkeypatch.setattr(
+        routes,
+        "_get_profile_client",
+        lambda profile, settings: (seen.append(profile), recorder)[1],
+    )
+    routes.set_provider_client(recorder)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_base_url="http://127.0.0.1:11434/v1",
+        provider_model="qwen3.8:27b-obliterated",
+        runtime_profile="local-qwen38-obliterated",
+        route_max_input_tokens=27_000,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=1))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resolved == ["local-qwen38-obliterated"]
+    assert seen[-1] == "local-fast"
+
+
 async def test_oversized_route_session_escalates_to_the_wide_tier(route_app):
     """The bug. A transcript that overflows the 27B's window has to reach the
     256K tier, exactly as the failover path would route it. Before this fix the

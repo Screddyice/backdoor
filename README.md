@@ -609,13 +609,13 @@ Observed 2026-08-12: a `qwen` session sent **143,490 tokens at the 27B's 32K win
 Tiers now declare the largest post-strip session they will take:
 
 ```
-ROUTE_MAX_INPUT_TOKENS=28000
+ROUTE_MAX_INPUT_TOKENS=27000
 ```
 
 Set it to the same bound the tier carries in `FAILOVER_LADDER`, so a deliberate route and a failover size that tier identically. Over it, the request escalates through the same ladder rather than failing:
 
 ```
-⇢ ROUTE ESCALATE [local-failover-heavy → local-failover-256k] in≈143490 over 28000
+⇢ ROUTE ESCALATE [local-qwen38-obliterated → local-failover-256k] in≈143490 over 27000
 ```
 
 Sizing happens **after** stripping, matching the failover branch — size the raw body and a bare-able session escalates to the wide 4B tier for no reason, wasting the stronger model. `0` disables the check, which is what the unstripped 64K tiers use.
@@ -636,7 +636,7 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
 
 Keep the value equal to the profile's actual `num_ctx`. Setting it above the true window restores the original bug in a quieter form, because compaction again waits for a ceiling the model cannot reach. An unknown profile falls back to 32000, the floor, on the principle that compacting early costs a little quality and compacting late costs the session. An explicit `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in the environment still wins, for deliberate experiments.
 
-The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste.
+The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste. The obliterated tier also caps generation at 4,096 tokens, so its 27K input ceiling leaves room for output and template overhead inside the 32,768-token runtime window.
 
 The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF. Its OpenAI endpoint returned an ordinary answer alongside internal reasoning in live compaction testing. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
 
@@ -657,7 +657,7 @@ The paragraph above describes the check on the **hybrid** path, and on its own i
 So the tier check runs **after every routing branch has chosen**, where no path can skip it:
 
 ```
-⇢ TIER ESCALATE [qwen3.8:27b-bare → qwen3.5:4b-256k] in≈143490 over 28000
+⇢ TIER ESCALATE [qwen3.8:27b-obliterated → qwen3.5:4b-256k] in≈143490 over 27000
 ```
 
 Three properties make that placement safe:
@@ -666,9 +666,11 @@ Three properties make that placement safe:
 - **It cannot fire twice.** The wide tiers leave `ROUTE_MAX_INPUT_TOKENS` unset, so once the hybrid branch has escalated, the backstop finds nothing to do.
 - **Escalation failure is not request failure.** If the wider profile cannot be loaded, the request continues on its original tier and surfaces an honest provider error, which is what it did before.
 
+The runtime interlock follows the same placement rule. Profiles that manage a large runtime set `RUNTIME_PROFILE`, and the router resolves it after both routing branches and size escalation. That keeps the hybrid `/model qwen` path and the wrapper's profile-mode path under the same MLX/Ollama exclusion guard.
+
 The general lesson: `router_mode` is a real fork in this file, and a guard is only as good as the branch it sits in. Verify a fix against the mode the failure actually used, not the one you were reading when you wrote it.
 
-Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. A 27B at **23GB** and a fusion council at roughly 21GB do not both fit on a 36GB host, and Ollama caps by model count, so nothing will stop you from asking for both.
+Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. This Qwen3.8 GGUF measures **17GB** resident and a fusion council is roughly 21GB. They do not both fit under this host's wired-memory ceiling, and Ollama caps by model count, so nothing upstream refuses the combination.
 
 ### Keeping the 27B warm without starving the council
 

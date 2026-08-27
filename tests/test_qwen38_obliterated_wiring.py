@@ -36,15 +36,17 @@ def test_action_tuned_mlx_model_remains_an_explicit_rollback() -> None:
 
 def test_normal_failover_uses_the_obliterated_gguf() -> None:
     assert Settings().failover_profile == PROFILE
-    assert FAILOVER_LADDER[0] == (28_000, PROFILE)
+    assert FAILOVER_LADDER[0] == (27_000, PROFILE)
 
 
 def test_profile_uses_local_ollama_without_thinking_stripping() -> None:
     settings = _settings_lines(PROFILE)
     assert "PROVIDER_BASE_URL=http://localhost:11434/v1" in settings
     assert f"PROVIDER_MODEL={MODEL}" in settings
+    assert f"RUNTIME_PROFILE={PROFILE}" in settings
     assert "ROUTE_BARE=true" in settings
-    assert "ROUTE_MAX_INPUT_TOKENS=28000" in settings
+    assert "ROUTE_MAX_INPUT_TOKENS=27000" in settings
+    assert "PROVIDER_MAX_TOKENS=4096" in settings
     assert not [line for line in settings if line.startswith("PROVIDER_STRIP_INLINE_THINKING=")]
 
 
