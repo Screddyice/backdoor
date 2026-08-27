@@ -66,3 +66,12 @@ def test_qwen_wrapper_defaults_to_the_obliterated_profile_at_32k() -> None:
     assert 'PROFILE="local-qwen38-obliterated"' in wrapper
     assert "local-qwen38-obliterated) QWEN_CTX=32000" in wrapper
     assert '[ "$PROFILE" = "local-qwen38-obliterated" ] && KEEP_ALIVE="10m"' in wrapper
+
+
+def test_qwen_wrapper_stops_mlx_before_warming_the_ollama_27b() -> None:
+    wrapper = (ROOT / "qwen").read_text()
+    stop = wrapper.index("qwen38 stop")
+    warm = wrapper.index('http://127.0.0.1:11434/api/chat')
+    assert stop < warm
+    assert 'WARM_OLLAMA=""' in wrapper
+    assert '[ -n "$WARM_OLLAMA" ] && curl' in wrapper

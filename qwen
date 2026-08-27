@@ -367,9 +367,16 @@ if [ "$PROFILE" = "local-qwen38-action" ]; then
   fi
 else
   KEEP_ALIVE="30m"
+  WARM_OLLAMA=1
   [ "$PROFILE" = "local-qwen38-obliterated" ] && KEEP_ALIVE="10m"
   [ "$PROFILE" = "local-failover-heavy" ] && KEEP_ALIVE="10m"
-  curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
+  if [ "$PROFILE" = "local-qwen38-obliterated" ]; then
+    if ! command -v qwen38 >/dev/null 2>&1 || ! qwen38 stop; then
+      WARM_OLLAMA=""
+      echo "qwen: MLX could not be stopped; skipping the direct 27B warmup so the router can fall back safely." >&2
+    fi
+  fi
+  [ -n "$WARM_OLLAMA" ] && curl -s -o /dev/null "http://127.0.0.1:11434/api/chat" \
     -d "{\"model\":\"$MODEL\",\"keep_alive\":\"$KEEP_ALIVE\",\"options\":{\"num_predict\":1},\"messages\":[{\"role\":\"system\",\"content\":\"warmup\"},{\"role\":\"user\",\"content\":\"hi\"}]}" \
     >/dev/null 2>&1 &
 fi
