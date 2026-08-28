@@ -372,7 +372,9 @@ class SingleUserOAuthProvider(
         form = await request.form()
         login_state = form.get("state")
         password = form.get("password")
-        pending = self._get_pending(login_state) if isinstance(login_state, str) else None
+        pending = (
+            self._get_pending(login_state) if isinstance(login_state, str) else None
+        )
         if pending is None:
             return HTMLResponse(
                 "Invalid or expired authorization request",
@@ -442,7 +444,15 @@ class SingleUserOAuthProvider(
         target = construct_redirect_uri(
             str(params.redirect_uri), code=code_value, state=params.state
         )
-        return RedirectResponse(target, status_code=302, headers=LOGIN_SECURITY_HEADERS)
+        escaped_target = html.escape(target, quote=True)
+        return HTMLResponse(
+            "<!doctype html><html><head><title>Screddy Hermes connected</title>"
+            "</head><body><main><h1>Screddy Hermes approved</h1>"
+            "<p>The connector password was accepted.</p>"
+            f'<p><a href="{escaped_target}">Continue to Claude</a></p>'
+            "</main></body></html>",
+            headers=LOGIN_SECURITY_HEADERS,
+        )
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str

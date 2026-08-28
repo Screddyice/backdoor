@@ -2,7 +2,9 @@
 
 import base64
 import hashlib
+import html
 import json
+import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -37,6 +39,12 @@ INITIALIZE_BODY = {
         "clientInfo": {"name": "claude-connector-test", "version": "1"},
     },
 }
+
+
+def _completion_target(response) -> str:
+    match = re.search(r'<a href="([^"]+)">Continue to Claude</a>', response.text)
+    assert match is not None
+    return html.unescape(match.group(1))
 
 
 def _oauth_env(monkeypatch, state_path: Path) -> None:
@@ -183,11 +191,11 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
         )
 
         callback = client.get(approved.headers["location"], follow_redirects=False)
-        assert callback.status_code == 302
+        assert callback.status_code == 200
         assert callback.headers["cache-control"] == "no-store"
         assert callback.headers["pragma"] == "no-cache"
         assert callback.headers["referrer-policy"] == "no-referrer"
-        redirect = urlparse(callback.headers["location"])
+        redirect = urlparse(_completion_target(callback))
         query = parse_qs(redirect.query)
         assert f"{redirect.scheme}://{redirect.netloc}{redirect.path}" == REDIRECT_URI
         assert query["state"] == ["claude-state"]
@@ -313,10 +321,11 @@ def test_login_uses_completion_get_and_tolerates_duplicate_submit(
         assert repeated.headers["location"] == approved.headers["location"]
 
         callback = client.get(approved.headers["location"], follow_redirects=False)
-        assert callback.status_code == 302
-        redirect = urlparse(callback.headers["location"])
-        assert f"{redirect.scheme}://{redirect.netloc}{redirect.path}" == REDIRECT_URI
-        assert parse_qs(redirect.query)["state"] == ["claude-state"]
+        assert callback.status_code == 200
+        assert "location" not in callback.headers
+        assert "Continue to Claude" in callback.text
+        assert 'href="https://client.example/callback?code=mcp_' in callback.text
+        assert "&amp;state=claude-state" in callback.text
         assert (
             client.get(approved.headers["location"], follow_redirects=False).status_code
             == 400
@@ -505,7 +514,7 @@ def test_authorization_enforces_resource_and_pkce_code_is_single_use(
             follow_redirects=False,
         )
         callback = client.get(approved.headers["location"], follow_redirects=False)
-        code = parse_qs(urlparse(callback.headers["location"]).query)["code"][0]
+        code = parse_qs(urlparse(_completion_target(callback)).query)["code"][0]
         token_data = {
             "grant_type": "authorization_code",
             "code": code,
