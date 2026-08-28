@@ -99,6 +99,16 @@ def test_build_local_payload_flattens_local_namespace_and_drops_remote_tools():
     assert budget.dropped_tools == 2
 
 
+def test_empty_local_tool_allowlist_removes_tools_and_tool_choice():
+    local, budget = build_local_payload(
+        load_request(), [], Settings(codex_local_tools="")
+    )
+
+    assert "tools" not in local
+    assert "tool_choice" not in local
+    assert budget.dropped_tools == 3
+
+
 def test_extract_recall_query_uses_only_the_latest_user_text():
     assert extract_recall_query(load_request()) == "active task"
 

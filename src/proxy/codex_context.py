@@ -122,9 +122,17 @@ def _function_tool(tool: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
-def _normalize_tools(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+def _normalize_tools(
+    payload: dict[str, Any], keep_raw: str
+) -> tuple[list[dict[str, Any]], int]:
     normalized: list[dict[str, Any]] = []
     dropped = 0
+    patterns = tuple(part.strip().lower() for part in keep_raw.split(",") if part.strip())
+
+    def allowed(name: str) -> bool:
+        lowered = name.lower()
+        return "local" in patterns or any(pattern in lowered for pattern in patterns)
+
     sources: list[Any] = []
     if isinstance(payload.get("tools"), list):
         sources.extend(payload["tools"])
@@ -148,7 +156,7 @@ def _normalize_tools(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int
                 continue
             for child in children:
                 converted = _function_tool(child) if isinstance(child, dict) else None
-                if converted is None:
+                if converted is None or not allowed(str(converted.get("name", ""))):
                     dropped += 1
                 else:
                     normalized.append(converted)
@@ -157,7 +165,7 @@ def _normalize_tools(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int
             dropped += 1
             continue
         converted = _function_tool(tool)
-        if converted is None:
+        if converted is None or not allowed(str(converted.get("name", ""))):
             dropped += 1
         else:
             normalized.append(converted)
@@ -253,7 +261,7 @@ def build_local_payload(
         *active,
     ]
 
-    tools, initially_dropped = _normalize_tools(payload)
+    tools, initially_dropped = _normalize_tools(payload, settings.codex_local_tools)
     tools, tool_tokens, budget_dropped = _bounded_tools(
         tools, settings.codex_tools_budget_tokens
     )
