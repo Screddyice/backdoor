@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from src.proxy import codex_routes
+from src.proxy import codex_routes, compute_lease
 from src.proxy.app import create_app
 from src.proxy.config import Settings, get_settings
 from src.proxy.failover import FailoverBreaker
@@ -245,6 +245,12 @@ async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
     app, settings, _ = codex_app
     breaker = one_shot_breaker(tmp_path)
     monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
+    claims = []
+    monkeypatch.setattr(
+        compute_lease,
+        "claim_exclusive_model",
+        lambda model, **kwargs: claims.append((model, kwargs)),
+    )
     cloud_calls = []
     local_calls = []
 
@@ -304,6 +310,12 @@ async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
     assert "authorization" not in local_calls[0].headers
     assert "chatgpt-account-id" not in local_calls[0].headers
     assert breaker.open is True
+    assert claims == [
+        (
+            "qwen3.8:27b-obliterated",
+            {"source": "codex-failover", "ttl_seconds": 600},
+        )
+    ]
 
 
 @pytest.mark.asyncio

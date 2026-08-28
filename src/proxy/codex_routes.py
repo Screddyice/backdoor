@@ -23,7 +23,7 @@ from .codex_context import (
 from .cognee_recall import recall_context
 from .config import Settings, get_settings
 from .failover import FailoverBreaker
-from . import mlx_admin, ollama_admin
+from . import compute_lease, mlx_admin, ollama_admin
 
 logger = logging.getLogger(__name__)
 codex_router = APIRouter(prefix="/backend-api/codex")
@@ -223,6 +223,11 @@ async def _serve_local(
     except CodexRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
+    compute_lease.claim_exclusive_model(
+        settings.codex_local_model,
+        source="codex-failover",
+        ttl_seconds=600,
+    )
     try:
         response = await _send_local(local_payload, settings)
     except httpx.TransportError as exc:

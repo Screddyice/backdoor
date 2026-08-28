@@ -4,6 +4,8 @@
 
 **Goal:** Keep one visible Codex thread working through ChatGPT inference outages by routing failed turns to `qwen3.8:27b-obliterated` with a fresh, Cognee-backed context capped at 32K.
 
+**Compute interlock addendum:** Claude and Codex must publish the same exclusive 27B ownership lease before inference. LLM-Jury must refuse both its local council and every frontier provider, including OpenRouter, whenever Backdoor failover is active, an ownership lease is live, or Ollama still reports the 27B model resident.
+
 **Architecture:** Codex uses a custom Responses provider on Backdoor. Backdoor relays healthy cloud requests byte-for-byte, while a separate Codex breaker rebuilds an outage request from the active user turn, authoritative local Cognee recall, and an allowlisted local tool catalog before streaming Ollama Responses events back to Codex.
 
 **Tech Stack:** Python 3.11, FastAPI, httpx, Pydantic Settings, Ollama Responses API, Cognee HTTP recall, pytest, pytest-asyncio

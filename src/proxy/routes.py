@@ -17,7 +17,7 @@ from .config import (
 )
 from .bare import make_bare, parse_keep
 from .failover import FAILOVER_STATUSES, FailoverBreaker
-from . import mlx_admin, ollama_admin
+from . import compute_lease, mlx_admin, ollama_admin
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -603,6 +603,13 @@ async def create_message(
             )
             settings = load_profile_settings(served_by)
             client = _get_profile_client(served_by, settings)
+
+    if settings.provider_model == "qwen3.8:27b-obliterated":
+        compute_lease.claim_exclusive_model(
+            settings.provider_model,
+            source="claude-failover" if failed_over else "claude-explicit",
+            ttl_seconds=600,
+        )
 
     payload = build_nim_payload(req, settings)
     msg_id = f"msg_{uuid.uuid4().hex}"

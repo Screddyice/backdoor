@@ -18,6 +18,8 @@ Both the normal Codex path and the local failover path operate within a 32K cont
 - Start each local failover turn from a fresh model context.
 - Recall durable context from the local Cognee server before local inference.
 - Use `qwen3.8:27b-obliterated` as the Codex failover model.
+- Give that 27B model exclusive compute for both Claude and Codex, whether selected explicitly or reached through failover.
+- Stop LLM-Jury before local council or frontier construction while the exclusive model is requested or resident. This includes OpenRouter.
 - Cap both cloud-facing Codex sessions and local inference at 32K.
 - Maintain a Codex-specific circuit breaker because ChatGPT and Anthropic can fail independently.
 - Never fail over for malformed requests or authentication and authorization failures.
@@ -89,6 +91,7 @@ The builder performs these steps:
 7. Add the current user request after the recall block.
 8. Normalize supported local tools.
 9. Rewrite the model to `qwen3.8:27b-obliterated`.
+10. Publish a process-scoped 10-minute exclusive-compute lease before local inference begins.
 10. Bound the complete request to the 32K policy before sending it to Ollama's `/v1/responses` endpoint.
 
 The request keeps enough Codex metadata to correlate logs and responses, but it drops opaque cloud-only fields that Ollama does not accept.
@@ -231,6 +234,7 @@ Deployment updates the detached Backdoor service checkout and the shared Codex c
 - A running Codex session continues in the same visible thread when ChatGPT inference loses connectivity.
 - Qwen starts with no cloud transcript and receives relevant Cognee context plus the current task.
 - Local inference uses `qwen3.8:27b-obliterated` and never exceeds the 32K policy.
+- Claude and Codex publish the same ownership contract. LLM-Jury checks the breaker, lease directory, and Ollama residency, then refuses the entire run while the 27B model owns compute.
 - Core local Codex tools continue working during failover.
 - Authentication failures remain visible and never activate Qwen.
 - Cloud inference resumes automatically after recovery.

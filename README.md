@@ -1077,13 +1077,15 @@ ps -E -o command= -p $(pgrep -x claude | head -1) | tr ' ' '\n' | grep ANTHROPIC
 
 Claude Code reads that variable once at startup, so a session that began unrouted can never gain failover — restarting the router or the shell will not reach it, and only relaunching does.
 
-**Coordination with other local-GPU consumers.** Every breaker transition is published atomically to `~/.backdoor/failover-state.json`:
+**Coordination with other model consumers.** Every breaker transition is published atomically to `~/.backdoor/failover-state.json`:
 
 ```json
 { "failover_active": true, "reason": "ConnectError", "updated_at": 1754130000.0, "pid": 4242 }
 ```
 
-llm-jury reads that file and disables itself while failover is active, so the router and the council never contend for the same VRAM. Writing is best-effort — a router that cannot write the file still routes, and a missing or unreadable file reads as "not failing over".
+Claude and Codex also write a process-scoped lease under `~/.backdoor/compute-leases/` before `qwen3.8:27b-obliterated` starts inference. This covers explicit Qwen sessions as well as failover and closes the load-time gap before Ollama lists the model in `/api/ps`. LLM-Jury checks the breaker, active leases, and Ollama residency before it constructs any backend. If the 27B model owns compute, LLM-Jury disables the local council and all frontier providers, including OpenRouter. Expired leases and leases from dead router processes are ignored.
+
+Writing is best-effort. A router that cannot publish state still routes, and LLM-Jury treats missing or unreadable state as inactive. Ollama residency remains the final backstop after a lease expires.
 
 | Setting | Default | Effect |
 |---|---|---|
@@ -1096,6 +1098,7 @@ llm-jury reads that file and disables itself while failover is active, so the ro
 | `failover_probe_seconds` | `60` | How often an open breaker retries upstream (half-open) |
 | `BACKDOOR_FAILOVER_STATUSES` | *(empty)* | Comma-separated HTTP statuses to restore as triggers, e.g. `429,529` |
 | `BACKDOOR_FAILOVER_STATE` | `~/.backdoor/failover-state.json` | Where breaker state is published |
+| `BACKDOOR_COMPUTE_LEASE_DIR` | `~/.backdoor/compute-leases` | Where Claude and Codex publish exclusive 27B ownership leases |
 
 ---
 
