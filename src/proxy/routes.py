@@ -549,6 +549,24 @@ async def create_message(
 
     req = bare_req if bare_req is not None else MessagesRequest.model_validate_json(body)
 
+    # Profile mode is also a supported direct path (`bd switch ...; bd claude`).
+    # It bypasses MODEL_ROUTES, so honor the active profile's bare contract here
+    # before optimization, sizing, or provider translation. The wrapper already
+    # launches Claude Code with --bare, but the server must remain safe when a
+    # caller bypasses that wrapper.
+    if settings.router_mode != "hybrid" and settings.route_bare:
+        try:
+            req = make_bare(
+                req,
+                keep=parse_keep(settings.failover_keep_tools),
+                tool_result_chars=settings.failover_tool_result_chars,
+            )
+        except Exception:
+            # Match hybrid routing and failover: stripping cannot become a new
+            # request failure. The provider will surface an honest overflow if
+            # the unstripped request is too large.
+            logger.exception("profile bare-mode failed; sending unstripped")
+
     fast = _check_optimizations(req, settings)
     if fast:
         return fast

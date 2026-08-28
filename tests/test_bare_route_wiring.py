@@ -152,6 +152,28 @@ async def test_stripping_failure_does_not_drop_the_request(routed_app):
     assert recorder.payload is not None, "a stripping failure swallowed the request"
 
 
+async def test_profile_mode_route_bare_arrives_stripped(monkeypatch):
+    """Direct `bd claude` must honor the profile's 32K bare contract too."""
+    recorder = RecordingClient()
+    routes.set_provider_client(recorder)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_base_url="http://localhost:11434/v1",
+        route_bare=True,
+    )
+    try:
+        resp = await _post(app, _harness_request())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    sent = json.dumps(recorder.payload)
+    assert "official CLI" not in sent
+    assert "Z" * 5000 not in sent
+
+
 def test_qwen_route_targets_a_profile_that_declares_route_bare():
     """The wiring guard: the flag has to be ON the profile `qwen` resolves to.
 

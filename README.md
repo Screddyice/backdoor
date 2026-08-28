@@ -686,7 +686,7 @@ Thirty idle minutes of a resident 27B is thirty minutes in which `llmjury solve`
 
 The warm-up call **must** carry a system message. A systemless request falls through to the baked ~46K-token Fable-5 SYSTEM prompt on the `*-64k/128k/256k` tags and cold-prefills all of it, which takes about a minute and looks exactly like an offline hang.
 
-The `qwen` wrapper reaches Ollama by a third path and never reads this table. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile and nothing strips server-side. Its modes pick their own tier:
+The `qwen` wrapper reaches Ollama by a third path. It runs the proxy in `profile` mode on :8082, where every request translates to the active profile. Profiles with `ROUTE_BARE=true` are stripped server-side too, which protects direct `bd claude` launches that bypass the wrapper. Its modes pick their own tier:
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
