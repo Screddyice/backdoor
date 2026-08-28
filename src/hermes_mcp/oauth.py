@@ -49,6 +49,7 @@ REGISTRATION_WINDOW = 60
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_FAILURE_WINDOW = 300
 OWNER_SUBJECT = "shawn"
+LOGIN_COMPLETION_PATH = "/login/complete"
 LOGIN_SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Pragma": "no-cache",
@@ -406,7 +407,7 @@ class SingleUserOAuthProvider(
         self.failed_logins.clear()
         self.approved_logins.add(login_state)
         completion_target = (
-            f"{str(self.settings.issuer).rstrip('/')}/login/complete"
+            f"{str(self.settings.issuer).rstrip('/')}{LOGIN_COMPLETION_PATH}"
             f"?state={login_state}"
         )
         return RedirectResponse(
