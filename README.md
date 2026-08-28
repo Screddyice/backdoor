@@ -638,6 +638,10 @@ Keep the value equal to the profile's actual `num_ctx`. Setting it above the tru
 
 The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste. The obliterated tier also caps generation at 4,096 tokens, so its 27K input ceiling leaves room for output and template overhead inside the 32,768-token runtime window.
 
+Claude Code 2.1.250 also subtracts its output reservation before calculating the auto-compact threshold. With `xhigh` effort and an unrecognized model name, it reserved 20K from Qwen's declared 32K window. That left a 12K effective input window. The client's lean plugin and tool prefix could exceed 12K while Backdoor's stripped request contained only about 3K tokens, so a two-message session started compacting.
+
+The `qwen` wrapper now sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096`, matching the provider cap. Claude Code then gives input 27,904 tokens, which lines up with the route's 27K escalation guard. The wrapper scopes this setting to local sessions, so cloud Claude sessions keep their normal output allowance. It also passes `--model qwen`; a saved Opus setting can no longer make the client calculate a 1M window while the wrapper serves the 32K local model.
+
 The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF. Its OpenAI endpoint returned an ordinary answer alongside internal reasoning in live compaction testing. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
 
 #### Memory is the other half of a small window

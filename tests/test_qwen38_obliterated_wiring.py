@@ -73,6 +73,17 @@ def test_qwen_wrapper_defaults_to_the_obliterated_profile_at_32k() -> None:
     assert '[ "$PROFILE" = "local-qwen38-obliterated" ] && KEEP_ALIVE="10m"' in wrapper
 
 
+def test_qwen_wrapper_keeps_xhigh_output_reservation_inside_the_32k_window() -> None:
+    wrapper = (ROOT / "qwen").read_text()
+    assert 'QWEN_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-4096}"' in wrapper
+    assert 'CLAUDE_CODE_MAX_OUTPUT_TOKENS="$QWEN_MAX_OUTPUT_TOKENS"' in wrapper
+
+
+def test_qwen_wrapper_pins_client_metadata_to_the_qwen_alias() -> None:
+    wrapper = (ROOT / "qwen").read_text()
+    assert "EXTRA_ARGS+=(--model qwen)" in wrapper
+
+
 def test_qwen_wrapper_stops_mlx_before_warming_the_ollama_27b() -> None:
     wrapper = (ROOT / "qwen").read_text()
     stop = wrapper.index("qwen38 stop")
