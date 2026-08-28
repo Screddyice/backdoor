@@ -2,7 +2,7 @@
 
 Date: 2026-08-28
 
-Status: Architecture approved; written specification pending review
+Status: Approved
 
 ## Goal
 
