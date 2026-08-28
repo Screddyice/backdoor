@@ -66,9 +66,39 @@ cmd_switch() {
   echo "Switched to '$name' -> $(_get PROVIDER_MODEL) @ $(_get PROVIDER_BASE_URL)"
   if _running; then echo "Restarting proxy..."; cmd_restart; else echo "(proxy down — run 'bd start' or 'bd claude')"; fi
 }
+
+_qwen_client_context_tokens() {
+  local active
+  active="$(cat "$ACTIVE_FILE" 2>/dev/null || true)"
+  case "$active" in
+    local-qwen38-obliterated|local-qwen38-action) echo 32000 ;;
+    local-failover-heavy) echo 32000 ;;
+    local-qwen35|local-fast|local-qwen-9b) echo 64000 ;;
+    local-failover-128k) echo 128000 ;;
+    local-failover-256k) echo 256000 ;;
+    *) echo 32000 ;;
+  esac
+}
+
 cmd_claude() {
   cmd_start
-  echo "Launching Claude Code via backdoor (model: $(_get PROVIDER_MODEL))..."
+  local provider_model provider_model_lower
+  provider_model="$(_get PROVIDER_MODEL)"
+  provider_model_lower="$(printf '%s' "$provider_model" | tr '[:upper:]' '[:lower:]')"
+  echo "Launching Claude Code via backdoor (model: $provider_model)..."
+
+  if [[ "$provider_model_lower" == qwen* ]]; then
+    local provider_max_tokens qwen_context_tokens
+    provider_max_tokens="$(_get PROVIDER_MAX_TOKENS)"
+    provider_max_tokens="${provider_max_tokens:-4096}"
+    qwen_context_tokens="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-$(_qwen_client_context_tokens)}"
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS="$qwen_context_tokens" \
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-$provider_max_tokens}" \
+      ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" \
+      claude --model qwen "$@"
+    return
+  fi
+
   ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" claude "$@"
 }
 cmd_log() { tail -n "${1:-40}" "$LOG" 2>/dev/null || echo "(no log yet)"; }

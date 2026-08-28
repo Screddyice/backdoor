@@ -642,6 +642,18 @@ Claude Code 2.1.250 also subtracts its output reservation before calculating the
 
 The `qwen` wrapper now sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096`, matching the provider cap. Claude Code then gives input 27,904 tokens, which lines up with the route's 27K escalation guard. The wrapper scopes this setting to local sessions, so cloud Claude sessions keep their normal output allowance. It also passes `--model qwen`; a saved Opus setting can no longer make the client calculate a 1M window while the wrapper serves the 32K local model.
 
+Every launcher needs its own client policy because Claude Code and Codex calculate compaction before Backdoor sees the request:
+
+| Entry path | Client policy |
+|---|---|
+| `qwen` | declares the selected profile window, caps output at 4,096, and pins `--model qwen` |
+| `bd claude` on a Qwen profile | derives the profile window, reads `PROVIDER_MAX_TOKENS`, and pins `--model qwen` |
+| `claude --model qwen` | the shell launcher applies the 4,096 output cap for an explicit Qwen start |
+| `/model qwen` inside a routed Claude session | unknown-model enforcement stays disabled for that process; Backdoor strips the request and escalates past 27K instead of letting Claude Code compact against a false 12K window |
+| Codex through Backdoor | advertises 32K, compacts at 27,904 total tokens, and keeps a 4K local reply reserve; this path ships in the Codex failover change |
+
+The mid-session Claude path cannot change its process environment after `/model` runs. Its router guard supplies the hard boundary. Known Claude model IDs keep their native compaction policy, and cloud output remains uncapped.
+
 The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF. Its OpenAI endpoint returned an ordinary answer alongside internal reasoning in live compaction testing. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
 
 #### Memory is the other half of a small window
@@ -652,7 +664,11 @@ This is the one documented exception to the MCP-off rule, and the token arithmet
 
 Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
 
-Degradation is quiet and safe. A missing `COGNEE_API_KEY` falls through to an empty MCP config, so a genuinely offline run still starts. `QWEN_COGNEE=0` forces it off for true-offline work with no network calls at all.
+Large fetched pages also bypass the model window at the proxy layer, making the behavior independent of GUI plugins. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. It submits the original source, its URL, and a content hash to the dedicated `qwen_external_context` Cognee dataset. Later Qwen turns search that dataset and inject only a bounded set of recalled passages. The first turn does not wait for Cognee indexing: local ranking supplies its excerpts while Cognee processes the durable copy in the background.
+
+This boundary is client-independent because every local Qwen request crosses Backdoor. Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Source text is marked as untrusted data, high-confidence credential-shaped documents are not written, individual documents are capped at 500,000 characters, and Cognee calls time out after 1.5 seconds. A Cognee or SSH-tunnel failure never drops the request. `QWEN_COGNEE=0` disables writes and recall for true-offline work, while the local 6,000-character reduction still protects Qwen's window.
+
+The proxy resolves Cognee settings from its process environment, then `~/.cognee/.env`, then `~/projects/.env`. That makes the same behavior available to terminal launchers and Dock-launched clients that never source `.zshrc`. A missing key or unreachable service degrades to local reduction only.
 
 #### The guard has to sit below every routing branch
 

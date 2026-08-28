@@ -164,6 +164,25 @@ def test_dropped_tool_result_is_flattened_and_truncated():
     assert len(body) < 400
 
 
+def test_external_context_capsule_gets_its_own_bounded_budget():
+    """The general 2K tool-result cap must not erase the ranked link capsule.
+
+    The capsule has already discarded the full page and is independently
+    bounded. Bare mode may retain up to 6K characters from this one marked
+    result without reopening the unbounded-tool-result bug.
+    """
+    capsule = "<qwen-external-context source=example>\n" + ("relevant passage " * 300)
+    out = make_bare(
+        req(messages=[Message(role="user", content=[{
+            "type": "tool_result", "tool_use_id": "fetch", "content": capsule,
+        }])]),
+        tool_result_chars=100,
+    )
+    body = str(out.messages[0].content)
+    assert len(body) > 100
+    assert len(body) < 6_500
+
+
 def test_kept_tool_result_keeps_its_structure_but_is_still_truncated():
     """The keep-list decides what the model may CALL, not how much history it
     drags along. A kept tool's block stays structured so a mid-loop tool_use_id

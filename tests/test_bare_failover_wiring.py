@@ -62,7 +62,8 @@ def offline_app(monkeypatch):
 
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
-        router_mode="hybrid", failover_to_local=True, failover_threshold=1
+        router_mode="hybrid", failover_to_local=True, failover_threshold=1,
+        qwen_cognee=False,
     )
     try:
         yield app, recorder
@@ -138,7 +139,7 @@ async def test_bare_mode_can_be_disabled(offline_app, monkeypatch):
     app, recorder = offline_app
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="hybrid", failover_to_local=True, failover_threshold=1,
-        failover_bare=False,
+        failover_bare=False, qwen_cognee=False,
     )
     await _post(app, _harness_request())
     assert "official CLI" in json.dumps(recorder.payload)

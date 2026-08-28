@@ -84,6 +84,14 @@ def test_qwen_wrapper_pins_client_metadata_to_the_qwen_alias() -> None:
     assert "EXTRA_ARGS+=(--model qwen)" in wrapper
 
 
+def test_bd_claude_applies_the_same_client_budget_to_qwen_profiles() -> None:
+    wrapper = (ROOT / "bd").read_text()
+    assert "_qwen_client_context_tokens()" in wrapper
+    assert 'local-qwen38-obliterated|local-qwen38-action) echo 32000' in wrapper
+    assert 'CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-$provider_max_tokens}"' in wrapper
+    assert 'claude --model qwen "$@"' in wrapper
+
+
 def test_qwen_wrapper_stops_mlx_before_warming_the_ollama_27b() -> None:
     wrapper = (ROOT / "qwen").read_text()
     stop = wrapper.index("qwen38 stop")
