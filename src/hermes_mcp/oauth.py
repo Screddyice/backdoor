@@ -401,7 +401,7 @@ class SingleUserOAuthProvider(
         target = construct_redirect_uri(
             str(params.redirect_uri), code=code_value, state=params.state
         )
-        return RedirectResponse(target, status_code=302)
+        return RedirectResponse(target, status_code=303)
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str

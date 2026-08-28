@@ -157,7 +157,7 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
             data={"state": login_state, "password": PASSWORD},
             follow_redirects=False,
         )
-        assert still_approved.status_code == 302
+        assert still_approved.status_code == 303
 
         # Use a fresh server to keep the remainder of the OAuth flow independent
         # of the deliberate brute-force lockout above.
@@ -173,7 +173,9 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
             data={"state": login_state, "password": PASSWORD},
             follow_redirects=False,
         )
-        assert approved.status_code == 302
+        # 303 forces the browser to follow the successful form POST with GET.
+        # A 302 allowed Comet to replay POST /login after the state was consumed.
+        assert approved.status_code == 303
         redirect = urlparse(approved.headers["location"])
         query = parse_qs(redirect.query)
         assert f"{redirect.scheme}://{redirect.netloc}{redirect.path}" == REDIRECT_URI
@@ -294,7 +296,7 @@ def test_login_throttle_is_global_but_never_blocks_the_correct_password(
             data={"state": owner_state, "password": PASSWORD},
             follow_redirects=False,
         )
-        assert approved.status_code == 302
+        assert approved.status_code == 303
 
 
 def test_registration_rejects_unapproved_redirect_and_is_bounded(monkeypatch, tmp_path):
@@ -373,7 +375,7 @@ def test_one_client_has_one_pending_state_and_one_failure_budget(monkeypatch, tm
             data={"state": rotated_state, "password": PASSWORD},
             follow_redirects=False,
         )
-        assert approved.status_code == 302
+        assert approved.status_code == 303
 
 
 def test_authorization_enforces_resource_and_pkce_code_is_single_use(

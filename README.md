@@ -1089,7 +1089,8 @@ static bearer-token path for clients that can set an `Authorization` header. Set
 client registration, authorization-code flow with PKCE, one-owner password consent, one-hour
 access tokens, and rotating 30-day refresh tokens. Registered clients and tokens survive service
 restarts in a mode-600 state file. The login password and deployment identifiers remain outside
-the repository.
+the repository. Successful password submissions use an HTTP 303 redirect so embedded browsers
+follow the Claude callback with GET instead of replaying the login form POST.
 
 **Environment.** Set at deploy time, never committed:
 
