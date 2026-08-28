@@ -105,17 +105,43 @@ async def close_codex_clients() -> None:
     _ollama_client = None
 
 
-async def _send_cloud(request: Request, body: bytes, settings: Settings) -> httpx.Response:
+async def _send_cloud(
+    request: Request,
+    body: bytes,
+    settings: Settings,
+    path: str = "responses",
+) -> httpx.Response:
     headers = {key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS}
     headers.setdefault("accept-encoding", "identity")
     upstream = _get_chatgpt_client(settings)
     upstream_request = upstream.build_request(
         request.method,
-        "responses",
+        path,
         content=body,
         headers=headers,
     )
     return await upstream.send(upstream_request, stream=True)
+
+
+@codex_router.get("/models")
+async def codex_models(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+):
+    """Relay the provider probe used by Codex CLI and Desktop diagnostics."""
+    try:
+        response = await _send_cloud(request, b"", settings, path="models")
+        body = await response.aread()
+        headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in _DECODED_SKIP_RESPONSE_HEADERS
+        }
+        status = response.status_code
+        await response.aclose()
+        return Response(content=body, status_code=status, headers=headers)
+    except httpx.TransportError as exc:
+        raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
 
 
 async def _send_local(payload: dict, settings: Settings) -> httpx.Response:

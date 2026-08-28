@@ -38,6 +38,38 @@ class FailingStream(httpx.AsyncByteStream):
         return None
 
 
+@pytest.mark.asyncio
+async def test_codex_models_probe_is_relayed_for_cli_and_desktop_doctor(
+    codex_app, monkeypatch
+):
+    app, settings, _ = codex_app
+    seen = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(401, json={"error": "auth required"})
+
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(upstream),
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.get(
+            "/backend-api/codex/models",
+            headers={"authorization": "Bearer auth-marker"},
+        )
+
+    assert response.status_code == 401
+    assert seen[0].url == httpx.URL("https://chatgpt.test/backend-api/codex/models")
+    assert seen[0].headers["authorization"] == "Bearer auth-marker"
+
+
 @pytest.fixture
 async def codex_app(monkeypatch, tmp_path):
     settings = Settings(
