@@ -20,6 +20,7 @@ from .codex_context import (
     enforce_cloud_budget,
     extract_recall_query,
 )
+from .external_context import prepare_codex_external_context
 from .cognee_recall import recall_context
 from .config import Settings, get_settings
 from .failover import FailoverBreaker
@@ -276,14 +277,15 @@ async def codex_responses(
     body = await request.body()
     try:
         payload = decode_codex_body(body, request.headers.get("content-encoding", ""))
+        prepared_payload = await prepare_codex_external_context(payload, settings)
         max_input = settings.codex_context_window - settings.codex_reply_reserve_tokens
-        estimated = enforce_cloud_budget(payload, max_input)
+        estimated = enforce_cloud_budget(prepared_payload, max_input)
     except CodexRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     breaker = get_codex_breaker(settings)
     if not breaker.allow_upstream():
-        return await _serve_local(payload, settings, breaker, correlation_id, started)
+        return await _serve_local(prepared_payload, settings, breaker, correlation_id, started)
 
     try:
         response = await _send_cloud(request, body, settings)
@@ -294,7 +296,7 @@ async def codex_responses(
             type(exc).__name__,
         )
         if breaker.record_failure(type(exc).__name__):
-            return await _serve_local(payload, settings, breaker, correlation_id, started)
+            return await _serve_local(prepared_payload, settings, breaker, correlation_id, started)
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
 
     if response.status_code in _failover_statuses(settings):
@@ -306,7 +308,7 @@ async def codex_responses(
         }
         await response.aclose()
         if breaker.record_failure(f"HTTP {response.status_code}"):
-            return await _serve_local(payload, settings, breaker, correlation_id, started)
+            return await _serve_local(prepared_payload, settings, breaker, correlation_id, started)
         return Response(content=decoded, status_code=response.status_code, headers=headers)
 
     was_open = breaker.open

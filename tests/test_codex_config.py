@@ -1,8 +1,17 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from src.proxy.codex_routes import _failover_statuses
 from src.proxy.config import Settings
+
+
+def test_readme_pins_codex_compaction_to_qwens_real_input_budget():
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    assert 'model_context_window = 32000' in readme
+    assert 'model_auto_compact_token_limit = 27904' in readme
+    assert 'model_auto_compact_token_limit_scope = "total"' in readme
 
 
 def test_codex_runtime_settings_accept_operator_environment(monkeypatch):

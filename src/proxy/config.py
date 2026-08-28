@@ -165,6 +165,17 @@ class Settings(BaseSettings):
             raise ValueError("Codex context component budgets exceed the context window")
         return self
 
+    # Large pages and attachments fetched by any client are reduced before a
+    # local Qwen sees them, then stored in and recalled from Cognee. Local
+    # ranking always runs; QWEN_COGNEE=0 disables only network memory for true
+    # offline use. Every Cognee call is bounded and fail-open.
+    qwen_cognee: bool = True
+    external_context_threshold_chars: int = 12000
+    external_context_char_budget: int = 6000
+    external_context_max_document_chars: int = 500000
+    external_context_top_k: int = 6
+    external_context_timeout_seconds: float = 1.5
+
     # Bare mode for an EXPLICIT `/model <name>` route, not just failover.
     # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
     # deliberate `/model qwen` handed the full unstripped harness to whatever
