@@ -9,6 +9,7 @@ from .config import get_settings
 from .client import ProviderClient
 from .logging_config import configure_logging as _configure_logging
 from .routes import router, set_provider_client
+from .codex_routes import codex_router, close_codex_clients
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,15 @@ async def lifespan(app: FastAPI):
         await tg_app.shutdown()
 
     await client.aclose()
+    await close_codex_clients()
     logger.info("Proxy shut down")
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="backdoor", version="1.0.0", lifespan=lifespan)
+    # Mount before the Anthropic catch-all route so Codex Responses never fall
+    # through to api.anthropic.com.
+    app.include_router(codex_router)
     app.include_router(router)
     return app
 

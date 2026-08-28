@@ -144,6 +144,13 @@ class Settings(BaseSettings):
     codex_local_model: str = "qwen3.8:27b-obliterated"
     codex_local_responses_url: str = "http://127.0.0.1:11434/v1/responses"
     codex_local_tools: str = "local"
+    codex_failover_to_local: bool = True
+    codex_chatgpt_upstream: str = "https://chatgpt.com/backend-api/codex"
+    codex_failover_threshold: int = Field(default=3, ge=1)
+    codex_failover_window_seconds: float = Field(default=120.0, gt=0)
+    codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
+    codex_failover_statuses: str = "429,500,502,503,504,529"
+    codex_failover_require_offline: bool = False
 
     @model_validator(mode="after")
     def validate_codex_context_allocation(self):
