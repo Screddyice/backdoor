@@ -95,6 +95,7 @@ def _pin(monkeypatch, **overrides):
     base = dict(
         router_mode="hybrid",
         provider_base_url="http://localhost:11434/v1",
+        provider_model="qwen3.8:27b-obliterated",
         qwen_cognee=False,
     )
     monkeypatch.setattr(
