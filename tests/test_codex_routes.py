@@ -58,6 +58,8 @@ async def codex_app(monkeypatch, tmp_path):
     monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
     monkeypatch.setattr(codex_routes, "_chatgpt_client", None)
     monkeypatch.setattr(codex_routes, "_ollama_client", None)
+    monkeypatch.setattr(codex_routes, "_local_inflight", 0)
+    monkeypatch.setattr(codex_routes, "_deferred_claims", set())
     yield app, settings, breaker
     for client_name in ("_chatgpt_client", "_ollama_client"):
         client = getattr(codex_routes, client_name, None)
@@ -220,3 +222,316 @@ async def test_midstream_cloud_failure_arms_codex_breaker(codex_app, monkeypatch
             )
 
     assert breaker.reason == "ReadError"
+
+
+def one_shot_breaker(tmp_path, now_fn=lambda: 1_000.0):
+    return FailoverBreaker(
+        threshold=1,
+        probe_interval=60.0,
+        now_fn=now_fn,
+        notify_fn=lambda *_: None,
+        online_fn=lambda: True,
+        state_path=tmp_path / "one-shot-codex-state.json",
+        source="codex",
+        upstream_name="ChatGPT Codex",
+        require_offline=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
+    codex_app, monkeypatch, tmp_path
+):
+    app, settings, _ = codex_app
+    breaker = one_shot_breaker(tmp_path)
+    monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
+    cloud_calls = []
+    local_calls = []
+
+    def cloud(request: httpx.Request) -> httpx.Response:
+        cloud_calls.append(request)
+        return httpx.Response(503, json={"error": "temporarily unavailable"})
+
+    def local(request: httpx.Request) -> httpx.Response:
+        local_calls.append(request)
+        return httpx.Response(
+            200,
+            stream=BytesStream(SSE.replace(b"resp_local", b"resp_qwen")),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def recall(query, recall_settings):
+        assert query == "active task"
+        return ["Cognee continuity marker"]
+
+    monkeypatch.setattr(codex_routes, "recall_context", recall)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            content=FIXTURE.read_bytes(),
+            headers={"authorization": "Bearer cloud-only-marker"},
+        )
+
+    assert response.status_code == 200
+    assert b"resp_qwen" in response.content
+    assert len(cloud_calls) == 1
+    assert len(local_calls) == 1
+    local_payload = json.loads(local_calls[0].content)
+    rendered = json.dumps(local_payload)
+    assert local_payload["model"] == "qwen3.8:27b-obliterated"
+    assert "active task" in rendered
+    assert "Cognee continuity marker" in rendered
+    assert "bounded result" in rendered
+    assert "older task" not in rendered
+    assert "prompt_cache_key" not in rendered
+    assert "reasoning" not in rendered
+    assert "authorization" not in local_calls[0].headers
+    assert "chatgpt-account-id" not in local_calls[0].headers
+    assert breaker.open is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 401, 403])
+async def test_auth_and_request_errors_never_activate_local_failover(
+    codex_app, monkeypatch, tmp_path, status
+):
+    app, settings, _ = codex_app
+    breaker = one_shot_breaker(tmp_path)
+    monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
+    local_calls = 0
+
+    def cloud(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status,
+            stream=BytesStream(b'{"error":"visible"}'),
+            headers={"content-type": "application/json"},
+        )
+
+    def local(request: httpx.Request) -> httpx.Response:
+        nonlocal local_calls
+        local_calls += 1
+        return httpx.Response(200, stream=BytesStream(SSE))
+
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+
+    assert response.status_code == status
+    assert response.json() == {"error": "visible"}
+    assert local_calls == 0
+    assert breaker.open is False
+
+
+@pytest.mark.asyncio
+async def test_empty_cognee_recall_still_serves_current_task_from_qwen(
+    codex_app, monkeypatch, tmp_path
+):
+    app, settings, _ = codex_app
+    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
+
+    def cloud(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "offline"})
+
+    local_payloads = []
+
+    def local(request: httpx.Request) -> httpx.Response:
+        local_payloads.append(json.loads(request.content))
+        return httpx.Response(200, stream=BytesStream(SSE))
+
+    async def no_recall(query, recall_settings):
+        return []
+
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+
+    assert response.status_code == 200
+    assert "active task" in json.dumps(local_payloads[0])
+    assert "Relevant context recalled from local Cognee" not in json.dumps(local_payloads[0])
+
+
+@pytest.mark.asyncio
+async def test_half_open_success_returns_same_thread_to_cloud(
+    codex_app, monkeypatch, tmp_path
+):
+    app, settings, _ = codex_app
+    now = {"value": 1_000.0}
+    breaker = one_shot_breaker(tmp_path, now_fn=lambda: now["value"])
+    monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
+    cloud_attempts = 0
+
+    def cloud(request: httpx.Request) -> httpx.Response:
+        nonlocal cloud_attempts
+        cloud_attempts += 1
+        if cloud_attempts == 1:
+            return httpx.Response(503, json={"error": "offline"})
+        return httpx.Response(
+            200,
+            stream=BytesStream(SSE.replace(b"resp_local", b"resp_cloud")),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    def local(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=BytesStream(SSE.replace(b"resp_local", b"resp_qwen")),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def no_recall(query, recall_settings):
+        return []
+
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    async def unload(*args):
+        return True
+
+    monkeypatch.setattr(codex_routes.ollama_admin, "unload", unload)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        local_response = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+        now["value"] += 61
+        cloud_response = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+
+    assert b"resp_qwen" in local_response.content
+    assert b"resp_cloud" in cloud_response.content
+    assert breaker.open is False
+    assert cloud_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_ollama_rejection_returns_clean_502(codex_app, monkeypatch, tmp_path):
+    app, settings, _ = codex_app
+    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
+
+    def cloud(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "offline"})
+
+    def local(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            stream=BytesStream(b'{"error":"unsupported field"}'),
+            headers={"content-type": "application/json"},
+        )
+
+    async def no_recall(query, recall_settings):
+        return []
+
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Local Qwen rejected the request"}
+
+
+@pytest.mark.asyncio
+async def test_recovery_defers_qwen_unload_until_local_stream_finishes(
+    monkeypatch, tmp_path
+):
+    breaker = one_shot_breaker(tmp_path)
+    assert breaker.record_failure("HTTP 503") is True
+    breaker.note_claim("http://127.0.0.1:11434/v1", "qwen3.8:27b-obliterated")
+    response = httpx.Response(200, stream=BytesStream(SSE))
+    stream = codex_routes._local_body(response, breaker)
+    first_chunk = await anext(stream)
+    assert first_chunk == SSE
+
+    unloaded = []
+
+    async def unload(base_url, model):
+        unloaded.append((base_url, model))
+        return True
+
+    monkeypatch.setattr(codex_routes.ollama_admin, "unload", unload)
+    breaker.record_success()
+    await codex_routes._release_claims(breaker, Settings())
+    assert unloaded == []
+
+    await stream.aclose()
+    assert unloaded == [
+        ("http://127.0.0.1:11434/v1", "qwen3.8:27b-obliterated")
+    ]
