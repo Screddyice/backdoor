@@ -314,7 +314,7 @@ async def test_profile_mode_runs_the_runtime_interlock_before_provider_call(monk
         provider_base_url="http://127.0.0.1:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
         runtime_profile="local-qwen38-obliterated",
-        route_max_input_tokens=27_000,
+        route_max_input_tokens=28_000,
     )
     try:
         resp = await _post(app, _route_request(turns=1))
