@@ -1090,8 +1090,9 @@ client registration, authorization-code flow with PKCE, one-owner password conse
 access tokens, and rotating 30-day refresh tokens. Registered clients and tokens survive service
 restarts in a mode-600 state file. The login password and deployment identifiers remain outside
 the repository. Successful password submissions use an HTTP 303 redirect to a same-origin
-`/login/complete` GET before returning to Claude. This post/redirect/get hop keeps embedded
-browsers from replaying the password form after the bridge consumes its one-time login state.
+`/login/complete` GET. That GET loads a no-store approval page with a **Continue to Claude**
+link. Loading a real page before the external callback keeps Chrome and Comet from treating the
+callback as part of the password POST redirect chain and replaying the consumed login state.
 
 **Environment.** Set at deploy time, never committed:
 
