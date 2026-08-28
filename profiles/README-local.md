@@ -1,40 +1,33 @@
 # Local / offline LLM setup (Mac)
 
-Run Claude Code — with your full claude-harness — against a **local, open-source
-model**, completely offline. No internet needed once the models are downloaded.
+Run Claude Code against a local open-source model. Once the models are
+downloaded, inference does not need internet access.
 
 ```
 Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
-   (UI +              (translates              (serves the         (Qwen3.5 9B,
-    harness)           Anthropic<->OpenAI)      open weights)        on-device)
+   (lean UI)           (translates              (serves the         (Qwen3.8 27B
+                       Anthropic<->OpenAI)      open weights)        or Qwen3.5 4B)
 ```
 
-Everything runs on this Mac. The harness loads normally because it's a global
-Claude Code plugin — the only thing that changes is the model underneath.
+Everything runs through this Mac. Every wrapper mode uses `--bare`; harness
+commands remain available on demand without loading the full startup prompt.
 
 ## One command
 
 ```bash
-qwen            # FULL harness (default). Qwen3.5 9B @ 64K ctx, MCP OFF, with
-                # claude-harness + claude-mem + ralph-loop hooks ACTIVE.
-                # (Fixed 2026-06-15: was 9b-256k, which loaded ~22GB and pinned
-                # the Mac. 64K + MCP-off loads ~12GB and stays responsive.)
-qwen lean       # Minimal (~945-tok) prompt on the 9B. Fastest; harness
-                # slash-commands on demand, no auto hooks.
-qwen fast       # Lean mode on the same Qwen3.5 4B @ 64K (snappiest local brain).
+qwen            # Lean Qwen3.8 27B OBLITERATED at 32K with Cognee memory.
+qwen lean       # Explicit spelling of the same lean 27B route.
+qwen full       # Lean Qwen3.5 4B compatibility route, also capped at 32K.
+qwen fast       # Lean mode on the same Qwen3.5 4B at 32K.
                 # (qwen coder / qwen2.5-coder removed 2026-07-04.)
 ```
 
 (`claude-local` is a symlink alias for `qwen` if you prefer the longer name.)
 
-**Why Qwen3.5 9B @ 64K (MCP off):** Qwen3.5 is 256K-native (no rope penalty)
-with native tool-calling (no content-JSON fallback) — which makes the FULL
-harness viable. The full-harness prompt is ~30-50K tokens, so it needs real
-context but NOT the 256K we ran before: at 256K the 9B's KV cache was ~16GB, the
-model loaded ~22GB on the 36GB M5 Max, and it thrashed — every request crawled.
-The fix (2026-06-15) is the same 9B at **64K** (~12GB loaded, comfortable) with
-**MCP off** so the prompt stays inside the window. The 9B is the sweet spot on
-36GB: Qwen3.5 jumps 9b → 27b, and a dense 27b is too heavy here.
+**Why 32K everywhere:** the local routes trade a large prompt for predictable
+latency and memory use. The default 27B and the 4B compatibility route both use
+a 32,768-token Ollama runtime, a 32,000-token Claude Code limit, and a 27,000-
+token input ceiling. Cognee holds durable context through a two-tool shim.
 
 `qwen` makes sure the Ollama daemon is up, confirms the model is pulled,
 points backdoor at the offline profile, and launches Claude Code. Anything after
@@ -163,7 +156,7 @@ Install: `launchctl load -w ~/Library/LaunchAgents/com.screddy.router-gui-env.pl
 
 ```bash
 bd list                 # show backends (* = active)
-bd switch local-qwen35  # Qwen3.5 4B @ 64K (default)
+bd switch local-qwen35  # Qwen3.5 4B @ 32K
 bd switch local-fast    # same 4B, lean profile
 bd switch modal-qwen    # back to the Modal cloud backend (needs internet)
 bd claude               # launch Claude Code through the active backend
@@ -175,8 +168,8 @@ bd stop                 # stop the proxy
 
 | Profile         | Model               | Notes                                    |
 |-----------------|---------------------|------------------------------------------|
-| `local-qwen35`  | qwen3.5:4b-64k      | 3.4GB weights. Tools+thinking. **Default.** |
-| `local-fast`    | qwen3.5:4b-64k      | Same model; lean profile used by `qwen fast`. |
+| `local-qwen35`  | qwen3.5:4b-32k      | 3.4GB weights. Lean compatibility route. |
+| `local-fast`    | qwen3.5:4b-32k      | Same model; lean profile used by `qwen fast`. |
 | `local-qwen-9b` | qwen3.5:9b-64k      | Stronger brain for subagents (`qwen-9b` route); the `fusion` agent runs on it. ~10-12GB. |
 | `modal-qwen`    | (Modal cloud)       | Pre-existing cloud backend. Online only. |
 

@@ -587,7 +587,7 @@ Profiles whose window assumes bare mode now say so:
 ROUTE_BARE=true
 ```
 
-Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwen-9b` backs the `fusion-qwen` subagent, which needs its system prompt and its tools to do anything at all. Stripping every named route would break that quietly.
+Set it only on tiers intended for lean use. The `qwen-9b` route stays unstripped because it backs the `fusion-qwen` subagent, which needs its system prompt and tools.
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
@@ -595,7 +595,7 @@ Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwe
 | `qwen38-obliterated` | `local-qwen38-obliterated` | the same tier, named directly | 32K | yes |
 | `qwen38-action` | `local-qwen38-action` | action-tuned MLX rollback | 64K | yes |
 | `qwen-stock` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
-| `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
+| `qwen-fast` | `local-fast` | `qwen3.5:4b-32k` | 32K | yes |
 | `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
 
 Stripping reuses the `failover_*` keep-list and truncation budget, so both paths build the same request shape. A route that stripped differently from failover would be a second behaviour to keep in sync for no gain.
@@ -629,12 +629,11 @@ Claude Code does not recognise the model name `qwen`, so it falls back to assumi
 The wrapper now states the real window before launching:
 
 ```
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-heavy
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-qwen38-obliterated
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-qwen35, local-fast
 ```
 
-Keep the value equal to the profile's actual `num_ctx`. Setting it above the true window restores the original bug in a quieter form, because compaction again waits for a ceiling the model cannot reach. An unknown profile falls back to 32000, the floor, on the principle that compacting early costs a little quality and compacting late costs the session. An explicit `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in the environment still wins, for deliberate experiments.
+Keep the value equal to the profile's actual `num_ctx`. Setting it above the true window restores the original bug in a quieter form, because compaction again waits for a ceiling the model cannot reach. An unknown profile falls back to 32000, the floor. The wrapper overwrites an inherited `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so shell state cannot raise either lean mode above the hard cap.
 
 The two guards are complements, not alternatives. Compaction keeps ordinary sessions inside the tier; escalation catches the ones that jump anyway, such as a single oversized paste. The obliterated tier also caps generation at 4,096 tokens, so its 27K input ceiling leaves room for output and template overhead inside the 32,768-token runtime window.
 
@@ -642,13 +641,13 @@ The backend must also return usable summary text. On 2026-08-28 the action-tuned
 
 #### Memory is the other half of a small window
 
-A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
+A short window is only workable if durable context has somewhere else to live. `QWEN_COGNEE` therefore defaults to **1**, attaching the self-hosted Cognee service over the two-tool stdio shim.
 
 This is the one documented exception to the MCP-off rule, and the token arithmetic is why it survives that rule. The global MCP set costs about 142K tokens of schema. The shim exposes `cognee_search` and `cognee_remember` and nothing else, so it costs hundreds. Against a 32K window the first is impossible and the second is affordable.
 
 Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
 
-Degradation is quiet and safe. A missing `COGNEE_API_KEY` falls through to an empty MCP config, so a genuinely offline run still starts. `QWEN_COGNEE=0` forces it off for true-offline work with no network calls at all.
+The configured endpoint is local loopback, so memory lookup and inference stay local to the machine-side stack. A missing `COGNEE_API_KEY` falls through to an empty MCP config, and `QWEN_COGNEE=0` forces memory off.
 
 #### The guard has to sit below every routing branch
 
@@ -692,8 +691,8 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 | Command | Profile | Model | Why |
 |---|---|---|---|
 | `qwen`, `qwen lean` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | `--bare` keeps the prompt small and the OpenAI endpoint returns textual compaction output |
-| `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
-| `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the heavy tier costs more GPU than the task is worth |
+| `qwen full` | `local-qwen35` | `qwen3.5:4b-32k` | compatibility alias for the lighter 4B, still launched with `--bare` |
+| `qwen fast` | `local-fast` | `qwen3.5:4b-32k` | lean 4B escape hatch when the 27B costs more GPU than the task is worth |
 
 The wrapper prints the tier it resolved at launch. Read that line if you are unsure which model you got.
 
@@ -891,32 +890,11 @@ The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces fo
 
 ### Durable memory on local models
 
-Local sessions read Mem0 recall from the offline mirror at `~/.mem0-local/cache.db` and get it prepended to the system prompt as plain text. No MCP server, no tool call, no network.
+Every `qwen` wrapper mode launches with `--bare`, so hooks cannot deliver memory. The wrapper compensates with a strict MCP config containing only `cognee_search` and `cognee_remember`. Both tools talk to the configured self-hosted Cognee API through its loopback endpoint.
 
-This exists because of a gap that was invisible from either side. Memory normally arrives through the `UserPromptSubmit` hook, which is why `bare.py` puts Mem0's MCP tools on the dropped side of the keep-list — the hook already injected the text before the request was built. But the `qwen` wrapper's lean and fast modes pass `--bare`, and `--bare` disables CLAUDE.md discovery and **every hook**. So the default local tier, the 27B, was the only brain in the stack with no durable memory, while `/model qwen`, failover, and `qwen full` all had it.
+This keeps the startup prompt small and makes recall explicit. The model searches Cognee when earlier decisions or project facts matter, then stores durable non-secret facts instead of carrying them through every turn. The two-tool schema costs hundreds of tokens rather than the roughly 142K consumed by the global MCP set.
 
-| Path | Before | Now |
-|---|---|---|
-| `/model qwen` (router) | hook injects | unchanged |
-| Cloud→local failover | hook injects | unchanged |
-| `qwen full` | hook injects | unchanged |
-| `qwen`, `qwen lean` | **nothing** | proxy injects |
-| `qwen fast` | **nothing** | proxy injects |
-
-The proxy is the one place every local request passes through whichever door it came in by, so one code path covers all of them.
-
-Reading the local mirror rather than the Mem0 API is deliberate: the cloud endpoint is unreachable during exactly the outage failover exists to cover, since the breaker opens on one condition — this host being offline.
-
-```
-PROVIDER_BASE_URL=http://localhost:11434/v1   # injection only fires for local providers
-MEMORY_INJECT=false                           # turn it off
-MEMORY_TOP_K=6
-MEMORY_CHAR_BUDGET=1200
-```
-
-Cloud providers are excluded so a session whose hook already ran does not pay for the same text twice. Recall is read-only (`mode=ro`), fails open on a missing or locked cache, and times out in 1.5s so the Mem0 sync job's write lock cannot stall a turn. The budget is small on purpose: bare mode exists to hold the prompt near 945 tokens, and unbounded recall would rebuild the problem it solved.
-
-Memories are labelled as background that may be stale rather than as instructions, because they are. The mirror still describes the heavy tier as `qwen3.5:27b-bare` at 15 GB, two facts that are both now wrong, and a local model asked about the tier will say so rather than assert the stale version.
+`QWEN_COGNEE=0` disables the shim. If Cognee credentials are unavailable, the wrapper loads an empty MCP config and continues without memory.
 
 ### Building a bare tag
 

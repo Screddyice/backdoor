@@ -70,16 +70,13 @@ done
 # (QWEN_FULL/QWEN_LEAN) cannot leave a profile that contradicts it. `fast` is
 # the one explicit pin and wins outright.
 #
-# Default/lean is the GGUF 27B as of 2026-08-28. It is viable because lean mode
-# passes --bare: the prompt is ~945 tokens against a 32K window. Full mode's
-# ~29K harness prompt does NOT fit that window with room left to converse, so it
-# stays on the 4B @ 64K — the tier the 2026-07-09 prefill revert chose for
-# exactly this case. Do not "unify" these two onto the 27B without first giving
-# the 27B a bigger window, and read the KV sizing note in
-# modelfiles/bare/qwen3.8-27b-bare.Modelfile before you do.
+# Default/lean is the GGUF 27B as of 2026-08-28. `full` retains the lighter 4B
+# profile as an explicit compatibility alias, but both launch with --bare and a
+# hard 32K ceiling. Durable context belongs in Cognee, not in a ~29K startup
+# prompt that leaves no useful conversation space.
 if [ -z "$PROFILE" ]; then
   if [ "$MODE" = "full" ]; then
-    PROFILE="local-qwen35"           # qwen3.5:4b-64k  — harness needs the window
+    PROFILE="local-qwen35"             # qwen3.5:4b-32k, lean compatibility tier
   else
     PROFILE="local-qwen38-obliterated" # obliterated 27B GGUF on Ollama
   fi
@@ -91,9 +88,9 @@ fi
 # growing, every turn re-prefills a context the model cannot hold, and the
 # session crawls. Keep these equal to the profile's actual num_ctx (see
 # modelfiles/bare/*.Modelfile). A value LARGER than the real window re-creates
-# the bug, so do not round up. Explicit env wins, for one-off experiments.
+# the bug, so the wrapper intentionally overrides any inherited value.
 case "$PROFILE" in
-  # The GGUF tier serves 32K. The two 64K rollback tiers are held at 32K so
+# The GGUF tier serves 32K. The wider rollback tiers are held at 32K so
   # compaction fires near their 28K escalation bound.
   # Smaller than the real window is the safe direction (the warning above is
   # about rounding UP), and it keeps auto-compact firing just past the 28000
@@ -103,10 +100,10 @@ case "$PROFILE" in
   local-qwen38-obliterated) QWEN_CTX=32000 ;; # GGUF 27B @ 32K
   local-qwen38-action) QWEN_CTX=32000 ;;    # MLX 27B @ 64K, held at 32K
   local-failover-heavy) QWEN_CTX=32000 ;;   # qwen3.5:9b-64k @ 64K, held at 32K
-  local-qwen35|local-fast) QWEN_CTX=64000 ;; # qwen3.5:4b-64k  @ 64K
+  local-qwen35|local-fast) QWEN_CTX=32000 ;; # qwen3.5:4b-32k @ 32K
   *) QWEN_CTX=32000 ;;                       # unknown profile: assume the floor
 esac
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-$QWEN_CTX}"
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$QWEN_CTX"
 
 # 1. Make sure the Ollama daemon is up (LaunchAgent normally keeps it alive).
 if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
@@ -166,11 +163,12 @@ MCP_ARGS=()
 # Defaulting it on is the point, not a convenience. Without memory the local
 # model has to carry every durable fact in-context, which is exactly what blows
 # a 32K window and makes the session crawl; with it, facts live in the graph and
-# the window stays short. Cognee Cloud exposes no hosted MCP endpoint (/mcp
-# 404s) and the full cognee-mcp schema will not fit 64K, hence the stdio shim.
+# the window stays short. The local Cognee API is reached through the configured
+# loopback endpoint; the full cognee-mcp schema will not fit 32K, hence the
+# two-tool stdio shim.
 #
-# Needs COGNEE_API_KEY + network. Both degrade safely: no key falls through to
-# an empty MCP config below, so a genuinely offline run still works. Set
+# Needs COGNEE_API_KEY and a reachable loopback service. Both degrade safely:
+# no key falls through to an empty MCP config below. Set
 # QWEN_COGNEE=0 to force it off (true-offline, zero network calls).
 COGNEE_DEFAULT=1
 if [ "${QWEN_COGNEE:-${QWEN_MEM0:-$COGNEE_DEFAULT}}" = "1" ] && [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
@@ -215,7 +213,7 @@ PY2
     )
     chmod 600 "$COGNEE_MCP_CONF"
     MCP_ARGS=(--strict-mcp-config --mcp-config "$COGNEE_MCP_CONF")
-    echo "qwen: Cognee memory MCP enabled (cloud memory, local inference)" >&2
+    echo "qwen: Cognee memory MCP enabled (local memory, local inference)" >&2
   else
     echo "qwen: QWEN_COGNEE=1 but COGNEE_API_KEY unset — MCP empty" >&2
     MCP_ARGS=(--strict-mcp-config --mcp-config "$HOME/backdoor/empty-mcp.json")
@@ -281,37 +279,34 @@ PY3
   fi
 fi
 
-# 4. Mode-specific launch args.
+# 4. All local launch modes stay lean. A 32K runtime cannot carry a ~29K
+# startup harness and still leave useful room for the conversation. The plugin
+# directory keeps harness commands available on demand without auto-injection.
+EXTRA_ARGS=(--bare)
+HARNESS_DIR="$(ls -dt "$HOME"/.claude/plugins/cache/claude-harness/claude-harness/*/ 2>/dev/null | head -1)"
+[ -n "$HARNESS_DIR" ] && EXTRA_ARGS+=(--plugin-dir "$HARNESS_DIR")
+
+# --bare also skips CLAUDE.md auto-discovery and EVERY hook. `claude --help`
+# says so outright, and a SessionStart probe confirmed it on 2026-08-15: the
+# hook fired without --bare and did not fire with it, and --settings cannot
+# put it back.
+#
+# That quietly removed both halves of PR creation from local-model sessions.
+# The model never saw the every-branch-gets-a-PR rule (it lives in CLAUDE.md),
+# and auto-pr-push.sh never fired to do it on the model's behalf. The branch
+# got commits, nothing opened a PR, and nothing said why.
+#
+# Re-inject the git/PR rules only. Loading the real CLAUDE.md set via
+# --add-dir would work but costs ~33KB, a quarter of the 27B's 32K window,
+# for context that is mostly irrelevant to a local coding turn. `--append-
+# system-prompt` takes the text inline; there is no `-file` form despite what
+# the --bare help text implies.
+PR_RULES="$HOME/backdoor/prompts/qwen-pr-rules.md"
+[ -f "$PR_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$(cat "$PR_RULES")")
+
 if [ "$MODE" = "full" ]; then
-  # AUTO-HOOK mode: enable harness + claude-mem + ralph-loop (and their hooks),
-  # disable the other heavy plugins so the prompt (~29K) stays manageable.
-  EXTRA_ARGS=(--settings "$HOME/backdoor/hook-mode.settings.json")
-  MODE_NOTE="full-hooks(harness)"
+  MODE_NOTE="full-lean(4b)"
 else
-  # LEAN mode: --bare skips the heavy plugin/hook auto-injection (~30K tokens);
-  # --plugin-dir re-adds claude-harness so its commands stay available on demand.
-  EXTRA_ARGS=(--bare)
-  HARNESS_DIR="$(ls -dt "$HOME"/.claude/plugins/cache/claude-harness/claude-harness/*/ 2>/dev/null | head -1)"
-  [ -n "$HARNESS_DIR" ] && EXTRA_ARGS+=(--plugin-dir "$HARNESS_DIR")
-
-  # --bare also skips CLAUDE.md auto-discovery and EVERY hook. `claude --help`
-  # says so outright, and a SessionStart probe confirmed it on 2026-08-15: the
-  # hook fired without --bare and did not fire with it, and --settings cannot
-  # put it back.
-  #
-  # That quietly removed both halves of PR creation from local-model sessions.
-  # The model never saw the every-branch-gets-a-PR rule (it lives in CLAUDE.md),
-  # and auto-pr-push.sh never fired to do it on the model's behalf. The branch
-  # got commits, nothing opened a PR, and nothing said why.
-  #
-  # Re-inject the git/PR rules only. Loading the real CLAUDE.md set via
-  # --add-dir would work but costs ~33KB — a quarter of the 27B's 32K window,
-  # for context that is mostly irrelevant to a local coding turn. `--append-
-  # system-prompt` takes the text inline; there is no `-file` form despite what
-  # the --bare help text implies.
-  PR_RULES="$HOME/backdoor/prompts/qwen-pr-rules.md"
-  [ -f "$PR_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$(cat "$PR_RULES")")
-
   MODE_NOTE="lean"
 fi
 
