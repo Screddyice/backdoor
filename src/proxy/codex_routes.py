@@ -17,7 +17,7 @@ from .codex_context import (
     CodexRequestError,
     build_local_payload,
     decode_codex_body,
-    enforce_cloud_budget,
+    estimate_codex_tokens,
     extract_recall_query,
 )
 from .external_context import prepare_codex_external_context
@@ -304,8 +304,7 @@ async def codex_responses(
     try:
         payload = decode_codex_body(body, request.headers.get("content-encoding", ""))
         prepared_payload = await prepare_codex_external_context(payload, settings)
-        max_input = settings.codex_context_window - settings.codex_reply_reserve_tokens
-        estimated = enforce_cloud_budget(prepared_payload, max_input)
+        estimated = estimate_codex_tokens(prepared_payload)
     except CodexRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 

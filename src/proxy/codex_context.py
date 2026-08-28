@@ -61,16 +61,6 @@ def estimate_codex_tokens(payload: dict[str, Any]) -> int:
     return count_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
-def enforce_cloud_budget(payload: dict[str, Any], max_input_tokens: int) -> int:
-    estimated = estimate_codex_tokens(payload)
-    if estimated > max_input_tokens:
-        raise CodexRequestError(
-            f"Codex request exceeds the {max_input_tokens}-token input limit",
-            status_code=413,
-        )
-    return estimated
-
-
 def _content_text(item: dict[str, Any]) -> str:
     content = item.get("content", "")
     if isinstance(content, str):

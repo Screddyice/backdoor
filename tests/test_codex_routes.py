@@ -154,18 +154,22 @@ async def test_online_codex_request_relays_original_body_headers_and_sse(
 
 
 @pytest.mark.asyncio
-async def test_codex_route_rejects_over_budget_before_contacting_cloud(
+async def test_codex_route_relays_request_above_local_budget_to_cloud(
     codex_app, monkeypatch
 ):
     app, settings, _ = codex_app
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    payload["input"][4]["content"][0]["text"] = "oversized " * 100_000
-    calls = 0
+    payload["input"][4]["content"][0]["text"] = "token " * 28_000
+    body = json.dumps(payload).encode()
+    seen = []
 
     def upstream(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(200, content=SSE)
+        seen.append(request)
+        return httpx.Response(
+            200,
+            stream=BytesStream(SSE),
+            headers={"content-type": "text/event-stream"},
+        )
 
     monkeypatch.setattr(
         codex_routes,
@@ -180,12 +184,14 @@ async def test_codex_route_rejects_over_budget_before_contacting_cloud(
     ) as client:
         response = await client.post(
             "/backend-api/codex/responses",
-            json=payload,
+            content=body,
             headers={"authorization": "Bearer auth-marker"},
         )
 
-    assert response.status_code == 413
-    assert calls == 0
+    assert response.status_code == 200
+    assert response.content == SSE
+    assert len(seen) == 1
+    assert seen[0].content == body
 
 
 @pytest.mark.asyncio

@@ -366,9 +366,6 @@ Add this to `~/.codex/config.toml` while keeping your existing ChatGPT login:
 
 ```toml
 model_provider = "backdoor"
-model_context_window = 32000
-model_auto_compact_token_limit = 27904
-model_auto_compact_token_limit_scope = "total"
 
 [model_providers.backdoor]
 name = "Backdoor"
@@ -381,11 +378,11 @@ supports_standalone_web_search = false
 
 Restart Codex Desktop after changing the shared configuration. Dock-launched processes do not reload terminal configuration or a modified TOML file mid-session.
 
-The 27,904-token compact limit leaves the same 4,096-token reply reserve used by Qwen and Backdoor. `total` makes Codex count the full request, including tool output, so the CLI and Desktop app reach the same boundary.
+Leave `model_context_window` and `model_auto_compact_token_limit` unset. Codex uses the selected cloud model's catalog limits. Backdoor applies Qwen's smaller window after it chooses local failover and rebuilds the request.
 
 ### What happens to a running thread
 
-While ChatGPT inference works, Backdoor validates the 32K limit and relays the original request, OAuth headers, response status, and SSE bytes. Account, plugin, and other hosted traffic still goes directly to ChatGPT because only the inference provider points at Backdoor.
+While ChatGPT inference works, Backdoor relays the original request, OAuth headers, response status, and SSE bytes. Backdoor sends cloud traffic without Qwen's 32K check. ChatGPT enforces the selected cloud model's input limit. Codex sends account, plugin, and other hosted traffic to ChatGPT because Backdoor replaces the inference provider alone.
 
 After three eligible failures inside 120 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
 
@@ -401,9 +398,9 @@ Cognee authentication resolves from the running process, `~/.cognee/.env`, then 
 
 The breaker permits one ChatGPT probe every 60 seconds while open. The first successful probe closes it, returns later turns to cloud, and releases Qwen after any local streams finish.
 
-### The 32K allocation
+### The local 32K allocation
 
-Both Codex and Backdoor enforce the same window:
+Backdoor enforces this allocation on the fresh request that it sends to Qwen:
 
 | Component | Limit |
 | --- | ---: |
@@ -713,7 +710,7 @@ Every launcher needs its own client policy because Claude Code and Codex calcula
 | `bd claude` on a Qwen profile | derives the profile window, reads `PROVIDER_MAX_TOKENS`, and pins `--model qwen` |
 | `claude --model qwen` | the shell launcher applies the 4,096 output cap for an explicit Qwen start |
 | `/model qwen` inside a routed Claude session | unknown-model enforcement stays disabled for that process; Backdoor strips the request and escalates past 27K instead of letting Claude Code compact against a false 12K window |
-| Codex through Backdoor | advertises 32K, compacts at 27,904 total tokens, and keeps a 4K local reply reserve; this path ships in the Codex failover change |
+| Codex through Backdoor | keeps the selected cloud model's catalog window; Backdoor rebuilds local failover requests within Qwen's 28K input budget |
 
 The mid-session Claude path cannot change its process environment after `/model` runs. Its router guard supplies the hard boundary. Known Claude model IDs keep their native compaction policy, and cloud output remains uncapped.
 
