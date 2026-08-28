@@ -123,6 +123,15 @@ class Settings(BaseSettings):
     memory_top_k: int = 6
     memory_char_budget: int = 1200
 
+    # Authoritative local Cognee recall for fresh Codex failover turns. The API
+    # key is optional on a single-user server and must arrive through the process
+    # environment, never a committed profile.
+    cognee_base_url: str = "http://127.0.0.1:8001"
+    cognee_api_key: str = ""
+    codex_cognee_timeout_seconds: float = Field(default=2.0, gt=0)
+    codex_cognee_top_k: int = Field(default=8, ge=1)
+    codex_cognee_char_budget: int = Field(default=8_000, ge=1)
+
     # Bare mode for an EXPLICIT `/model <name>` route, not just failover.
     # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
     # deliberate `/model qwen` handed the full unstripped harness to whatever
