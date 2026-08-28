@@ -358,6 +358,65 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 ---
 
+## Codex cloud-to-local failover
+
+Codex uses a different protocol from Claude Code. Its ChatGPT-backed sessions post to the Responses API, so the Anthropic `/v1/messages` router cannot catch a failed Codex turn. Backdoor exposes a separate Responses relay at `http://127.0.0.1:8083/backend-api/codex`.
+
+Add this to `~/.codex/config.toml` while keeping your existing ChatGPT login:
+
+```toml
+model_provider = "backdoor"
+model_context_window = 32000
+
+[model_providers.backdoor]
+name = "Backdoor"
+base_url = "http://127.0.0.1:8083/backend-api/codex"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+supports_standalone_web_search = false
+```
+
+Restart Codex Desktop after changing the shared configuration. Dock-launched processes do not reload terminal configuration or a modified TOML file mid-session.
+
+### What happens to a running thread
+
+While ChatGPT inference works, Backdoor validates the 32K limit and relays the original request, OAuth headers, response status, and SSE bytes. Account, plugin, and other hosted traffic still goes directly to ChatGPT because only the inference provider points at Backdoor.
+
+After three eligible failures inside 120 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+
+The visible Codex thread does not change. Qwen receives a fresh internal request containing:
+
+- the latest user instruction and the active local tool loop;
+- a bounded recall from local Cognee;
+- local Code Mode tools converted from Codex's Responses Lite namespace format.
+
+It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, or hosted web-search tools. Cognee provides continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads Cognee through `POST /api/v1/recall`; existing Codex hooks remain responsible for durable writes.
+
+Cognee authentication resolves from the running process, `~/.cognee/.env`, then the existing `~/.cognee-plugin/api_key.json` cache when its server URL matches. The key is not copied into the Backdoor LaunchAgent.
+
+The breaker permits one ChatGPT probe every 60 seconds while open. The first successful probe closes it, returns later turns to cloud, and releases Qwen after any local streams finish.
+
+### The 32K allocation
+
+Both Codex and Backdoor enforce the same window:
+
+| Component | Limit |
+| --- | ---: |
+| Local guidance | 1,000 tokens |
+| Cognee recall | 2,000 tokens |
+| Local tool schemas | 4,000 tokens |
+| Current task and active tool results | 21,000 tokens |
+| Reply reserve | 4,000 tokens |
+
+Backdoor removes extra recall, optional tools, old tool output, and attachments in that order. It never truncates the latest textual instruction. If that instruction cannot fit, Codex receives HTTP 413 with a clear error.
+
+Set `CODEX_LOCAL_TOOLS=` to remove all local tools. The default `local` keeps non-MCP Code Mode tools. Remote `mcp__*` namespaces stay out of the outage request because they cannot work without the network.
+
+Set `CODEX_FAILOVER_TO_LOCAL=false` to disable Qwen fallback without removing the custom provider. Cloud inference still crosses the Responses relay and returns its real errors. Backdoor logs correlation IDs, route choice, status class, timing, token counts, recall counts, and tool counts. It never logs prompts, recalled text, OAuth values, tool arguments, or model output.
+
+---
+
 ## Offline failover (hybrid mode)
 
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.

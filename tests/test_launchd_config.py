@@ -25,6 +25,10 @@ def test_launchd_example_has_capacity_for_concurrent_claude_sessions() -> None:
     assert config["EnvironmentVariables"]["FORWARD_ROUTER_PORT"] == port
     assert config["EnvironmentVariables"]["FORWARD_IDLE_TIMEOUT"] == "660"
     assert config["EnvironmentVariables"]["FORWARD_MAX_CONNECTIONS"] == "512"
+    assert config["EnvironmentVariables"]["CODEX_FAILOVER_TO_LOCAL"] == "true"
+    assert config["EnvironmentVariables"]["CODEX_CONTEXT_WINDOW"] == "32000"
+    assert config["EnvironmentVariables"]["CODEX_LOCAL_MODEL"] == "qwen3.8:27b-obliterated"
+    assert config["EnvironmentVariables"]["COGNEE_BASE_URL"] == "http://127.0.0.1:8001"
     assert config["EnvironmentVariables"]["LOG_FILE"].startswith("/Users/you/")
     assert config["StandardOutPath"] == "/dev/null"
     assert config["StandardErrorPath"] == "/dev/null"

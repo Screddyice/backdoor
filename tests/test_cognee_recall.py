@@ -1,11 +1,12 @@
 import json
 import logging
+from pathlib import Path
 
 import httpx
 import pytest
 
 from src.proxy.config import Settings
-from src.proxy.cognee_recall import recall_context
+from src.proxy.cognee_recall import recall_context, resolve_cognee_api_key
 
 
 @pytest.mark.asyncio
@@ -49,12 +50,15 @@ async def test_recall_posts_authoritative_graph_query_and_normalizes_results():
 
 
 @pytest.mark.asyncio
-async def test_recall_omits_empty_api_key_and_treats_empty_list_as_success(caplog):
+async def test_recall_omits_empty_api_key_and_treats_empty_list_as_success(
+    caplog, monkeypatch
+):
     def handler(request: httpx.Request) -> httpx.Response:
         assert "x-api-key" not in request.headers
         return httpx.Response(200, json=[])
 
     settings = Settings(cognee_base_url="http://cognee.test", cognee_api_key="")
+    monkeypatch.setattr("src.proxy.cognee_recall.resolve_cognee_api_key", lambda _: "")
     with caplog.at_level(logging.WARNING):
         result = await recall_context(
             "no matching context",
@@ -117,3 +121,45 @@ async def test_recall_stops_before_exceeding_character_budget():
     )
 
     assert result == ["12345", "x"]
+
+
+def test_api_key_resolution_uses_existing_cognee_files_without_copying(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text('COGNEE_API_KEY="env-file-key"\n', encoding="utf-8")
+    cache_path = tmp_path / "api_key.json"
+    cache_path.write_text(
+        json.dumps({"api_key": "cached-key", "base_url": "http://127.0.0.1:8001"}),
+        encoding="utf-8",
+    )
+
+    assert resolve_cognee_api_key(
+        Settings(cognee_api_key="explicit-key"),
+        env_path=env_path,
+        cache_path=cache_path,
+    ) == "explicit-key"
+    assert resolve_cognee_api_key(
+        Settings(cognee_api_key=""),
+        env_path=env_path,
+        cache_path=cache_path,
+    ) == "env-file-key"
+
+    env_path.write_text("", encoding="utf-8")
+    assert resolve_cognee_api_key(
+        Settings(cognee_api_key=""),
+        env_path=env_path,
+        cache_path=cache_path,
+    ) == "cached-key"
+
+
+def test_cached_cognee_key_is_ignored_for_a_different_server(tmp_path):
+    cache_path = tmp_path / "api_key.json"
+    cache_path.write_text(
+        json.dumps({"api_key": "wrong-server-key", "base_url": "http://other.test"}),
+        encoding="utf-8",
+    )
+
+    assert resolve_cognee_api_key(
+        Settings(cognee_base_url="http://127.0.0.1:8001", cognee_api_key=""),
+        env_path=tmp_path / "missing.env",
+        cache_path=cache_path,
+    ) == ""
