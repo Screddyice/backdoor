@@ -439,6 +439,61 @@ def test_state_file_publishes_open_then_close():
     assert _state(br)["failover_active"] is False
 
 
+def test_independent_breakers_publish_aggregate_gpu_ownership(tmp_path):
+    """Closing Codex must not hide an active Anthropic GPU claim, or vice versa."""
+    clock = Clock()
+    state_path = tmp_path / "shared-state.json"
+    anthropic = FailoverBreaker(
+        threshold=1,
+        now_fn=clock,
+        notify_fn=lambda *_: None,
+        online_fn=lambda: False,
+        state_path=state_path,
+        source="anthropic",
+        upstream_name="Anthropic",
+    )
+    codex = FailoverBreaker(
+        threshold=1,
+        now_fn=clock,
+        notify_fn=lambda *_: None,
+        online_fn=lambda: False,
+        state_path=state_path,
+        source="codex",
+        upstream_name="ChatGPT Codex",
+    )
+
+    assert anthropic.record_failure("AnthropicConnectError") is True
+    assert codex.record_failure("CodexConnectError") is True
+    anthropic.record_success()
+
+    published = json.loads(state_path.read_text(encoding="utf-8"))
+    assert published["failover_active"] is True
+    assert published["active_sources"] == ["codex"]
+    assert published["reasons"] == {"codex": "CodexConnectError"}
+
+    codex.record_success()
+    published = json.loads(state_path.read_text(encoding="utf-8"))
+    assert published["failover_active"] is False
+    assert published["active_sources"] == []
+    assert published["reasons"] == {}
+
+
+def test_codex_breaker_can_open_for_service_failure_while_host_is_online(tmp_path):
+    """The Codex policy can cover usage limits without weakening Anthropic."""
+    br = FailoverBreaker(
+        threshold=1,
+        notify_fn=lambda *_: None,
+        online_fn=lambda: True,
+        state_path=tmp_path / "codex-state.json",
+        source="codex",
+        upstream_name="ChatGPT Codex",
+        require_offline=False,
+    )
+
+    assert br.record_failure("HTTP 429") is True
+    assert br.open is True
+
+
 def test_state_file_stays_inactive_when_online():
     """The file tracks GPU ownership, so a non-opening failure must not set it."""
     clock = Clock()

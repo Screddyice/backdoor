@@ -58,6 +58,11 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
+# One router process can carry independent upstream breakers while sharing one
+# local GPU. Publish their combined ownership so one recovery cannot hide a
+# different upstream that is still serving from a local model.
+_ACTIVE_BREAKERS: dict[Path, dict[str, str]] = {}
+
 
 def _statuses_from_env() -> set[int]:
     raw = os.environ.get("BACKDOOR_FAILOVER_STATUSES", "").strip()
@@ -213,6 +218,9 @@ class FailoverBreaker:
         notify_fn: Callable[[str, str], None] = _notify,
         online_fn: Callable[[], bool] = internet_reachable,
         state_path: Path | None = None,
+        source: str = "anthropic",
+        upstream_name: str = "Anthropic",
+        require_offline: bool = True,
     ):
         self.threshold = threshold
         self.window = window
@@ -221,6 +229,9 @@ class FailoverBreaker:
         self._notify = notify_fn
         self._online = online_fn
         self._state_path = STATE_PATH if state_path is None else state_path
+        self.source = source
+        self.upstream_name = upstream_name
+        self.require_offline = require_offline
         self.open = False
         self.reason = ""
         self._failures = 0
@@ -239,10 +250,18 @@ class FailoverBreaker:
         which is the same default a fresh router has.
         """
         try:
+            active = _ACTIVE_BREAKERS.setdefault(self._state_path, {})
+            if self.open:
+                active[self.source] = self.reason
+            else:
+                active.pop(self.source, None)
+            reasons = dict(sorted(active.items()))
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "failover_active": self.open,
-                "reason": self.reason,
+                "failover_active": bool(reasons),
+                "reason": next(iter(reasons.values()), ""),
+                "active_sources": list(reasons),
+                "reasons": reasons,
                 "updated_at": time.time(),
                 "pid": os.getpid(),
             }
@@ -275,22 +294,21 @@ class FailoverBreaker:
             self._failures += 1
         self.reason = reason
         if not self.open and self._failures >= self.threshold:
-            # Threshold reached, but that only establishes that ANTHROPIC is
-            # unreachable. Claiming the local GPU is justified only when nothing
-            # else is reachable either — otherwise we would hide a provider
-            # outage behind a 4B and evict the llm-jury council to do it.
-            if not self._online():
+            # Anthropic requires a genuine internet outage before it may claim
+            # the GPU. Other upstreams can opt into service-level failover for
+            # explicit transient statuses such as usage limits.
+            if not self.require_offline or not self._online():
                 self.open = True
                 self._last_probe_at = now
                 logger.warning(
                     "failover OPEN after %d consecutive failures (%s) and no "
-                    "internet — serving passthrough traffic from the local "
+                    "usable %s service — serving traffic from the local "
                     "failover profile",
-                    self._failures, reason,
+                    self._failures, reason, self.upstream_name,
                 )
                 self._notify(
-                    "Backdoor failover",
-                    f"Offline ({reason}) — routing to local model",
+                    f"Backdoor {self.source} failover",
+                    f"{self.upstream_name} unavailable ({reason}); routing to local model",
                 )
                 self._publish()
             else:
@@ -298,9 +316,9 @@ class FailoverBreaker:
                 # Reset the count so the probe is not re-run on every request —
                 # it takes another `threshold` failures to ask again.
                 logger.warning(
-                    "upstream failing (%s) but this host is online — relaying the "
+                    "%s failing (%s) but this host is online — relaying the "
                     "error instead of failing over (the local GPU stays free)",
-                    reason,
+                    self.upstream_name, reason,
                 )
                 self._failures = 0
         return self.open
@@ -337,8 +355,11 @@ class FailoverBreaker:
         """
         was_open = self.open
         if was_open:
-            logger.warning("failover CLOSED — Anthropic reachable again")
-            self._notify("Backdoor failover", "Anthropic recovered — back to cloud")
+            logger.warning("failover CLOSED — %s reachable again", self.upstream_name)
+            self._notify(
+                f"Backdoor {self.source} failover",
+                f"{self.upstream_name} recovered; back to cloud",
+            )
         self.open = False
         self.reason = ""
         self._failures = 0
