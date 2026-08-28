@@ -365,6 +365,12 @@ async def test_auth_and_request_errors_never_activate_local_failover(
     breaker = one_shot_breaker(tmp_path)
     monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
     local_calls = 0
+    local_preparations = 0
+
+    async def prepare_local(payload, _settings):
+        nonlocal local_preparations
+        local_preparations += 1
+        return payload
 
     def cloud(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -391,6 +397,9 @@ async def test_auth_and_request_errors_never_activate_local_failover(
         "_ollama_client",
         httpx.AsyncClient(transport=httpx.MockTransport(local)),
     )
+    monkeypatch.setattr(
+        codex_routes, "prepare_codex_external_context", prepare_local
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
     ) as client:
@@ -401,6 +410,7 @@ async def test_auth_and_request_errors_never_activate_local_failover(
     assert response.status_code == status
     assert response.json() == {"error": "visible"}
     assert local_calls == 0
+    assert local_preparations == 0
     assert breaker.open is False
 
 
@@ -516,6 +526,53 @@ async def test_half_open_success_returns_same_thread_to_cloud(
 
 
 @pytest.mark.asyncio
+async def test_half_open_stream_failure_keeps_breaker_open_and_qwen_claimed(
+    codex_app, monkeypatch, tmp_path
+):
+    app, settings, _ = codex_app
+    now = {"value": 1_000.0}
+    breaker = one_shot_breaker(tmp_path, now_fn=lambda: now["value"])
+    assert breaker.record_failure("HTTP 503") is True
+    breaker.note_claim("http://127.0.0.1:11434/v1", settings.codex_local_model)
+    now["value"] += 61
+    monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
+
+    def cloud(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=FailingStream(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    unloaded = []
+
+    async def unload(base_url, model):
+        unloaded.append((base_url, model))
+        return True
+
+    monkeypatch.setattr(codex_routes.ollama_admin, "unload", unload)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+
+    with pytest.raises((httpx.TransportError, ExceptionGroup)):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+        ) as client:
+            await client.post(
+                "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+            )
+
+    assert breaker.open is True
+    assert unloaded == []
+
+
+@pytest.mark.asyncio
 async def test_ollama_rejection_returns_clean_502(codex_app, monkeypatch, tmp_path):
     app, settings, _ = codex_app
     monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
@@ -578,7 +635,7 @@ async def test_recovery_defers_qwen_unload_until_local_stream_finishes(
 
     monkeypatch.setattr(codex_routes.ollama_admin, "unload", unload)
     breaker.record_success()
-    await codex_routes._release_claims(breaker, Settings())
+    await codex_routes._release_claims(breaker)
     assert unloaded == []
 
     await stream.aclose()

@@ -61,16 +61,6 @@ def estimate_codex_tokens(payload: dict[str, Any]) -> int:
     return count_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
-def enforce_cloud_budget(payload: dict[str, Any], max_input_tokens: int) -> int:
-    estimated = estimate_codex_tokens(payload)
-    if estimated > max_input_tokens:
-        raise CodexRequestError(
-            f"Codex request exceeds the {max_input_tokens}-token input limit",
-            status_code=413,
-        )
-    return estimated
-
-
 def _content_text(item: dict[str, Any]) -> str:
     content = item.get("content", "")
     if isinstance(content, str):
@@ -96,7 +86,14 @@ def _active_turn(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
             latest_text = _content_text(item).strip()
             if not latest_text:
                 continue
-            suffix = [copy.deepcopy(value) for value in items[index:] if isinstance(value, dict)]
+            suffix = [copy.deepcopy(item)]
+            for value in items[index + 1 :]:
+                if not isinstance(value, dict):
+                    continue
+                if value.get("type") in {"function_call", "function_call_output"}:
+                    suffix.append(copy.deepcopy(value))
+                elif value.get("type") == "message" and value.get("role") == "assistant":
+                    suffix.append(copy.deepcopy(value))
             return suffix, latest_text
     raise CodexRequestError("Codex request has no current user instruction")
 
@@ -247,19 +244,29 @@ def build_local_payload(
     memory_lines, memory_tokens = _bounded_memories(
         memories, settings.codex_memory_budget_tokens
     )
-    guidance = _LOCAL_PREAMBLE
-    if memory_lines:
-        guidance += "\n\n" + _MEMORY_PREAMBLE + "\n" + "\n".join(
-            f"- {line}" for line in memory_lines
-        )
     input_items: list[dict[str, Any]] = [
         {
             "type": "message",
             "role": "developer",
-            "content": [{"type": "input_text", "text": guidance}],
+            "content": [{"type": "input_text", "text": _LOCAL_PREAMBLE}],
         },
-        *active,
     ]
+    if memory_lines:
+        input_items.append(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": _MEMORY_PREAMBLE
+                        + "\n"
+                        + "\n".join(f"- {line}" for line in memory_lines),
+                    }
+                ],
+            }
+        )
+    input_items.extend(active)
 
     tools, initially_dropped = _normalize_tools(payload, settings.codex_local_tools)
     tools, tool_tokens, budget_dropped = _bounded_tools(
@@ -280,15 +287,7 @@ def build_local_payload(
     max_input = settings.codex_context_window - settings.codex_reply_reserve_tokens
     input_tokens = estimate_codex_tokens(local)
     if input_tokens > max_input and memory_lines:
-        input_items.pop(0)
-        input_items.insert(
-            0,
-            {
-                "type": "message",
-                "role": "developer",
-                "content": [{"type": "input_text", "text": _LOCAL_PREAMBLE}],
-            },
-        )
+        input_items.pop(1)
         memory_tokens = 0
         trimmed += len(memory_lines)
         input_tokens = estimate_codex_tokens(local)

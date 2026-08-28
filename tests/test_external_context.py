@@ -167,6 +167,37 @@ def test_codex_function_output_becomes_the_same_bounded_capsule():
     assert payload["input"][-1]["output"] == page
 
 
+def test_codex_shell_output_is_compacted_but_never_queued_for_cognee():
+    output = "private workspace data " * 1_000
+    payload = {
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect this file"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "shell-1",
+                "name": "exec",
+                "arguments": '{"cmd":"read local file"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "shell-1",
+                "output": output,
+            },
+        ]
+    }
+
+    compacted, documents = compact_codex_tool_outputs(
+        payload, threshold_chars=8_000, char_budget=4_000
+    )
+
+    assert CONTEXT_OPEN in compacted["input"][-1]["output"]
+    assert documents == []
+
+
 async def test_codex_preparation_stores_full_source_without_mutating_cloud_payload(monkeypatch):
     page = "Public fetched report. " * 1_000
     payload = {
@@ -174,6 +205,8 @@ async def test_codex_preparation_stores_full_source_without_mutating_cloud_paylo
             {"type": "message", "role": "user", "content": [
                 {"type": "input_text", "text": "Summarize the report"},
             ]},
+            {"type": "function_call", "call_id": "fetch-1", "name": "web_fetch",
+             "arguments": '{"url":"https://example.com/report"}'},
             {"type": "function_call_output", "call_id": "fetch-1", "output": page},
         ]
     }

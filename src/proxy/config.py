@@ -132,9 +132,9 @@ class Settings(BaseSettings):
     codex_cognee_top_k: int = Field(default=8, ge=1)
     codex_cognee_char_budget: int = Field(default=8_000, ge=1)
 
-    # Codex Responses failover keeps a hard 32K window on both the cloud guard
-    # and the fresh local request. Component budgets include the reply reserve,
-    # so an invalid allocation is rejected at startup rather than at inference.
+    # Codex Responses failover keeps a hard 32K window on the fresh local
+    # request. Component budgets include the reply reserve, so an invalid
+    # allocation is rejected at startup rather than at inference.
     codex_context_window: int = Field(default=32_000, ge=1)
     codex_reply_reserve_tokens: int = Field(default=4_000, ge=1)
     codex_system_budget_tokens: int = Field(default=1_000, ge=0)

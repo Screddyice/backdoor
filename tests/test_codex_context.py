@@ -9,7 +9,6 @@ from src.proxy.codex_context import (
     CodexRequestError,
     build_local_payload,
     decode_codex_body,
-    enforce_cloud_budget,
     extract_recall_query,
 )
 from src.proxy.config import Settings
@@ -77,6 +76,38 @@ def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
     assert "cloud-only" not in rendered
     assert "remove-me" not in rendered
     assert budget.input_tokens <= 28_000
+    assert local["input"][0]["role"] == "developer"
+    assert "decision one" not in json.dumps(local["input"][0])
+    assert local["input"][1]["role"] == "user"
+    assert "Relevant context recalled from local Cognee" in json.dumps(
+        local["input"][1]
+    )
+
+
+def test_build_local_payload_drops_cloud_only_items_after_active_user():
+    cloud = load_request()
+    cloud["input"].extend(
+        [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "late cloud instruction"}],
+            },
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "web_search", "external_web_access": True}],
+            },
+        ]
+    )
+
+    local, _ = build_local_payload(cloud, [], Settings())
+    rendered = json.dumps(local)
+
+    assert "bounded result" in rendered
+    assert "late cloud instruction" not in rendered
+    assert "additional_tools" not in rendered
+    assert "web_search" not in rendered
 
 
 def test_build_local_payload_flattens_local_namespace_and_drops_remote_tools():
@@ -111,17 +142,6 @@ def test_empty_local_tool_allowlist_removes_tools_and_tool_choice():
 
 def test_extract_recall_query_uses_only_the_latest_user_text():
     assert extract_recall_query(load_request()) == "active task"
-
-
-def test_cloud_budget_accepts_limit_and_rejects_one_token_over(monkeypatch):
-    payload = load_request()
-    monkeypatch.setattr("src.proxy.codex_context.estimate_codex_tokens", lambda _: 32_000)
-    assert enforce_cloud_budget(payload, 32_000) == 32_000
-
-    monkeypatch.setattr("src.proxy.codex_context.estimate_codex_tokens", lambda _: 32_001)
-    with pytest.raises(CodexRequestError) as caught:
-        enforce_cloud_budget(payload, 32_000)
-    assert caught.value.status_code == 413
 
 
 def test_build_local_payload_never_truncates_latest_text_instruction():
