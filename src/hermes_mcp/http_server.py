@@ -27,7 +27,7 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .oauth import OAuthSettings, SingleUserOAuthProvider
+from .oauth import LOGIN_COMPLETION_PATH, OAuthSettings, SingleUserOAuthProvider
 from .registry import Profile, load_registry
 from .tools import register_tools
 
@@ -171,6 +171,10 @@ def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
         @mcp.custom_route("/login", methods=["GET", "POST"])
         async def oauth_login(request):
             return await provider.handle_login(request)
+
+        @mcp.custom_route(LOGIN_COMPLETION_PATH, methods=["GET"])
+        async def oauth_login_complete(request):
+            return await provider.handle_login_completion(request)
     else:
         key = require_bridge_key()
         mcp = MCPServer(

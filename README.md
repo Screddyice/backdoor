@@ -1089,8 +1089,9 @@ static bearer-token path for clients that can set an `Authorization` header. Set
 client registration, authorization-code flow with PKCE, one-owner password consent, one-hour
 access tokens, and rotating 30-day refresh tokens. Registered clients and tokens survive service
 restarts in a mode-600 state file. The login password and deployment identifiers remain outside
-the repository. Successful password submissions use an HTTP 303 redirect so embedded browsers
-follow the Claude callback with GET instead of replaying the login form POST.
+the repository. Successful password submissions use an HTTP 303 redirect to a same-origin
+`/login/complete` GET before returning to Claude. This post/redirect/get hop keeps embedded
+browsers from replaying the password form after the bridge consumes its one-time login state.
 
 **Environment.** Set at deploy time, never committed:
 
@@ -1106,10 +1107,10 @@ follow the Claude callback with GET instead of replaying the login form POST.
 | `HERMES_MCP_PORT` | No | Port the bridge binds. Defaults to `8000`. A non-integer or out-of-range value is refused at boot rather than surfacing later as a bind failure |
 | `HERMES_MCP_ALLOWED_HOSTS` | No | Comma-separated, whitespace-tolerant extra `Host` values for the streamable-HTTP transport's DNS-rebinding allowlist, e.g. `bridge.example.com:443`. Unset or empty leaves today's behavior unchanged — the SDK's own loopback-only default applies (`127.0.0.1:*`, `localhost:*`, `[::1]:*`). Set it and those loopback defaults stay, with the configured hosts added on top; DNS-rebinding protection stays on, the allowlist only widens. Needed when the bridge runs behind a tunnel that forwards a public hostname in the `Host` header — without it such a request is rejected with **421 before auth even runs**. Required, not optional, whenever `HERMES_MCP_HOST` is non-loopback |
 
-For OAuth mode, proxy these paths to the same bridge process: `/mcp`, `/login`, `/authorize`,
-`/token`, `/register`, and `/.well-known/oauth-*`. Claude's custom connector needs only the public
-`https://.../mcp` URL; leave its advanced client credential fields empty so Claude uses dynamic
-registration.
+For OAuth mode, proxy these paths to the same bridge process: `/mcp`, `/login`,
+`/login/complete`, `/authorize`, `/token`, `/register`, and `/.well-known/oauth-*`. Claude's
+custom connector needs only the public `https://.../mcp` URL; leave its advanced client
+credential fields empty so Claude uses dynamic registration.
 
 ---
 
