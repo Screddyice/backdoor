@@ -1,6 +1,6 @@
 import os
 from functools import lru_cache
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -131,6 +131,32 @@ class Settings(BaseSettings):
     codex_cognee_timeout_seconds: float = Field(default=2.0, gt=0)
     codex_cognee_top_k: int = Field(default=8, ge=1)
     codex_cognee_char_budget: int = Field(default=8_000, ge=1)
+
+    # Codex Responses failover keeps a hard 32K window on both the cloud guard
+    # and the fresh local request. Component budgets include the reply reserve,
+    # so an invalid allocation is rejected at startup rather than at inference.
+    codex_context_window: int = Field(default=32_000, ge=1)
+    codex_reply_reserve_tokens: int = Field(default=4_000, ge=1)
+    codex_system_budget_tokens: int = Field(default=1_000, ge=0)
+    codex_memory_budget_tokens: int = Field(default=2_000, ge=0)
+    codex_tools_budget_tokens: int = Field(default=4_000, ge=0)
+    codex_active_turn_budget_tokens: int = Field(default=21_000, ge=1)
+    codex_local_model: str = "qwen3.8:27b-obliterated"
+    codex_local_responses_url: str = "http://127.0.0.1:11434/v1/responses"
+    codex_local_tools: str = "local"
+
+    @model_validator(mode="after")
+    def validate_codex_context_allocation(self):
+        allocated = (
+            self.codex_reply_reserve_tokens
+            + self.codex_system_budget_tokens
+            + self.codex_memory_budget_tokens
+            + self.codex_tools_budget_tokens
+            + self.codex_active_turn_budget_tokens
+        )
+        if allocated > self.codex_context_window:
+            raise ValueError("Codex context component budgets exceed the context window")
+        return self
 
     # Bare mode for an EXPLICIT `/model <name>` route, not just failover.
     # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
