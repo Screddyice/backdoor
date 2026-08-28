@@ -6,6 +6,8 @@
 
 **Compute interlock addendum:** Claude and Codex must publish the same exclusive 27B ownership lease before inference. LLM-Jury must refuse both its local council and every frontier provider, including OpenRouter, whenever Backdoor failover is active, an ownership lease is live, or Ollama still reports the 27B model resident.
 
+**Implementation correction, 2026-08-29:** The planned 32K cloud guard was removed after reproducing a 413 on fresh Codex sessions whose static tool and plugin prefix already exceeded Qwen's local budget. Healthy cloud traffic now keeps the selected model's catalog window and travels byte-faithfully through Backdoor. The 32K allocation applies only after local failover is selected and the request is rebuilt for Qwen. Historical checklist items below still describe the original guard so the review trail remains intact.
+
 **Architecture:** Codex uses a custom Responses provider on Backdoor. Backdoor relays healthy cloud requests byte-for-byte, while a separate Codex breaker rebuilds an outage request from the active user turn, authoritative local Cognee recall, and an allowlisted local tool catalog before streaming Ollama Responses events back to Codex.
 
 **Tech Stack:** Python 3.11, FastAPI, httpx, Pydantic Settings, Ollama Responses API, Cognee HTTP recall, pytest, pytest-asyncio

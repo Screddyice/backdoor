@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -17,10 +18,12 @@ from .codex_context import (
     CodexRequestError,
     build_local_payload,
     decode_codex_body,
-    estimate_codex_tokens,
     extract_recall_query,
 )
-from .external_context import prepare_codex_external_context
+from .external_context import (
+    prepare_codex_external_context,
+    recall_codex_external_context,
+)
 from .cognee_recall import recall_context
 from .config import Settings, get_settings
 from .failover import FailoverBreaker
@@ -48,6 +51,7 @@ _ollama_client: httpx.AsyncClient | None = None
 _codex_breaker: FailoverBreaker | None = None
 _local_inflight = 0
 _deferred_claims: set[tuple[str, str]] = set()
+_local_state_lock = asyncio.Lock()
 
 
 def _new_chatgpt_client(settings: Settings) -> httpx.AsyncClient:
@@ -111,7 +115,11 @@ async def _send_cloud(
     settings: Settings,
     path: str = "responses",
 ) -> httpx.Response:
-    headers = {key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS}
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in _HOP_HEADERS
+    }
     headers.setdefault("accept-encoding", "identity")
     upstream = _get_chatgpt_client(settings)
     upstream_request = upstream.build_request(
@@ -121,6 +129,35 @@ async def _send_cloud(
         headers=headers,
     )
     return await upstream.send(upstream_request, stream=True)
+
+
+async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+        raise HTTPException(
+            status_code=413, detail="Codex request exceeds the encoded size limit"
+        )
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > max_bytes:
+            raise HTTPException(
+                status_code=413, detail="Codex request exceeds the encoded size limit"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_local_payload(body: bytes, request: Request, settings: Settings) -> dict:
+    try:
+        return decode_codex_body(
+            body,
+            request.headers.get("content-encoding", ""),
+            max_decoded_bytes=settings.codex_max_request_bytes,
+        )
+    except CodexRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 @codex_router.get("/models")
@@ -184,13 +221,49 @@ async def _cloud_body(
             await _release_claims(breaker)
 
 
+async def _passthrough_body(response: httpx.Response) -> AsyncIterator[bytes]:
+    async for chunk in response.aiter_raw():
+        yield chunk
+
+
+class _ManagedStreamingResponse(StreamingResponse):
+    """Always close the iterator and upstream response on client disconnect."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        background, self.background = self.background, None
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close_iterator = getattr(self.body_iterator, "aclose", None)
+            try:
+                if close_iterator is not None:
+                    await close_iterator()
+            finally:
+                if background is not None:
+                    await background()
+
+
+def _relay_passthrough(response: httpx.Response) -> StreamingResponse:
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() not in _SKIP_RESPONSE_HEADERS
+    }
+    return _ManagedStreamingResponse(
+        _passthrough_body(response),
+        status_code=response.status_code,
+        headers=headers,
+        background=BackgroundTask(response.aclose),
+    )
+
+
 def _relay_cloud(response: httpx.Response, breaker: FailoverBreaker) -> StreamingResponse:
     headers = {
         key: value
         for key, value in response.headers.items()
         if key.lower() not in _SKIP_RESPONSE_HEADERS
     }
-    return StreamingResponse(
+    return _ManagedStreamingResponse(
         _cloud_body(response, breaker),
         status_code=response.status_code,
         headers=headers,
@@ -200,32 +273,81 @@ def _relay_cloud(response: httpx.Response, breaker: FailoverBreaker) -> Streamin
 
 async def _release_claims(breaker: FailoverBreaker) -> None:
     global _deferred_claims
-    claims = breaker.drain_claims()
-    if not claims:
-        return
-    if _local_inflight:
-        _deferred_claims.update(claims)
-        return
-    for base_url, model in claims:
-        await ollama_admin.unload(base_url, model)
+    async with _local_state_lock:
+        claims = breaker.drain_claims()
+        if _local_inflight:
+            _deferred_claims.update(claims)
+            return
+        if not breaker.open and _deferred_claims:
+            claims.update(_deferred_claims)
+            _deferred_claims = set()
+        for base_url, model in claims:
+            await ollama_admin.unload(base_url, model)
 
 
-async def _local_body(
+class _LocalBody(AsyncIterator[bytes]):
+    def __init__(self, response: httpx.Response, breaker: FailoverBreaker):
+        self._response = response
+        self._breaker = breaker
+        self._iterator = response.aiter_raw().__aiter__()
+        self._closed = False
+
+    def __aiter__(self) -> "_LocalBody":
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await self._iterator.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close_iterator = getattr(self._iterator, "aclose", None)
+        try:
+            if close_iterator is not None:
+                await close_iterator()
+        finally:
+            try:
+                await self._response.aclose()
+            finally:
+                await _release_local_slot(self._breaker)
+
+
+def _local_body(
     response: httpx.Response,
     breaker: FailoverBreaker,
-) -> AsyncIterator[bytes]:
+    *,
+    reserved: bool = False,
+) -> _LocalBody:
+    global _local_inflight
+    if not reserved:
+        _local_inflight += 1
+    return _LocalBody(response, breaker)
+
+
+async def _release_local_slot(breaker: FailoverBreaker) -> None:
     global _local_inflight, _deferred_claims
-    _local_inflight += 1
-    try:
-        async for chunk in response.aiter_raw():
-            yield chunk
-    finally:
+    async with _local_state_lock:
         _local_inflight = max(0, _local_inflight - 1)
-        await response.aclose()
         if not _local_inflight and _deferred_claims and not breaker.open:
             claims, _deferred_claims = _deferred_claims, set()
             for base_url, model in claims:
                 await ollama_admin.unload(base_url, model)
+
+
+async def _reserve_local_slot() -> None:
+    global _local_inflight
+    async with _local_state_lock:
+        _local_inflight += 1
 
 
 async def _serve_local(
@@ -235,66 +357,115 @@ async def _serve_local(
     correlation_id: str,
     started: float,
 ) -> StreamingResponse:
+    global _local_inflight, _deferred_claims
     if not settings.codex_failover_to_local:
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable")
 
-    resolved = await mlx_admin.resolve_profile("local-qwen38-obliterated")
-    if resolved != "local-qwen38-obliterated":
-        logger.warning(
-            "Codex local route id=%s exact Qwen runtime unavailable",
-            correlation_id,
+    await _reserve_local_slot()
+    response: httpx.Response | None = None
+    try:
+        resolved = await mlx_admin.resolve_profile("local-qwen38-obliterated")
+        if resolved != "local-qwen38-obliterated":
+            logger.warning(
+                "Codex local route id=%s exact Qwen runtime unavailable",
+                correlation_id,
+            )
+            raise HTTPException(
+                status_code=503, detail="Local Qwen runtime unavailable"
+            )
+
+        breaker.note_claim(_ollama_openai_base(settings), settings.codex_local_model)
+        if not breaker.open:
+            _deferred_claims.update(breaker.drain_claims())
+
+        try:
+            query = extract_recall_query(
+                cloud_payload, settings.codex_active_turn_budget_tokens
+            )
+            local_source = await prepare_codex_external_context(cloud_payload, settings)
+            if settings.qwen_cognee:
+                external_memories, agent_memories = await asyncio.gather(
+                    recall_codex_external_context(cloud_payload, settings),
+                    recall_context(query, settings),
+                )
+                memories = agent_memories + external_memories
+            else:
+                memories = []
+            local_payload, budget = build_local_payload(
+                local_source, memories, settings
+            )
+        except CodexRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+        compute_lease.claim_exclusive_model(
+            settings.codex_local_model,
+            source="codex-failover",
+            ttl_seconds=600,
         )
-        raise HTTPException(status_code=503, detail="Local Qwen runtime unavailable")
+        try:
+            response = await _send_local(local_payload, settings)
+        except httpx.TransportError as exc:
+            logger.warning(
+                "Codex local request failed id=%s error=%s",
+                correlation_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(status_code=502, detail="Local Qwen unavailable") from exc
+        if response.status_code >= 400:
+            status = response.status_code
+            await response.aclose()
+            response = None
+            logger.warning(
+                "Codex local request failed id=%s status=%d", correlation_id, status
+            )
+            raise HTTPException(
+                status_code=502, detail="Local Qwen rejected the request"
+            )
+        logger.info(
+            "Codex route id=%s path=local model=%s input_tokens=%d memories=%d "
+            "tools=%d dropped_tools=%d elapsed_ms=%d",
+            correlation_id,
+            settings.codex_local_model,
+            budget.input_tokens,
+            len(memories),
+            len(local_payload.get("tools", [])),
+            budget.dropped_tools,
+            round((time.monotonic() - started) * 1000),
+        )
+        headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in _SKIP_RESPONSE_HEADERS
+        }
+        stream = _local_body(response, breaker, reserved=True)
+        return _ManagedStreamingResponse(
+            stream,
+            status_code=response.status_code,
+            headers=headers,
+            background=BackgroundTask(stream.aclose),
+        )
+    except BaseException:
+        if response is not None:
+            await response.aclose()
+        await _release_local_slot(breaker)
+        raise
 
-    try:
-        local_source = await prepare_codex_external_context(cloud_payload, settings)
-        query = extract_recall_query(local_source)
-        memories = await recall_context(query, settings)
-        local_payload, budget = build_local_payload(local_source, memories, settings)
-    except CodexRequestError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    compute_lease.claim_exclusive_model(
-        settings.codex_local_model,
-        source="codex-failover",
-        ttl_seconds=600,
-    )
+@codex_router.post("/responses/compact")
+async def codex_compact(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+):
+    """Relay Codex cloud compaction without involving the inference breaker."""
+    body = await _read_bounded_body(request, settings.codex_max_request_bytes)
+    path = "responses/compact"
+    if request.url.query:
+        path = f"{path}?{request.url.query}"
     try:
-        response = await _send_local(local_payload, settings)
+        response = await _send_cloud(request, body, settings, path=path)
     except httpx.TransportError as exc:
-        logger.warning(
-            "Codex local request failed id=%s error=%s",
-            correlation_id,
-            type(exc).__name__,
-        )
-        raise HTTPException(status_code=502, detail="Local Qwen unavailable") from exc
-    if response.status_code >= 400:
-        status = response.status_code
-        await response.aclose()
-        logger.warning("Codex local request failed id=%s status=%d", correlation_id, status)
-        raise HTTPException(status_code=502, detail="Local Qwen rejected the request")
-    breaker.note_claim(_ollama_openai_base(settings), settings.codex_local_model)
-    logger.info(
-        "Codex route id=%s path=local model=%s input_tokens=%d memories=%d "
-        "tools=%d dropped_tools=%d elapsed_ms=%d",
-        correlation_id,
-        settings.codex_local_model,
-        budget.input_tokens,
-        len(memories),
-        len(local_payload.get("tools", [])),
-        budget.dropped_tools,
-        round((time.monotonic() - started) * 1000),
-    )
-    headers = {
-        key: value
-        for key, value in response.headers.items()
-        if key.lower() not in _SKIP_RESPONSE_HEADERS
-    }
-    return StreamingResponse(
-        _local_body(response, breaker),
-        status_code=response.status_code,
-        headers=headers,
-    )
+        raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
+    return _relay_passthrough(response)
 
 
 @codex_router.post("/responses")
@@ -304,15 +475,12 @@ async def codex_responses(
 ):
     started = time.monotonic()
     correlation_id = uuid.uuid4().hex[:12]
-    body = await request.body()
-    try:
-        payload = decode_codex_body(body, request.headers.get("content-encoding", ""))
-        estimated = estimate_codex_tokens(payload)
-    except CodexRequestError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    body = await _read_bounded_body(request, settings.codex_max_request_bytes)
 
     breaker = get_codex_breaker(settings)
-    if not breaker.allow_upstream():
+    failover_enabled = settings.codex_failover_to_local
+    if failover_enabled and not breaker.allow_upstream():
+        payload = _decode_local_payload(body, request, settings)
         return await _serve_local(payload, settings, breaker, correlation_id, started)
 
     try:
@@ -323,11 +491,12 @@ async def codex_responses(
             correlation_id,
             type(exc).__name__,
         )
-        if breaker.record_failure(type(exc).__name__):
+        if failover_enabled and breaker.record_failure(type(exc).__name__):
+            payload = _decode_local_payload(body, request, settings)
             return await _serve_local(payload, settings, breaker, correlation_id, started)
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
 
-    if response.status_code in _failover_statuses(settings):
+    if failover_enabled and response.status_code in _failover_statuses(settings):
         decoded = await response.aread()
         headers = {
             key: value
@@ -336,14 +505,17 @@ async def codex_responses(
         }
         await response.aclose()
         if breaker.record_failure(f"HTTP {response.status_code}"):
+            payload = _decode_local_payload(body, request, settings)
             return await _serve_local(payload, settings, breaker, correlation_id, started)
         return Response(content=decoded, status_code=response.status_code, headers=headers)
 
     logger.info(
-        "Codex route id=%s path=cloud status=%d input_tokens=%d elapsed_ms=%d",
+        "Codex route id=%s path=cloud status=%d request_bytes=%d elapsed_ms=%d",
         correlation_id,
         response.status_code,
-        estimated,
+        len(body),
         round((time.monotonic() - started) * 1000),
     )
+    if not failover_enabled:
+        return _relay_passthrough(response)
     return _relay_cloud(response, breaker)

@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     codex_local_tools: str = "local"
     codex_failover_to_local: bool = True
     codex_chatgpt_upstream: str = "https://chatgpt.com/backend-api/codex"
+    codex_max_request_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
     codex_failover_threshold: int = Field(default=3, ge=1)
     codex_failover_window_seconds: float = Field(default=120.0, gt=0)
     codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
@@ -173,6 +174,8 @@ class Settings(BaseSettings):
     external_context_threshold_chars: int = 12000
     external_context_char_budget: int = 6000
     external_context_max_document_chars: int = 500000
+    external_context_max_documents: int = Field(default=4, ge=0)
+    external_context_public_url_prefixes: str = ""
     external_context_top_k: int = 6
     external_context_timeout_seconds: float = 1.5
 

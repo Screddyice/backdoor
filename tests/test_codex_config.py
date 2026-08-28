@@ -22,6 +22,7 @@ def test_codex_runtime_settings_accept_operator_environment(monkeypatch):
     monkeypatch.setenv("CODEX_CONTEXT_WINDOW", "32000")
     monkeypatch.setenv("CODEX_FAILOVER_THRESHOLD", "3")
     monkeypatch.setenv("CODEX_FAILOVER_STATUSES", "429,503,401")
+    monkeypatch.setenv("CODEX_MAX_REQUEST_BYTES", "67108864")
 
     settings = Settings(_env_file=None)
 
@@ -31,6 +32,7 @@ def test_codex_runtime_settings_accept_operator_environment(monkeypatch):
     assert settings.cognee_base_url == "http://127.0.0.1:8001"
     assert settings.codex_context_window == 32_000
     assert settings.codex_failover_threshold == 3
+    assert settings.codex_max_request_bytes == 64 * 1024 * 1024
     assert _failover_statuses(settings) == {429, 503}
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import gzip
 import json
+import zlib
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -37,17 +38,44 @@ class CodexBudget:
     trimmed_items: int
 
 
-def decode_codex_body(body: bytes, content_encoding: str) -> dict[str, Any]:
+def decode_codex_body(
+    body: bytes,
+    content_encoding: str,
+    *,
+    max_decoded_bytes: int | None = None,
+) -> dict[str, Any]:
     encoding = (content_encoding or "").strip().lower()
     if encoding in ("", "identity"):
         decoded = body
     elif encoding == "gzip":
         try:
-            decoded = gzip.decompress(body)
-        except (OSError, EOFError) as exc:
+            if max_decoded_bytes is None:
+                decoded = gzip.decompress(body)
+            else:
+                inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                decoded = inflater.decompress(body, max_decoded_bytes + 1)
+                if len(decoded) > max_decoded_bytes or inflater.unconsumed_tail:
+                    raise CodexRequestError(
+                        "Codex request exceeds the decoded size limit",
+                        status_code=413,
+                    )
+                decoded += inflater.flush(max_decoded_bytes + 1 - len(decoded))
+                if len(decoded) > max_decoded_bytes:
+                    raise CodexRequestError(
+                        "Codex request exceeds the decoded size limit",
+                        status_code=413,
+                    )
+                if not inflater.eof or inflater.unused_data:
+                    raise CodexRequestError("Invalid gzip request body")
+        except (OSError, EOFError, zlib.error) as exc:
             raise CodexRequestError("Invalid gzip request body") from exc
     else:
         raise CodexRequestError("Unsupported content encoding", status_code=415)
+    if max_decoded_bytes is not None and len(decoded) > max_decoded_bytes:
+        raise CodexRequestError(
+            "Codex request exceeds the decoded size limit",
+            status_code=413,
+        )
     try:
         payload = json.loads(decoded)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -76,6 +104,25 @@ def _content_text(item: dict[str, Any]) -> str:
     )
 
 
+def _paired_call_indices(
+    items: list[Any], start: int = 0
+) -> dict[int, int]:
+    pending: dict[str, int | None] = {}
+    pairs: dict[int, int] = {}
+    for item_index in range(start, len(items)):
+        item = items[item_index]
+        if not isinstance(item, dict):
+            continue
+        call_id = str(item.get("call_id") or "")
+        if item.get("type") == "function_call" and call_id:
+            pending[call_id] = None if call_id in pending else item_index
+        elif item.get("type") == "function_call_output" and call_id:
+            call_index = pending.pop(call_id, None)
+            if call_index is not None:
+                pairs[item_index] = call_index
+    return pairs
+
+
 def _active_turn(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
     items = payload.get("input")
     if not isinstance(items, list):
@@ -85,21 +132,65 @@ def _active_turn(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
         if isinstance(item, dict) and item.get("role") == "user":
             latest_text = _content_text(item).strip()
             if not latest_text:
-                continue
+                raise CodexRequestError(
+                    "Latest Codex user turn has no textual instruction"
+                )
+            pairs = _paired_call_indices(items, index + 1)
+            paired_indices = set(pairs) | set(pairs.values())
             suffix = [copy.deepcopy(item)]
-            for value in items[index + 1 :]:
+            for trailing_index in range(index + 1, len(items)):
+                value = items[trailing_index]
                 if not isinstance(value, dict):
                     continue
-                if value.get("type") in {"function_call", "function_call_output"}:
+                if trailing_index in paired_indices:
                     suffix.append(copy.deepcopy(value))
                 elif value.get("type") == "message" and value.get("role") == "assistant":
                     suffix.append(copy.deepcopy(value))
             return suffix, latest_text
+
+    pairs = _paired_call_indices(items)
+    completed_outputs: list[int] = []
+    for item_index in range(len(items) - 1, -1, -1):
+        item = items[item_index]
+        if not isinstance(item, dict):
+            if completed_outputs:
+                break
+            continue
+        if item.get("type") != "function_call_output":
+            if completed_outputs:
+                break
+            continue
+        if item_index not in pairs:
+            break
+        completed_outputs.append(item_index)
+    completed_outputs.reverse()
+    if completed_outputs:
+        completed_indices = set(completed_outputs) | {
+            pairs[output_index] for output_index in completed_outputs
+        }
+        active = [
+            copy.deepcopy(item)
+            for item_index, item in enumerate(items)
+            if item_index in completed_indices and isinstance(item, dict)
+        ]
+        names = [
+            str(items[pairs[output_index]].get("name") or "tool")
+            for output_index in completed_outputs
+        ]
+        query = "Continue after local tool calls: " + ", ".join(names)
+        return active, query
     raise CodexRequestError("Codex request has no current user instruction")
 
 
-def extract_recall_query(payload: dict[str, Any]) -> str:
+def extract_recall_query(
+    payload: dict[str, Any], max_tokens: int | None = None
+) -> str:
     _, latest_text = _active_turn(payload)
+    if max_tokens is not None and count_text(latest_text) > max_tokens:
+        raise CodexRequestError(
+            "Latest Codex instruction does not fit the local context budget",
+            status_code=413,
+        )
     return latest_text
 
 
@@ -128,12 +219,17 @@ def _normalize_tools(
 
     def allowed(name: str) -> bool:
         lowered = name.lower()
-        return "local" in patterns or any(pattern in lowered for pattern in patterns)
+        explicit = tuple(pattern for pattern in patterns if pattern != "local")
+        if lowered.startswith("mcp__"):
+            return any(pattern in lowered for pattern in explicit)
+        return "local" in patterns or any(pattern in lowered for pattern in explicit)
 
     sources: list[Any] = []
     if isinstance(payload.get("tools"), list):
         sources.extend(payload["tools"])
     for item in payload.get("input", []):
+        if isinstance(item, dict) and item.get("role") == "user":
+            break
         if isinstance(item, dict) and item.get("type") == "additional_tools":
             tools = item.get("tools")
             if isinstance(tools, list):
@@ -209,28 +305,73 @@ def _trim_active_items(
             status_code=413,
         )
     trimmed = 0
+    for item in items:
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        attachments = [
+            part
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") in {"input_image", "input_file"}
+        ]
+        if attachments:
+            item["content"] = [part for part in content if part not in attachments]
+            trimmed += len(attachments)
     while count_text(json.dumps(items, ensure_ascii=False, separators=(",", ":"))) > budget:
         changed = False
-        for item in reversed(items[1:]):
-            if item.get("type") == "function_call_output" and item.get("output") != "[output omitted]":
+        for item in items:
+            if (
+                item.get("type") == "function_call_output"
+                and item.get("output") != "[output omitted]"
+            ):
                 item["output"] = "[output omitted]"
                 trimmed += 1
                 changed = True
                 break
-            content = item.get("content")
-            if isinstance(content, list):
-                images = [part for part in content if isinstance(part, dict) and part.get("type") in {"input_image", "input_file"}]
-                if images:
-                    item["content"] = [part for part in content if part not in images]
-                    trimmed += len(images)
-                    changed = True
-                    break
+        if changed:
+            continue
         if not changed:
             raise CodexRequestError(
                 "Active Codex turn does not fit the local context budget",
                 status_code=413,
             )
     return items, trimmed
+
+
+def _apply_tool_choice(
+    raw_choice: Any, tools: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], str | dict[str, Any] | None, int]:
+    names = {tool["name"] for tool in tools}
+    if isinstance(raw_choice, dict):
+        name = raw_choice.get("name")
+        if raw_choice.get("type") == "function":
+            if name not in names:
+                return [], None, len(tools)
+            selected = [tool for tool in tools if tool["name"] == name]
+            optional = [tool for tool in tools if tool["name"] != name]
+            return selected + optional, {"type": "function", "name": name}, 0
+        if raw_choice.get("type") == "allowed_tools":
+            mode = raw_choice.get("mode")
+            raw_tools = raw_choice.get("tools")
+            if mode not in {"auto", "required"} or not isinstance(raw_tools, list):
+                return [], None, len(tools)
+            allowed_names = {
+                str(tool.get("name"))
+                for tool in raw_tools
+                if isinstance(tool, dict)
+                and tool.get("type") == "function"
+                and tool.get("name") in names
+            }
+            selected = [tool for tool in tools if tool["name"] in allowed_names]
+            if not selected:
+                return [], None, len(tools)
+            return selected, mode, len(tools) - len(selected)
+        return tools, "auto", 0
+    if isinstance(raw_choice, str):
+        if raw_choice in {"auto", "none", "required"}:
+            return tools, raw_choice, 0
+    return tools, "auto", 0
 
 
 def build_local_payload(
@@ -268,10 +409,40 @@ def build_local_payload(
         )
     input_items.extend(active)
 
+    raw_tool_choice = payload.get("tool_choice", "auto")
+    requires_tool = (
+        raw_tool_choice == "required"
+        or isinstance(raw_tool_choice, dict)
+        and (
+            raw_tool_choice.get("type") == "function"
+            or raw_tool_choice.get("type") == "allowed_tools"
+            and raw_tool_choice.get("mode") == "required"
+        )
+    )
     tools, initially_dropped = _normalize_tools(payload, settings.codex_local_tools)
+    tools, tool_choice, choice_dropped = _apply_tool_choice(
+        raw_tool_choice, tools
+    )
     tools, tool_tokens, budget_dropped = _bounded_tools(
         tools, settings.codex_tools_budget_tokens
     )
+    budget_dropped += choice_dropped
+    if (
+        isinstance(tool_choice, dict)
+        and tool_choice.get("type") == "function"
+        and tool_choice.get("name") not in {tool["name"] for tool in tools}
+    ):
+        raise CodexRequestError(
+            "Required Codex tool does not fit the local tool budget",
+            status_code=413,
+        )
+    if requires_tool and not tools:
+        raise CodexRequestError(
+            "Required Codex tool does not fit the local tool budget",
+            status_code=413,
+        )
+    if not tools:
+        tool_choice = None
     local: dict[str, Any] = {
         "model": settings.codex_local_model,
         "input": input_items,
@@ -280,7 +451,8 @@ def build_local_payload(
     }
     if tools:
         local["tools"] = tools
-        local["tool_choice"] = payload.get("tool_choice", "auto")
+        if tool_choice is not None:
+            local["tool_choice"] = tool_choice
     if isinstance(payload.get("text"), dict):
         local["text"] = copy.deepcopy(payload["text"])
 
@@ -292,6 +464,11 @@ def build_local_payload(
         trimmed += len(memory_lines)
         input_tokens = estimate_codex_tokens(local)
     if input_tokens > max_input and tools:
+        if requires_tool:
+            raise CodexRequestError(
+                "Required Codex tool does not fit the local context budget",
+                status_code=413,
+            )
         trimmed += len(tools)
         local.pop("tools", None)
         local.pop("tool_choice", None)

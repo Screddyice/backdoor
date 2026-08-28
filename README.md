@@ -382,17 +382,19 @@ Leave `model_context_window` and `model_auto_compact_token_limit` unset. Codex u
 
 ### What happens to a running thread
 
-While ChatGPT inference works, Backdoor relays the original request, OAuth headers, response status, and SSE bytes. Backdoor sends cloud traffic without Qwen's 32K check. ChatGPT enforces the selected cloud model's input limit. Codex sends account, plugin, and other hosted traffic to ChatGPT because Backdoor replaces the inference provider alone.
+While ChatGPT inference works, Backdoor relays the original request, OAuth headers, response status, and SSE bytes. Backdoor sends cloud traffic without parsing it or applying Qwen's 32K check. ChatGPT enforces the selected cloud model's input limit. Codex compaction requests also stay on the ChatGPT relay. Codex sends account, plugin, and other hosted traffic to ChatGPT because Backdoor replaces the inference provider alone.
+
+The relay accepts request bodies up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must send a larger encoded request.
 
 After three eligible failures inside 120 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
 
 The visible Codex thread does not change. Qwen receives a fresh internal request containing:
 
-- the latest user instruction and the active local tool loop;
-- a bounded recall from local Cognee;
+- the latest user instruction and the active local tool loop, including a paired tool continuation that does not repeat the user message;
+- a bounded recall from Cognee when `QWEN_COGNEE` is enabled;
 - local Code Mode tools converted from Codex's Responses Lite namespace format.
 
-It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, or hosted web-search tools. Cognee provides continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads Cognee through `POST /api/v1/recall`; existing Codex hooks remain responsible for durable writes.
+It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Cognee can provide continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads agent recall through `POST /api/v1/recall`. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_COGNEE=0` to suppress every Cognee read and write on the local path.
 
 Cognee authentication resolves from the running process, `~/.cognee/.env`, then the existing `~/.cognee-plugin/api_key.json` cache when its server URL matches. The key is not copied into the Backdoor LaunchAgent.
 
@@ -414,7 +416,7 @@ Backdoor removes extra recall, optional tools, old tool output, and attachments 
 
 Set `CODEX_LOCAL_TOOLS=` to remove all local tools. The default `local` keeps non-MCP Code Mode tools. Remote `mcp__*` namespaces stay out of the outage request because they cannot work without the network.
 
-Set `CODEX_FAILOVER_TO_LOCAL=false` to disable Qwen fallback without removing the custom provider. Cloud inference still crosses the Responses relay and returns its real errors. Backdoor logs correlation IDs, route choice, status class, timing, token counts, recall counts, and tool counts. It never logs prompts, recalled text, OAuth values, tool arguments, or model output.
+Set `CODEX_FAILOVER_TO_LOCAL=false` to disable Qwen fallback without removing the custom provider. Cloud inference still crosses the Responses relay and returns its real errors. Backdoor logs correlation IDs, route choice, status class, timing, cloud request byte counts, local token counts, recall counts, and tool counts. It never logs prompts, recalled text, OAuth values, tool arguments, or model output.
 
 ---
 
@@ -724,9 +726,9 @@ This is the one documented exception to the MCP-off rule, and the token arithmet
 
 Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
 
-Large fetched pages also bypass the model window at the proxy layer, making the behavior independent of GUI plugins. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. It submits the original source, its URL, and a content hash to the dedicated `qwen_external_context` Cognee dataset. Later Qwen turns search that dataset and inject only a bounded set of recalled passages. The first turn does not wait for Cognee indexing: local ranking supplies its excerpts while Cognee processes the durable copy in the background.
+Large fetched pages also bypass the model window at the proxy layer, making the behavior independent of GUI plugins. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted with its URL and content hash to the dedicated `qwen_external_context` Cognee dataset. Browser-session tools never persist their output. Later Qwen turns search that dataset and inject only a bounded set of recalled passages. The first turn does not wait for Cognee indexing: local ranking supplies its excerpts while Cognee processes an approved durable copy in the background.
 
-This boundary is client-independent because every local Qwen request crosses Backdoor. Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Source text is marked as untrusted data, high-confidence credential-shaped documents are not written, individual documents are capped at 500,000 characters, and Cognee calls time out after 1.5 seconds. A Cognee or SSH-tunnel failure never drops the request. `QWEN_COGNEE=0` disables writes and recall for true-offline work, while the local 6,000-character reduction still protects Qwen's window.
+This boundary is client-independent because every local Qwen request crosses Backdoor. Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Unapproved, authenticated, intranet, and client sources remain ephemeral even when their content looks harmless. Approved source text is marked as untrusted data, high-confidence credential-shaped documents are not written, and stored source URLs exclude user information, query strings, and fragments. Individual documents are capped at 500,000 characters before ranking, and each request can enqueue at most four documents. Cognee calls time out after 1.5 seconds. A Cognee or SSH-tunnel failure never drops the request. `QWEN_COGNEE=0` disables writes and recall for true-offline work, while the local 6,000-character reduction still protects Qwen's window.
 
 The proxy resolves Cognee settings from its process environment, then `~/.cognee/.env`, then `~/projects/.env`. That makes the same behavior available to terminal launchers and Dock-launched clients that never source `.zshrc`. A missing key or unreachable service degrades to local reduction only.
 

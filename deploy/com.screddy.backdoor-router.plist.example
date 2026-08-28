@@ -42,6 +42,8 @@
         <string>3</string>
         <key>CODEX_FAILOVER_STATUSES</key>
         <string>429,500,502,503,504,529</string>
+        <key>CODEX_MAX_REQUEST_BYTES</key>
+        <string>67108864</string>
         <key>CODEX_CONTEXT_WINDOW</key>
         <string>32000</string>
         <key>CODEX_LOCAL_RESPONSES_URL</key>

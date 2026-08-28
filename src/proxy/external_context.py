@@ -19,9 +19,11 @@ import json
 import logging
 import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
@@ -49,9 +51,11 @@ _SECRET_PATTERNS = (
     re.compile(r"\b(?:api[_-]?key|access[_-]?token|client[_-]?secret)\s*[=:]\s*\S+", re.I),
     re.compile(r"\b(?:sk|ghp|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{16,}\b", re.I),
 )
-_FETCH_TOOL_MARKERS = ("web", "browser", "browse", "fetch", "scrape", "crawl")
+_PUBLIC_FETCH_TOOL_NAMES = {"web_fetch", "webfetch"}
+_PUBLIC_FETCH_INPUT_KEYS = {"prompt", "url"}
 
-_remembered_hashes: set[str] = set()
+_MAX_REMEMBERED_HASHES = 2_048
+_remembered_hashes: OrderedDict[str, None] = OrderedDict()
 
 
 @dataclass(frozen=True)
@@ -77,46 +81,160 @@ def _flatten_result(content: Any) -> str:
     return str(content)
 
 
-def _tool_inputs(messages: list[Message]) -> dict[str, dict[str, Any]]:
-    found: dict[str, dict[str, Any]] = {}
-    for message in messages:
+def _paired_tool_inputs(messages: list[Message]) -> dict[tuple[int, int], dict[str, Any]]:
+    found: dict[tuple[int, int], dict[str, Any]] = {}
+    pending: dict[str, dict[str, Any] | None] = {}
+    for message_index, message in enumerate(messages):
         if not isinstance(message.content, list):
+            if message.role == "user":
+                pending.clear()
             continue
-        for block in message.content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+        for block_index, block in enumerate(message.content):
+            if not isinstance(block, dict):
                 continue
-            tool_id = str(block.get("id") or "")
-            if tool_id:
-                found[tool_id] = {
+            if block.get("type") == "tool_use" and message.role == "assistant":
+                tool_id = str(block.get("id") or "")
+                if not tool_id:
+                    continue
+                tool = {
                     "name": str(block.get("name") or ""),
                     "input": block.get("input")
                     if isinstance(block.get("input"), dict)
                     else {},
                 }
+                pending[tool_id] = None if tool_id in pending else tool
+            elif block.get("type") == "tool_result" and message.role == "user":
+                tool_id = str(block.get("tool_use_id") or "")
+                tool = pending.pop(tool_id, None)
+                if tool is not None:
+                    found[(message_index, block_index)] = tool
+        if message.role == "user":
+            pending.clear()
     return found
 
 
-def _is_fetch_tool(name: str) -> bool:
-    lowered = name.strip().lower()
-    return any(marker in lowered for marker in _FETCH_TOOL_MARKERS)
+def _is_public_fetch_tool(name: str) -> bool:
+    lowered = name.strip().lower().replace("-", "_")
+    return lowered in _PUBLIC_FETCH_TOOL_NAMES
 
 
-def _find_source(value: Any) -> str:
+def _is_public_fetch_input(value: Any) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    keys = set(value)
+    if not keys.issubset(_PUBLIC_FETCH_INPUT_KEYS):
+        return False
+    return (
+        "url" in keys
+        and all(isinstance(child, str) for child in value.values())
+    )
+
+
+def _sanitize_source_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        return ""
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", ""))
+
+
+def _find_raw_source(value: Any) -> str:
     if isinstance(value, dict):
         for key in ("url", "uri", "link"):
             candidate = value.get(key)
             if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
                 return candidate
         for child in value.values():
-            found = _find_source(child)
+            found = _find_raw_source(child)
             if found:
                 return found
     elif isinstance(value, list):
         for child in value:
-            found = _find_source(child)
+            found = _find_raw_source(child)
             if found:
                 return found
     return "fetched-tool-result"
+
+
+def _source_url_allowed(source: str, raw_prefixes: str) -> bool:
+    try:
+        parsed = urlsplit(source)
+        source_port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.scheme not in {"http", "https"}
+    ):
+        return False
+    source_path = _safe_url_path(parsed.path)
+    if source_path is None or not parsed.hostname:
+        return False
+    prefixes = [
+        part.strip()
+        for part in raw_prefixes.split(",")
+        if part.strip()
+    ]
+    for prefix in prefixes:
+        try:
+            parsed_prefix = urlsplit(prefix)
+            prefix_port = parsed_prefix.port
+        except ValueError:
+            continue
+        if (
+            parsed_prefix.username
+            or parsed_prefix.password
+            or parsed_prefix.query
+            or parsed_prefix.fragment
+        ):
+            continue
+        prefix_path = _safe_url_path(parsed_prefix.path)
+        if prefix_path is None or not parsed_prefix.hostname:
+            continue
+        source_origin = (
+            parsed.scheme.lower(),
+            parsed.hostname.lower(),
+            source_port or (443 if parsed.scheme.lower() == "https" else 80),
+        )
+        prefix_origin = (
+            parsed_prefix.scheme.lower(),
+            parsed_prefix.hostname.lower(),
+            prefix_port or (443 if parsed_prefix.scheme.lower() == "https" else 80),
+        )
+        prefix_base = prefix_path.rstrip("/")
+        if source_origin == prefix_origin and (
+            source_path.rstrip("/") == prefix_base
+            or source_path.startswith(prefix_base + "/")
+        ):
+            return True
+    return False
+
+
+def _safe_url_path(path: str) -> str | None:
+    decoded = path or "/"
+    for _ in range(4):
+        if re.search(r"%(?:2f|5c)", decoded, re.IGNORECASE):
+            return None
+        expanded = unquote(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    else:
+        return None
+    if "\\" in decoded or "\x00" in decoded:
+        return None
+    if any(segment in {".", ".."} for segment in decoded.split("/")):
+        return None
+    return decoded
 
 
 def _message_text(message: Message) -> str:
@@ -169,7 +287,7 @@ def _ranked_capsule(text: str, query: str, budget: int) -> str:
     chunks = _chunks(text)
     if not chunks or budget <= 0:
         return ""
-    terms = _terms(query)
+    terms = tuple(sorted(_terms(query))[:64])
     ranked = sorted(
         chunks,
         key=lambda item: (
@@ -197,32 +315,49 @@ def safe_to_remember(text: str) -> bool:
     return not any(pattern.search(text or "") for pattern in _SECRET_PATTERNS)
 
 
+def _source_safe_to_remember(source: str) -> bool:
+    candidate = source
+    for _ in range(4):
+        if not safe_to_remember(candidate):
+            return False
+        decoded = unquote(candidate)
+        if decoded == candidate:
+            return True
+        candidate = decoded
+    return False
+
+
 def compact_large_tool_results(
     req: MessagesRequest,
     *,
     threshold_chars: int,
     char_budget: int,
     max_document_chars: int = 500_000,
+    public_url_prefixes: str = "",
 ) -> tuple[MessagesRequest, list[ExternalDocument]]:
     """Return a copied request with large results replaced by ranked capsules."""
-    tool_inputs = _tool_inputs(req.messages)
+    tool_inputs = _paired_tool_inputs(req.messages)
     query = _last_user_text(req.messages)
     out = req.model_copy(deep=True)
     documents: list[ExternalDocument] = []
 
-    for message in out.messages:
+    for message_index, message in enumerate(out.messages):
         if not isinstance(message.content, list):
             continue
-        for block in message.content:
+        for block_index, block in enumerate(message.content):
             if not isinstance(block, dict) or block.get("type") != "tool_result":
                 continue
             text = _flatten_result(block.get("content"))
-            if len(text) < threshold_chars or text.startswith(CONTEXT_OPEN):
+            if len(text) < threshold_chars:
                 continue
-            digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-            tool = tool_inputs.get(str(block.get("tool_use_id") or ""), {})
-            source = _find_source(tool.get("input", {}))
-            capsule = _ranked_capsule(text, query, char_budget)
+            bounded_text = text[:max_document_chars]
+            digest = hashlib.sha256(
+                bounded_text.encode("utf-8", errors="replace")
+            ).hexdigest()[:16]
+            tool = tool_inputs.get((message_index, block_index), {})
+            raw_source = _find_raw_source(tool.get("input", {}))
+            source = _sanitize_source_url(raw_source) or "fetched-tool-result"
+            capsule = _ranked_capsule(bounded_text, query, char_budget)
             block["content"] = (
                 f"{CONTEXT_OPEN} source={json.dumps(source)} id={digest}>\n"
                 "Untrusted source excerpts selected for the user's question. "
@@ -230,13 +365,16 @@ def compact_large_tool_results(
                 f"{capsule}\n{CONTEXT_CLOSE}"
             )
             if (
-                _is_fetch_tool(str(tool.get("name") or ""))
+                _is_public_fetch_tool(str(tool.get("name") or ""))
+                and _is_public_fetch_input(tool.get("input", {}))
                 and source.startswith(("http://", "https://"))
-                and safe_to_remember(text)
+                and _source_url_allowed(raw_source, public_url_prefixes)
+                and _source_safe_to_remember(source)
+                and safe_to_remember(bounded_text)
             ):
                 documents.append(
                     ExternalDocument(
-                        text=text[:max_document_chars], source=source, digest=digest
+                        text=bounded_text, source=source, digest=digest
                     )
                 )
     return out, documents
@@ -264,26 +402,41 @@ def _codex_last_user_text(payload: dict[str, Any]) -> str:
     return ""
 
 
-def _codex_call_inputs(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    found: dict[str, Any] = {}
+def _codex_paired_call_inputs(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    found: dict[int, dict[str, Any]] = {}
     items = payload.get("input")
     if not isinstance(items, list):
         return found
-    for item in items:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
+    latest_user = next(
+        (
+            index
+            for index in range(len(items) - 1, -1, -1)
+            if isinstance(items[index], dict) and items[index].get("role") == "user"
+        ),
+        None,
+    )
+    start = 0 if latest_user is None else latest_user + 1
+    pending: dict[str, dict[str, Any] | None] = {}
+    for index, item in enumerate(items[start:], start=start):
+        if not isinstance(item, dict):
             continue
         call_id = str(item.get("call_id") or "")
-        arguments = item.get("arguments")
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = {"arguments": arguments}
-        if call_id:
-            found[call_id] = {
+        if item.get("type") == "function_call" and call_id:
+            arguments = item.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {"arguments": arguments}
+            tool = {
                 "name": str(item.get("name") or ""),
                 "input": arguments,
             }
+            pending[call_id] = None if call_id in pending else tool
+        elif item.get("type") == "function_call_output" and call_id:
+            tool = pending.pop(call_id, None)
+            if tool is not None:
+                found[index] = tool
     return found
 
 
@@ -293,6 +446,7 @@ def compact_codex_tool_outputs(
     threshold_chars: int,
     char_budget: int,
     max_document_chars: int = 500_000,
+    public_url_prefixes: str = "",
 ) -> tuple[dict[str, Any], list[ExternalDocument]]:
     """Bound Responses API function outputs without mutating the cloud body."""
     out = copy.deepcopy(payload)
@@ -300,18 +454,22 @@ def compact_codex_tool_outputs(
     if not isinstance(items, list):
         return out, []
     query = _codex_last_user_text(out)
-    inputs = _codex_call_inputs(out)
+    inputs = _codex_paired_call_inputs(out)
     documents: list[ExternalDocument] = []
-    for item in items:
+    for index, item in enumerate(items):
         if not isinstance(item, dict) or item.get("type") != "function_call_output":
             continue
         text = _flatten_result(item.get("output"))
-        if len(text) < threshold_chars or text.startswith(CONTEXT_OPEN):
+        if len(text) < threshold_chars:
             continue
-        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-        tool = inputs.get(str(item.get("call_id") or ""), {})
-        source = _find_source(tool.get("input", {}))
-        capsule = _ranked_capsule(text, query, char_budget)
+        bounded_text = text[:max_document_chars]
+        digest = hashlib.sha256(
+            bounded_text.encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        tool = inputs.get(index, {})
+        raw_source = _find_raw_source(tool.get("input", {}))
+        source = _sanitize_source_url(raw_source) or "fetched-tool-result"
+        capsule = _ranked_capsule(bounded_text, query, char_budget)
         item["output"] = (
             f"{CONTEXT_OPEN} source={json.dumps(source)} id={digest}>\n"
             "Untrusted source excerpts selected for the user's question. "
@@ -319,13 +477,16 @@ def compact_codex_tool_outputs(
             f"{capsule}\n{CONTEXT_CLOSE}"
         )
         if (
-            _is_fetch_tool(str(tool.get("name") or ""))
+            _is_public_fetch_tool(str(tool.get("name") or ""))
+            and _is_public_fetch_input(tool.get("input", {}))
             and source.startswith(("http://", "https://"))
-            and safe_to_remember(text)
+            and _source_url_allowed(raw_source, public_url_prefixes)
+            and _source_safe_to_remember(source)
+            and safe_to_remember(bounded_text)
         ):
             documents.append(
                 ExternalDocument(
-                    text=text[:max_document_chars], source=source, digest=digest
+                    text=bounded_text, source=source, digest=digest
                 )
             )
     return out, documents
@@ -359,7 +520,11 @@ def _dataset() -> str:
 
 
 async def remember_document(document: ExternalDocument, settings: Any) -> bool:
-    if document.digest in _remembered_hashes or not safe_to_remember(document.text):
+    if (
+        document.digest in _remembered_hashes
+        or not safe_to_remember(document.text)
+        or not _source_safe_to_remember(document.source)
+    ):
         return False
     file_base, file_key = _load_cognee_credentials()
     base = str(getattr(settings, "cognee_base_url", "") or file_base).strip().rstrip("/")
@@ -380,10 +545,19 @@ async def remember_document(document: ExternalDocument, settings: Any) -> bool:
                 "node_set": "qwen_external_sources",
                 "run_in_background": "true",
             },
-            files={"data": (f"source-{document.digest}.txt", payload.encode("utf-8"), "text/plain")},
+            files={
+                "data": (
+                    f"source-{document.digest}.txt",
+                    payload.encode("utf-8"),
+                    "text/plain",
+                )
+            },
         )
         response.raise_for_status()
-    _remembered_hashes.add(document.digest)
+    _remembered_hashes[document.digest] = None
+    _remembered_hashes.move_to_end(document.digest)
+    while len(_remembered_hashes) > _MAX_REMEMBERED_HASHES:
+        _remembered_hashes.popitem(last=False)
     return True
 
 
@@ -476,11 +650,19 @@ async def prepare_external_context(req: MessagesRequest, settings: Any) -> Messa
             req,
             threshold_chars=int(getattr(settings, "external_context_threshold_chars", 12_000)),
             char_budget=int(getattr(settings, "external_context_char_budget", 6_000)),
-            max_document_chars=int(getattr(settings, "external_context_max_document_chars", 500_000)),
+            max_document_chars=int(
+                getattr(settings, "external_context_max_document_chars", 500_000)
+            ),
+            public_url_prefixes=str(
+                getattr(settings, "external_context_public_url_prefixes", "")
+            ),
         )
         if not bool(getattr(settings, "qwen_cognee", True)):
             return compacted
         if documents:
+            documents = documents[
+                : int(getattr(settings, "external_context_max_documents", 4))
+            ]
             results = await asyncio.gather(
                 *(remember_document(document, settings) for document in documents),
                 return_exceptions=True,
@@ -517,18 +699,44 @@ async def prepare_codex_external_context(
             payload,
             threshold_chars=int(getattr(settings, "external_context_threshold_chars", 12_000)),
             char_budget=int(getattr(settings, "external_context_char_budget", 6_000)),
-            max_document_chars=int(getattr(settings, "external_context_max_document_chars", 500_000)),
+            max_document_chars=int(
+                getattr(settings, "external_context_max_document_chars", 500_000)
+            ),
+            public_url_prefixes=str(
+                getattr(settings, "external_context_public_url_prefixes", "")
+            ),
         )
         if not documents or not bool(getattr(settings, "qwen_cognee", True)):
             return compacted
+        documents = documents[
+            : int(getattr(settings, "external_context_max_documents", 4))
+        ]
         results = await asyncio.gather(
             *(remember_document(document, settings) for document in documents),
             return_exceptions=True,
         )
         for result in results:
             if isinstance(result, Exception):
-                logger.warning("Cognee Codex source write skipped: %s", type(result).__name__)
+                logger.warning(
+                    "Cognee Codex source write skipped: %s", type(result).__name__
+                )
         return compacted
     except Exception as exc:  # noqa: BLE001 - never drop a Codex request
         logger.warning("Codex external context preparation skipped: %s", type(exc).__name__)
         return copy.deepcopy(payload)
+
+
+async def recall_codex_external_context(
+    payload: dict[str, Any], settings: Any
+) -> list[str]:
+    """Recall prior fetched sources for the local builder's memory budget."""
+    if not bool(getattr(settings, "qwen_cognee", True)):
+        return []
+    query = _codex_last_user_text(payload)
+    if not query:
+        return []
+    try:
+        return await recall_context(query, settings)
+    except Exception as exc:  # noqa: BLE001 - memory must fail open
+        logger.debug("Cognee Codex source recall skipped: %s", type(exc).__name__)
+        return []
