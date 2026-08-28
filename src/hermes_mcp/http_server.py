@@ -171,6 +171,10 @@ def build_server(registry: dict[str, Profile] | None = None) -> MCPServer:
         @mcp.custom_route("/login", methods=["GET", "POST"])
         async def oauth_login(request):
             return await provider.handle_login(request)
+
+        @mcp.custom_route("/login/complete", methods=["GET"])
+        async def oauth_login_complete(request):
+            return await provider.handle_login_completion(request)
     else:
         key = require_bridge_key()
         mcp = MCPServer(

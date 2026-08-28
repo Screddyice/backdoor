@@ -147,6 +147,7 @@ class SingleUserOAuthProvider(
         self.access_tokens: dict[str, AccessToken] = {}
         self.refresh_tokens: dict[str, RefreshToken] = {}
         self.pending: dict[str, tuple[str, AuthorizationParams, float]] = {}
+        self.approved_logins: set[str] = set()
         self.failed_logins: deque[float] = deque()
         self.registrations: deque[float] = deque()
         self._load()
@@ -301,6 +302,7 @@ class SingleUserOAuthProvider(
         ]
         for state in expired:
             self.pending.pop(state, None)
+            self.approved_logins.discard(state)
         superseded = [
             state
             for state, (client_id, _, _) in self.pending.items()
@@ -308,6 +310,7 @@ class SingleUserOAuthProvider(
         ]
         for state in superseded:
             self.pending.pop(state, None)
+            self.approved_logins.discard(state)
         if len(self.pending) >= MAX_PENDING_AUTHORIZATIONS:
             raise AuthorizeError(
                 error="temporarily_unavailable",
@@ -383,7 +386,25 @@ class SingleUserOAuthProvider(
                 "Invalid credentials", status_code=401, headers=LOGIN_SECURITY_HEADERS
             )
         self.failed_logins.clear()
+        self.approved_logins.add(login_state)
+        completion_target = (
+            f"{str(self.settings.issuer).rstrip('/')}/login/complete"
+            f"?state={login_state}"
+        )
+        return RedirectResponse(completion_target, status_code=303)
 
+    async def handle_login_completion(self, request: Request) -> Response:
+        login_state = request.query_params.get("state", "")
+        if (
+            login_state not in self.approved_logins
+            or login_state not in self.pending
+        ):
+            return HTMLResponse(
+                "Invalid or expired authorization request",
+                status_code=400,
+                headers=LOGIN_SECURITY_HEADERS,
+            )
+        self.approved_logins.discard(login_state)
         client_id, params, _ = self.pending.pop(login_state)
         code_value = f"mcp_{secrets.token_urlsafe(32)}"
         code = AuthorizationCode(
@@ -401,7 +422,7 @@ class SingleUserOAuthProvider(
         target = construct_redirect_uri(
             str(params.redirect_uri), code=code_value, state=params.state
         )
-        return RedirectResponse(target, status_code=303)
+        return RedirectResponse(target, status_code=302)
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
