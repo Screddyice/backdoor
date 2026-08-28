@@ -51,6 +51,7 @@ LOGIN_FAILURE_WINDOW = 300
 OWNER_SUBJECT = "shawn"
 LOGIN_SECURITY_HEADERS = {
     "Cache-Control": "no-store",
+    "Pragma": "no-cache",
     "Content-Security-Policy": (
         "default-src 'none'; form-action 'self'; base-uri 'none'; "
         "frame-ancestors 'none'"
@@ -223,6 +224,21 @@ class SingleUserOAuthProvider(
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self.clients.get(client_id)
 
+    def _discard_pending(self, login_state: str) -> None:
+        self.pending.pop(login_state, None)
+        self.approved_logins.discard(login_state)
+
+    def _get_pending(
+        self, login_state: str
+    ) -> tuple[str, AuthorizationParams, float] | None:
+        pending = self.pending.get(login_state)
+        if pending is None:
+            return None
+        if pending[2] <= time.monotonic() - PENDING_AUTHORIZATION_TTL:
+            self._discard_pending(login_state)
+            return None
+        return pending
+
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         now = time.monotonic()
         while self.registrations and self.registrations[0] <= now - REGISTRATION_WINDOW:
@@ -275,11 +291,13 @@ class SingleUserOAuthProvider(
                 )
             evicted_client_id = disposable[0].client_id
             self.clients.pop(evicted_client_id, None)
-            self.pending = {
-                state: item
+            evicted_states = [
+                state
                 for state, item in self.pending.items()
-                if item[0] != evicted_client_id
-            }
+                if item[0] == evicted_client_id
+            ]
+            for state in evicted_states:
+                self._discard_pending(state)
         self.clients[client_info.client_id] = client_info
         self.registrations.append(now)
         self._save()
@@ -301,16 +319,14 @@ class SingleUserOAuthProvider(
             if created_at <= now - PENDING_AUTHORIZATION_TTL
         ]
         for state in expired:
-            self.pending.pop(state, None)
-            self.approved_logins.discard(state)
+            self._discard_pending(state)
         superseded = [
             state
             for state, (client_id, _, _) in self.pending.items()
             if client_id == client.client_id
         ]
         for state in superseded:
-            self.pending.pop(state, None)
-            self.approved_logins.discard(state)
+            self._discard_pending(state)
         if len(self.pending) >= MAX_PENDING_AUTHORIZATIONS:
             raise AuthorizeError(
                 error="temporarily_unavailable",
@@ -323,13 +339,14 @@ class SingleUserOAuthProvider(
     async def handle_login(self, request: Request) -> Response:
         if request.method == "GET":
             login_state = request.query_params.get("state", "")
-            if login_state not in self.pending:
+            pending = self._get_pending(login_state)
+            if pending is None:
                 return HTMLResponse(
                     "Invalid or expired authorization request",
                     status_code=400,
                     headers=LOGIN_SECURITY_HEADERS,
                 )
-            client_id, params, _ = self.pending[login_state]
+            client_id, params, _ = pending
             client = self.clients.get(client_id)
             client_name = html.escape(
                 client.client_name if client and client.client_name else "connector"
@@ -354,7 +371,8 @@ class SingleUserOAuthProvider(
         form = await request.form()
         login_state = form.get("state")
         password = form.get("password")
-        if not isinstance(login_state, str) or login_state not in self.pending:
+        pending = self._get_pending(login_state) if isinstance(login_state, str) else None
+        if pending is None:
             return HTMLResponse(
                 "Invalid or expired authorization request",
                 status_code=400,
@@ -391,21 +409,22 @@ class SingleUserOAuthProvider(
             f"{str(self.settings.issuer).rstrip('/')}/login/complete"
             f"?state={login_state}"
         )
-        return RedirectResponse(completion_target, status_code=303)
+        return RedirectResponse(
+            completion_target, status_code=303, headers=LOGIN_SECURITY_HEADERS
+        )
 
     async def handle_login_completion(self, request: Request) -> Response:
         login_state = request.query_params.get("state", "")
-        if (
-            login_state not in self.approved_logins
-            or login_state not in self.pending
-        ):
+        pending = self._get_pending(login_state)
+        if login_state not in self.approved_logins or pending is None:
             return HTMLResponse(
                 "Invalid or expired authorization request",
                 status_code=400,
                 headers=LOGIN_SECURITY_HEADERS,
             )
         self.approved_logins.discard(login_state)
-        client_id, params, _ = self.pending.pop(login_state)
+        self.pending.pop(login_state, None)
+        client_id, params, _ = pending
         code_value = f"mcp_{secrets.token_urlsafe(32)}"
         code = AuthorizationCode(
             code=code_value,
@@ -422,7 +441,7 @@ class SingleUserOAuthProvider(
         target = construct_redirect_uri(
             str(params.redirect_uri), code=code_value, state=params.state
         )
-        return RedirectResponse(target, status_code=302)
+        return RedirectResponse(target, status_code=302, headers=LOGIN_SECURITY_HEADERS)
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str

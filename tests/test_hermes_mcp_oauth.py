@@ -174,6 +174,9 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
             follow_redirects=False,
         )
         assert approved.status_code == 303
+        assert approved.headers["cache-control"] == "no-store"
+        assert approved.headers["pragma"] == "no-cache"
+        assert approved.headers["referrer-policy"] == "no-referrer"
         completion = urlparse(approved.headers["location"])
         assert f"{completion.scheme}://{completion.netloc}{completion.path}" == (
             f"{ISSUER}/login/complete"
@@ -181,6 +184,9 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
 
         callback = client.get(approved.headers["location"], follow_redirects=False)
         assert callback.status_code == 302
+        assert callback.headers["cache-control"] == "no-store"
+        assert callback.headers["pragma"] == "no-cache"
+        assert callback.headers["referrer-policy"] == "no-referrer"
         redirect = urlparse(callback.headers["location"])
         query = parse_qs(redirect.query)
         assert f"{redirect.scheme}://{redirect.netloc}{redirect.path}" == REDIRECT_URI
@@ -313,6 +319,39 @@ def test_login_uses_completion_get_and_tolerates_duplicate_submit(
         assert parse_qs(redirect.query)["state"] == ["claude-state"]
         assert (
             client.get(approved.headers["location"], follow_redirects=False).status_code
+            == 400
+        )
+
+
+def test_login_and_completion_reject_state_after_pending_ttl(monkeypatch, tmp_path):
+    now = [100.0]
+    monkeypatch.setattr("src.hermes_mcp.oauth.time.monotonic", lambda: now[0])
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        registration = _register(client)
+        login_state, _ = _authorize(client, registration)
+        approved = client.post(
+            "/login",
+            data={"state": login_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert approved.status_code == 303
+
+        now[0] += 601
+        assert (
+            client.get(approved.headers["location"], follow_redirects=False).status_code
+            == 400
+        )
+        assert client.get("/login", params={"state": login_state}).status_code == 400
+        assert (
+            client.post(
+                "/login",
+                data={"state": login_state, "password": PASSWORD},
+                follow_redirects=False,
+            ).status_code
             == 400
         )
 
