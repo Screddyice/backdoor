@@ -44,6 +44,7 @@
 - Create `tests/test_codex_routes.py`: online relay, fallback classification, local streaming, and recovery tests.
 - Modify `tests/test_failover.py`: independent breaker identities and aggregate state publication.
 - Modify `tests/conftest.py`: reset Codex route clients and breaker state between tests.
+- Create `tests/test_codex_config.py`: runtime parsing and validation for the new environment contract.
 
 ---
 
@@ -339,7 +340,6 @@ git commit -m "feat: rebuild bounded Codex failover turns"
 - Produces:
   - `codex_router: APIRouter` mounted at `/backend-api/codex`.
   - `async def close_codex_clients() -> None`.
-  - `def reset_codex_runtime() -> None` for test isolation.
 
 - [ ] **Step 1: Write failing online relay tests**
 
@@ -390,7 +390,7 @@ Wrap `aiter_raw()` so a committed stream transport error records a breaker failu
 
 - [ ] **Step 5: Mount and clean up the router**
 
-Include `codex_router` before the existing catch-all router in `create_app()`. Call `close_codex_clients()` during lifespan shutdown. In the autouse test fixture, call `reset_codex_runtime()` before and after each test so clients and breakers never leak state.
+Include `codex_router` before the existing catch-all router in `create_app()`. Call `close_codex_clients()` during lifespan shutdown. In the autouse test fixture, monkeypatch the Codex route module's client and breaker globals to isolated values and close test-owned clients during teardown. Do not add production cleanup methods used only by tests.
 
 - [ ] **Step 6: Run relay and application tests**
 
@@ -492,47 +492,43 @@ git commit -m "feat: fail Codex over to Cognee-backed Qwen"
 - Modify: `deploy/com.screddy.backdoor-router.plist.example`
 - Modify: `README.md`
 - Modify: `tests/test_launchd_config.py`
-- Create: `tests/test_codex_config_docs.py`
+- Create: `tests/test_codex_config.py`
 
 **Interfaces:**
 - Consumes: every setting implemented in Tasks 2 through 5.
 - Produces: a copyable Codex custom-provider block and complete Backdoor runtime configuration.
 
-- [ ] **Step 1: Write failing documentation/configuration tests**
+- [ ] **Step 1: Write failing runtime configuration tests**
 
-Assert `.env.example`, the LaunchAgent example, and README agree on:
+Instantiate `Settings` with environment overrides and assert the runtime consumes:
 
 - Backdoor inference URL `http://127.0.0.1:8083/backend-api/codex`;
 - Qwen model `qwen3.8:27b-obliterated`;
 - context window `32000`;
 - Cognee loopback URL;
-- breaker defaults;
-- no literal API key value.
+- breaker thresholds and status allowlist.
 
-Assert the README provider example contains:
+Add a validation test that rejects a component allocation above 32,000 tokens and accepts this exact allocation:
 
-```toml
-model_provider = "backdoor"
-model_context_window = 32000
-
-[model_providers.backdoor]
-name = "Backdoor"
-base_url = "http://127.0.0.1:8083/backend-api/codex"
-wire_api = "responses"
-requires_openai_auth = true
-supports_websockets = false
-supports_standalone_web_search = false
+```python
+system=1_000
+memory=2_000
+tools=4_000
+active_turn=21_000
+reply_reserve=4_000
 ```
+
+Human-facing README prose and the copyable TOML block receive review, not brittle source-text tests.
 
 - [ ] **Step 2: Run tests and confirm failure**
 
 Run:
 
 ```bash
-uv run pytest tests/test_codex_config_docs.py tests/test_launchd_config.py -q
+uv run pytest tests/test_codex_config.py tests/test_launchd_config.py -q
 ```
 
-Expected: failures because the operator contract is not documented.
+Expected: failures because the settings and allocation validation do not exist.
 
 - [ ] **Step 3: Document Backdoor settings**
 
@@ -559,7 +555,7 @@ State that Codex Desktop must restart after shared configuration changes.
 Run:
 
 ```bash
-uv run pytest tests/test_codex_config_docs.py tests/test_launchd_config.py -q
+uv run pytest tests/test_codex_config.py tests/test_launchd_config.py -q
 ```
 
 Expected: all pass.
@@ -567,7 +563,7 @@ Expected: all pass.
 - [ ] **Step 6: Commit the operator contract**
 
 ```bash
-git add .env.example deploy/com.screddy.backdoor-router.plist.example README.md tests/test_codex_config_docs.py tests/test_launchd_config.py
+git add .env.example deploy/com.screddy.backdoor-router.plist.example README.md tests/test_codex_config.py tests/test_launchd_config.py
 git commit -m "docs: configure Codex Qwen failover"
 ```
 
