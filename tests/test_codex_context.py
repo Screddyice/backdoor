@@ -9,6 +9,7 @@ from src.proxy.codex_context import (
     CodexRequestError,
     build_local_payload,
     decode_codex_body,
+    enforce_cloud_budget,
     extract_recall_query,
 )
 from src.proxy.config import Settings
@@ -110,6 +111,17 @@ def test_empty_local_tool_allowlist_removes_tools_and_tool_choice():
 
 def test_extract_recall_query_uses_only_the_latest_user_text():
     assert extract_recall_query(load_request()) == "active task"
+
+
+def test_cloud_budget_accepts_limit_and_rejects_one_token_over(monkeypatch):
+    payload = load_request()
+    monkeypatch.setattr("src.proxy.codex_context.estimate_codex_tokens", lambda _: 32_000)
+    assert enforce_cloud_budget(payload, 32_000) == 32_000
+
+    monkeypatch.setattr("src.proxy.codex_context.estimate_codex_tokens", lambda _: 32_001)
+    with pytest.raises(CodexRequestError) as caught:
+        enforce_cloud_budget(payload, 32_000)
+    assert caught.value.status_code == 413
 
 
 def test_build_local_payload_never_truncates_latest_text_instruction():
