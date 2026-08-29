@@ -573,6 +573,16 @@ That is what lets the default tier be a 27B rather than a 4B without repeating t
 
 Every `mcp__*` tool is dropped from bare requests. Those schemas supplied most of the measured ~286K-token tool payload, and remote MCP integrations cannot help during true offline failover. Keep a specific MCP tool only through the existing allowlist when its schema cost and availability justify it.
 
+The standalone wrapper attaches MCP servers per request instead of loading the whole inventory:
+
+```bash
+qwen mcp list
+qwen mcp screddy-hermes -p "check the requested conversation"
+qwen mcp composio-tmn,atlassian
+```
+
+`qwen mcp NAME` validates each name against `~/.claude.json`, runs the same certificate-verifying internet probe as the hybrid router, and writes a private session config under `~/.cache/backdoor/`. Only the named servers start, alongside the compact Cognee memory shim when Cognee is enabled. If the Mac is offline, Qwen skips the requested MCP connection and keeps working with local tools. `QWEN_MCP_ASSUME_ONLINE=1` bypasses the probe on a network that blocks its public endpoints while allowing the selected MCP.
+
 Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai` and cannot work offline, but local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
 
 **The tier must accept tool definitions.** This is a hard pairing, not a preference. `deepseek-r1` at any runnable size does not: Ollama answers a request carrying tools with `does not support tools`, HTTP 400, killing the session failover exists to save. If you swap the tier for a model without tool support, set `failover_keep_tools=""` at the same time.
