@@ -569,7 +569,9 @@ answer in 3.6s on qwen3.5:27b, ending in a real tool call
 
 That is what lets the default tier be a 27B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 27B in place, and you rebuild the original failure on a much larger model.
 
-**Local tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob` and `Grep` touch nothing but this disk, so they keep working while the host is offline, and keeping them means the failover model can carry on doing work instead of only talking about it. Every `mcp__*` tool is a remote integration and is dead for exactly as long as the breaker is open. That split also happens to be where the weight is: the ~286K tokens of definitions came from MCP servers, not from the dozen local tools, so dropping them removes nearly all of the cost and nearly none of the offline capability.
+**Built-in tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob`, `Grep`, `WebSearch`, and `WebFetch` are Claude Code tools rather than MCP integrations, so bare mode keeps them. A deliberate local Qwen session can search or fetch when the Mac has internet access, and Bash can call public HTTP APIs with `curl`. If a network call fails, Qwen continues with local tools. True breaker failover gets an explicit offline prompt because the breaker opens only after the connectivity probe confirms that the host cannot reach the internet.
+
+Every `mcp__*` tool is dropped from bare requests. Those schemas supplied most of the measured ~286K-token tool payload, and remote MCP integrations cannot help during true offline failover. Keep a specific MCP tool only through the existing allowlist when its schema cost and availability justify it.
 
 Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai` and cannot work offline, but local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
 
@@ -578,6 +580,8 @@ Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai
 ### Deliberate routing: `/model qwen`
 
 Failover is not the only way into a local tier. A session can ask for one by name with `/model qwen`, and that request takes a different branch. It matches `MODEL_ROUTES`, returns a profile immediately, and skips the failover block underneath. Only the failover block stripped.
+
+The deliberate route receives an online-capable lean prompt. It tells Qwen to use `WebSearch`, `WebFetch`, or `Bash` with `curl` when current information matters, then continue offline if the call fails. This keeps inference local while letting the agent use the network that is already available to Claude Code's built-in tools.
 
 So `/model qwen` handed the 27B a full harness session against a 32K window, which is the pairing the section above warns about. That window is small on purpose. Bare mode is what makes it generous.
 

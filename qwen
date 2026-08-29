@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# qwen: launch Claude Code against a fully offline local Qwen model.
+# qwen: launch Claude Code against a local Qwen model.
 # (alias: claude-local)
 #
 #   Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
 #
-# Everything runs on-device. No internet required once models are pulled.
+# Inference runs on-device. Local work remains available without internet;
+# WebSearch, WebFetch, and public HTTP calls can use a live connection.
 #
 # Modes (default changed 2026-08-28 to the obliterated 27B GGUF):
 #   qwen            LEAN (default, 2026-07-09). Minimal prompt (~945 tok) on
@@ -310,7 +311,13 @@ else
   # system-prompt` takes the text inline; there is no `-file` form despite what
   # the --bare help text implies.
   PR_RULES="$HOME/backdoor/prompts/qwen-pr-rules.md"
-  [ -f "$PR_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$(cat "$PR_RULES")")
+  ONLINE_RULES="$HOME/backdoor/prompts/qwen-online-tools.md"
+  LEAN_RULES=""
+  [ -f "$PR_RULES" ] && LEAN_RULES="$(cat "$PR_RULES")"
+  if [ -f "$ONLINE_RULES" ]; then
+    LEAN_RULES="${LEAN_RULES}${LEAN_RULES:+$'\n\n'}$(cat "$ONLINE_RULES")"
+  fi
+  [ -n "$LEAN_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$LEAN_RULES")
 
   MODE_NOTE="lean"
 fi
