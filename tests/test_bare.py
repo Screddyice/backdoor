@@ -5,6 +5,7 @@ import pytest
 from src.proxy.bare import (
     DEFAULT_KEEP_TOOLS,
     DEFAULT_SYSTEM,
+    OFFLINE_SYSTEM,
     make_bare,
     parse_keep,
 )
@@ -88,6 +89,20 @@ def test_harness_system_prompt_is_replaced():
     out = make_bare(req(system=huge))
     assert out.system == DEFAULT_SYSTEM
     assert len(out.system) < len(huge) / 100
+
+
+def test_default_system_exposes_optional_internet_tools():
+    out = make_bare(req(system="huge harness"))
+    assert "WebSearch" in out.system
+    assert "WebFetch" in out.system
+    assert "curl" in out.system
+    assert "lost its network connection" not in out.system
+
+
+def test_offline_system_does_not_invite_network_calls():
+    out = make_bare(req(system="huge harness"), system=OFFLINE_SYSTEM)
+    assert "lost its network connection" in out.system
+    assert "WebSearch" not in out.system
 
 
 def test_system_can_be_dropped_entirely():
