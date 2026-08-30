@@ -62,7 +62,8 @@ def offline_app(monkeypatch):
 
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
-        router_mode="hybrid", failover_to_local=True, failover_threshold=1
+        router_mode="hybrid", failover_to_local=True, failover_threshold=1,
+        qwen_cognee=False,
     )
     try:
         yield app, recorder
@@ -140,7 +141,7 @@ async def test_bare_mode_can_be_disabled(offline_app, monkeypatch):
     app, recorder = offline_app
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="hybrid", failover_to_local=True, failover_threshold=1,
-        failover_bare=False,
+        failover_bare=False, qwen_cognee=False,
     )
     await _post(app, _harness_request())
     assert "official CLI" in json.dumps(recorder.payload)
@@ -302,7 +303,9 @@ async def test_profile_mode_runs_the_runtime_interlock_before_provider_call(monk
         provider_base_url="http://127.0.0.1:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
         runtime_profile="local-qwen38-obliterated",
-        route_max_input_tokens=27_000,
+        # This test isolates runtime supervision. Tier escalation has separate
+        # coverage and would replace the runtime profile before this assertion.
+        route_max_input_tokens=0,
     )
     try:
         resp = await _post(app, _route_request(turns=1))

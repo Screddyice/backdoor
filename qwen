@@ -152,6 +152,14 @@ case "$PROFILE" in
 esac
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-$QWEN_CTX}"
 
+# Claude Code reserves output space before it decides whether to compact. Its
+# xhigh default reserves 20K for an unrecognised model, leaving only a 12K
+# effective input window inside this profile's 32K context. The lean plugin and
+# tool prefix can cross that line before the conversation starts. Match the
+# provider cap so the client has 27,904 tokens available for input and compacts
+# near the route's 27K escalation guard instead of on the first useful turn.
+QWEN_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-4096}"
+
 # 1. Make sure the Ollama daemon is up (LaunchAgent normally keeps it alive).
 if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
   echo "Ollama daemon down — starting via LaunchAgent..."
@@ -366,6 +374,11 @@ else
   MODE_NOTE="lean"
 fi
 
+# Keep Claude Code's context accounting on the local alias even when the saved
+# user setting names a cloud model. A later --model in "$@" remains available
+# as an explicit caller override.
+EXTRA_ARGS+=(--model qwen)
+
 # 5. Point backdoor at the profile, ensure the proxy is up, then exec `claude`
 #    DIRECTLY (not `bd claude`, which cd's into the backdoor repo and breaks
 #    file paths) so it runs in YOUR current directory.
@@ -448,6 +461,7 @@ echo "▶ Local model: $MODEL ($PROFILE, $MODE_NOTE) — $MCP_NOTE"
 # normally guarantees a branch does not end the day without a PR. Dropping exec
 # costs one idle shell and buys back that backstop (step 7).
 env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_API_KEY="proxy" \
+  CLAUDE_CODE_MAX_OUTPUT_TOKENS="$QWEN_MAX_OUTPUT_TOKENS" \
   API_TIMEOUT_MS=600000 \
   claude ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} "$@"
 claude_status=$?

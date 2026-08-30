@@ -31,9 +31,9 @@ What gets stripped, in descending order of how much it costs:
 What is deliberately NOT stripped: the conversation itself. Failing over is
 supposed to preserve the session, and the messages are the session.
 
-Scope: this applies ONLY on the failover path. An explicit `/model qwen` route
-is a deliberate choice to use a local model *with* the harness, and rewriting
-that user's request would be a surprise.
+Scope: this applies to failover and to profiles that explicitly declare
+`ROUTE_BARE=true`. Wider local profiles can retain the harness by leaving that
+flag off.
 """
 
 import json
@@ -78,6 +78,13 @@ LOCAL_TOKEN = "local"
 # Per-tool-result character budget. Generous enough to keep a short command's
 # output intact, small enough that one `Read` of a big file cannot dominate.
 DEFAULT_TOOL_RESULT_CHARS = 2000
+
+# A marked external-context capsule has already reduced an unbounded fetched
+# document to ranked excerpts. Give that capsule its own hard ceiling so the
+# general 2K tool-result cap does not erase it, without trusting an arbitrary
+# tool result that merely happens to be large.
+EXTERNAL_CONTEXT_OPEN = "<qwen-external-context"
+EXTERNAL_CONTEXT_MAX_CHARS = 6000
 
 # Replaces the harness system prompt. Short on purpose — every token here is
 # one the model cannot spend on the conversation.
@@ -144,6 +151,8 @@ def _result_text(content: Any, limit: int) -> str:
     """Flatten a tool_result payload to bounded plain text."""
     if content is None:
         return ""
+    if isinstance(content, str) and content.startswith(EXTERNAL_CONTEXT_OPEN):
+        return _truncate(content, EXTERNAL_CONTEXT_MAX_CHARS)
     if isinstance(content, str):
         return _truncate(content, limit)
     if isinstance(content, list):
