@@ -400,6 +400,8 @@ Cognee authentication resolves from the running process, `~/.cognee/.env`, then 
 
 The breaker permits one ChatGPT probe every 60 seconds while open. The first successful probe closes it, returns later turns to cloud, and releases Qwen after any local streams finish.
 
+Before Codex receives a local response, Backdoor removes Qwen reasoning items from the SSE stream and reindexes the remaining output. Ollama places plaintext reasoning in the Responses API `encrypted_content` field, while ChatGPT expects an opaque value that it issued and can verify. Letting that local item enter the thread makes the first recovered cloud turn fail with `invalid_encrypted_content`. Tool calls and visible assistant output remain in the thread; healthy cloud responses still pass through byte-for-byte.
+
 ### The local 32K allocation
 
 Backdoor enforces this allocation on the fresh request that it sends to Qwen:

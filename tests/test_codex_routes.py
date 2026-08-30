@@ -18,6 +18,16 @@ SSE = (
     b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_local"}}\n\n'
     b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_local","status":"completed"}}\n\n'
 )
+LOCAL_REASONING_SSE = (
+    b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_local","type":"reasoning","summary":[],"encrypted_content":"plain local reasoning"}}\n\n'
+    b'event: response.content_part.added\ndata: {"type":"response.content_part.added","item_id":"rs_local","output_index":0,"content_index":0,"part":{"type":"reasoning_text","text":"plain local content part"}}\n\n'
+    b'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","item_id":"rs_local","output_index":0,"summary_index":0,"delta":"plain local reasoning"}\n\n'
+    b'event: response.content_part.done\ndata: {"type":"response.content_part.done","item_id":"rs_local","output_index":0,"content_index":0,"part":{"type":"reasoning_text","text":"plain local content part"}}\n\n'
+    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_local","type":"reasoning","summary":[{"type":"summary_text","text":"plain local reasoning"}],"encrypted_content":"plain local reasoning"}}\n\n'
+    b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_local","type":"function_call","call_id":"call_local","name":"read_file","arguments":"{}"}}\n\n'
+    b'event: response.function_call_arguments.done\ndata: {"type":"response.function_call_arguments.done","item_id":"fc_local","output_index":1,"arguments":"{}"}\n\n'
+    b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_local","status":"completed","output":[{"id":"rs_local","type":"reasoning","summary":[{"type":"summary_text","text":"plain local reasoning"}],"encrypted_content":"plain local reasoning"},{"id":"fc_local","type":"function_call","call_id":"call_local","name":"read_file","arguments":"{}"}]}}\n\n'
+)
 
 
 class BytesStream(httpx.AsyncByteStream):
@@ -26,6 +36,18 @@ class BytesStream(httpx.AsyncByteStream):
 
     async def __aiter__(self):
         yield self.data
+
+    async def aclose(self):
+        return None
+
+
+class ChunkedStream(httpx.AsyncByteStream):
+    def __init__(self, *chunks: bytes):
+        self.chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
 
     async def aclose(self):
         return None
@@ -640,6 +662,94 @@ async def test_empty_cognee_recall_still_serves_current_task_from_qwen(
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_local_response_drops_reasoning_and_returns_json(
+    codex_app, monkeypatch, tmp_path
+):
+    app, settings, _ = codex_app
+    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
+    request_payload = json.loads(FIXTURE.read_bytes())
+    request_payload["stream"] = False
+    local_payloads = []
+    local_responses = []
+
+    def cloud(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "offline"})
+
+    def local(request: httpx.Request) -> httpx.Response:
+        local_payloads.append(json.loads(request.content))
+        response = httpx.Response(
+            200,
+            stream=BytesStream(
+                json.dumps(
+                    {
+                        "id": "resp_local",
+                        "object": "response",
+                        "output": [
+                            {
+                                "id": "rs_local",
+                                "type": "reasoning",
+                                "encrypted_content": "plain local reasoning",
+                            },
+                            {
+                                "id": "msg_local",
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": "visible answer"}
+                                ],
+                            },
+                        ],
+                        "metadata": {"encrypted_content": "plain local metadata"},
+                    }
+                ).encode()
+            ),
+            headers={"content-type": "application/json"},
+        )
+        local_responses.append(response)
+        return response
+
+    async def no_recall(_query, _settings):
+        return []
+
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            content=json.dumps(request_payload).encode(),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert local_payloads[0]["stream"] is False
+    assert response.json()["output"] == [
+        {
+            "id": "msg_local",
+            "type": "message",
+            "content": [{"type": "output_text", "text": "visible answer"}],
+        }
+    ]
+    assert "encrypted_content" not in response.text
+    assert "plain local reasoning" not in response.text
+    assert local_responses[0].is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
 async def test_half_open_success_returns_same_thread_to_cloud(
     codex_app, monkeypatch, tmp_path
 ):
@@ -822,6 +932,171 @@ async def test_recovery_defers_qwen_unload_until_local_stream_finishes(
     assert unloaded == [
         ("http://127.0.0.1:11434/v1", "qwen3.8:27b-obliterated")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire",
+    [LOCAL_REASONING_SSE, LOCAL_REASONING_SSE.replace(b"\n", b"\r\n")],
+)
+async def test_local_stream_drops_reasoning_items_that_cloud_cannot_verify(
+    codex_app, tmp_path, wire
+):
+    breaker = one_shot_breaker(tmp_path)
+    response = httpx.Response(
+        200,
+        stream=ChunkedStream(
+            *(wire[index : index + 1] for index in range(len(wire)))
+        ),
+    )
+    stream = codex_routes._local_body(response, breaker)
+
+    rendered = b"".join([chunk async for chunk in stream])
+
+    assert b'"type":"reasoning"' not in rendered
+    assert b"encrypted_content" not in rendered
+    assert b"plain local reasoning" not in rendered
+    assert b"plain local content part" not in rendered
+    assert b"rs_local" not in rendered
+    assert b'"type":"function_call"' in rendered
+    assert b'"call_id":"call_local"' in rendered
+    assert rendered.count(b'"output_index":0') == 2
+    assert b'"output_index":1' not in rendered
+    assert b"\n\n\n" not in rendered
+
+
+def test_local_sse_sanitizer_reindexes_multiple_reasoning_items():
+    dropped_indices = set()
+
+    def frame(event_type, output_index, item_type):
+        payload = {
+            "type": event_type,
+            "output_index": output_index,
+            "item": {"type": item_type},
+        }
+        return b"data: " + json.dumps(payload).encode() + b"\n\n"
+
+    assert (
+        codex_routes._sanitize_local_sse_frame(
+            frame("response.output_item.added", 0, "message"),
+            dropped_indices,
+            set(),
+        )
+        != b""
+    )
+    assert (
+        codex_routes._sanitize_local_sse_frame(
+            frame("response.output_item.added", 1, "reasoning"),
+            dropped_indices,
+            set(),
+        )
+        == b""
+    )
+    middle = codex_routes._sanitize_local_sse_frame(
+        frame("response.output_item.added", 2, "function_call"),
+        dropped_indices,
+        set(),
+    )
+    assert b'"output_index":1' in middle
+    assert (
+        codex_routes._sanitize_local_sse_frame(
+            frame("response.output_item.added", 3, "reasoning"),
+            dropped_indices,
+            set(),
+        )
+        == b""
+    )
+    final = codex_routes._sanitize_local_sse_frame(
+        frame("response.output_item.added", 4, "message"),
+        dropped_indices,
+        set(),
+    )
+    assert b'"output_index":2' in final
+
+
+def test_local_sse_sanitizer_preserves_guard_frames_byte_for_byte():
+    dropped_indices = set()
+    dropped_item_ids = set()
+    for frame in (b"data: [DONE]\n\n", b"data: []\n\n"):
+        assert (
+            codex_routes._sanitize_local_sse_frame(
+                frame, dropped_indices, dropped_item_ids
+            )
+            == frame
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [b"{broken}", b"9" * 5_000],
+)
+async def test_local_stream_closes_on_unparseable_sse_json(
+    codex_app, tmp_path, payload
+):
+    breaker = one_shot_breaker(tmp_path)
+    response = httpx.Response(
+        200,
+        stream=ChunkedStream(b"data: " + payload + b"\n\n"),
+    )
+    stream = codex_routes._local_body(response, breaker)
+
+    with pytest.raises(ValueError, match="unparseable SSE frame"):
+        await anext(stream)
+
+    assert response.is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_local_stream_closes_when_the_json_decoder_recurses(
+    codex_app, monkeypatch, tmp_path
+):
+    breaker = one_shot_breaker(tmp_path)
+    response = httpx.Response(200, stream=ChunkedStream(b"data: {}\n\n"))
+    stream = codex_routes._local_body(response, breaker)
+
+    def recurse(_payload):
+        raise RecursionError
+
+    monkeypatch.setattr(codex_routes.json, "loads", recurse)
+    with pytest.raises(ValueError, match="unparseable SSE frame"):
+        await anext(stream)
+
+    assert response.is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_local_stream_rejects_an_oversized_sse_frame(
+    codex_app, monkeypatch, tmp_path
+):
+    breaker = one_shot_breaker(tmp_path)
+    monkeypatch.setattr(codex_routes, "_MAX_LOCAL_SSE_FRAME_BYTES", 16)
+    response = httpx.Response(200, stream=ChunkedStream(b"data: ", b"x" * 11))
+    stream = codex_routes._local_body(response, breaker)
+
+    with pytest.raises(ValueError, match="size limit"):
+        await anext(stream)
+
+    assert response.is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_local_stream_discards_an_incomplete_trailing_frame(
+    codex_app, tmp_path
+):
+    breaker = one_shot_breaker(tmp_path)
+    response = httpx.Response(
+        200,
+        stream=ChunkedStream(b'data: {"type":"response.reasoning_summary_text.delta"}'),
+    )
+    stream = codex_routes._local_body(response, breaker)
+
+    assert b"".join([chunk async for chunk in stream]) == b""
+    assert response.is_closed
+    assert codex_routes._local_inflight == 0
 
 
 @pytest.mark.asyncio
