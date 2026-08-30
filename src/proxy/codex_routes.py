@@ -621,6 +621,15 @@ async def _serve_local(
         if not local_payload["stream"]:
             try:
                 local_json = await _read_local_json_response(response)
+            except httpx.TransportError as exc:
+                logger.warning(
+                    "Codex local response failed id=%s error=%s",
+                    correlation_id,
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=502, detail="Local Qwen unavailable"
+                ) from exc
             except ValueError as exc:
                 raise HTTPException(
                     status_code=502, detail="Local Qwen returned an invalid response"
