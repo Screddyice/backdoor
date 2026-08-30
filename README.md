@@ -404,7 +404,7 @@ Crediting the probe at the end of the stream instead looks equivalent and is not
 
 Before Codex receives a local response, Backdoor removes Qwen reasoning items from streaming SSE and non-streaming JSON. It reindexes retained SSE output and removes every local `encrypted_content` field. Ollama places plaintext reasoning in that field, while ChatGPT expects an opaque value that it issued and can verify. Letting a local reasoning item enter the thread makes the first recovered cloud turn fail with `invalid_encrypted_content`. Tool calls and visible assistant output remain in the thread; healthy cloud responses still pass through byte-for-byte.
 
-Backdoor caps each local SSE frame and decoded non-streaming JSON body at 8 MiB. Invalid or oversized JSON returns `502 Local Qwen returned an invalid response`. An invalid or oversized SSE frame closes the local stream and releases its runtime slot.
+Backdoor caps each local SSE frame and non-streaming JSON body at 8 MiB. It requests uncompressed local responses and rejects any encoded response before reading its body, which prevents decompression from bypassing those limits. Invalid or oversized JSON returns `502 Local Qwen returned an invalid response`. An invalid or oversized SSE frame closes the local stream and releases its runtime slot.
 
 ### The local 32K allocation
 

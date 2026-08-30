@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_left
 import json
 import logging
 import time
@@ -46,6 +47,9 @@ _HOP_HEADERS = {
 }
 _SKIP_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection"}
 _DECODED_SKIP_RESPONSE_HEADERS = _SKIP_RESPONSE_HEADERS | {"content-encoding"}
+_SANITIZED_LOCAL_SKIP_RESPONSE_HEADERS = _DECODED_SKIP_RESPONSE_HEADERS | {
+    "content-type"
+}
 _MAX_LOCAL_SSE_FRAME_BYTES = 8 * 1024 * 1024
 _MAX_LOCAL_JSON_BODY_BYTES = 8 * 1024 * 1024
 
@@ -192,7 +196,8 @@ async def _send_local(payload: dict, settings: Settings) -> httpx.Response:
         json=payload,
         headers={
             "content-type": "application/json",
-            "accept": "text/event-stream",
+            "accept": "text/event-stream" if payload.get("stream") else "application/json",
+            "accept-encoding": "identity",
         },
     )
     return await client.send(local_request, stream=True)
@@ -310,7 +315,7 @@ def _is_reasoning_type(value: object) -> bool:
 
 def _sanitize_local_sse_frame(
     frame: bytes,
-    dropped_indices: set[int],
+    dropped_indices: list[int],
     dropped_item_ids: set[str],
 ) -> bytes:
     lines = frame.rstrip(b"\r\n").splitlines()
@@ -319,6 +324,7 @@ def _sanitize_local_sse_frame(
         return frame
     try:
         payload = json.loads(b"\n".join(data_lines))
+        changed = _sanitize_local_json_value(payload)
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         logger.warning("Codex local route received an unparseable SSE frame")
         raise ValueError("Codex local route received an unparseable SSE frame") from exc
@@ -341,31 +347,20 @@ def _sanitize_local_sse_frame(
         or reasoning_part
     ):
         if isinstance(output_index, int):
-            dropped_indices.add(output_index)
+            position = bisect_left(dropped_indices, output_index)
+            if (
+                position == len(dropped_indices)
+                or dropped_indices[position] != output_index
+            ):
+                dropped_indices.insert(position, output_index)
         if reasoning_item and isinstance(item.get("id"), str):
             dropped_item_ids.add(item["id"])
         if (reasoning_event or reasoning_part) and isinstance(item_id, str):
             dropped_item_ids.add(item_id)
         return b""
 
-    changed = False
-    response = payload.get("response")
-    if isinstance(response, dict) and isinstance(response.get("output"), list):
-        output = response["output"]
-        filtered = [
-            value
-            for value in output
-            if not isinstance(value, dict)
-            or not _is_reasoning_type(value.get("type"))
-        ]
-        if len(filtered) != len(output):
-            response["output"] = filtered
-            changed = True
-
     if isinstance(output_index, int):
-        adjusted_index = output_index - sum(
-            dropped_index < output_index for dropped_index in dropped_indices
-        )
+        adjusted_index = output_index - bisect_left(dropped_indices, output_index)
         if adjusted_index != output_index:
             payload["output_index"] = adjusted_index
             changed = True
@@ -387,21 +382,27 @@ def _sanitize_local_sse_frame(
     return newline.join(rebuilt) + newline + newline
 
 
-def _sanitize_local_json_value(value):
+def _sanitize_local_json_value(value) -> bool:
+    changed = False
     if isinstance(value, list):
-        sanitized = []
+        write_index = 0
         for child in value:
             if isinstance(child, dict) and _is_reasoning_type(child.get("type")):
+                changed = True
                 continue
-            sanitized.append(_sanitize_local_json_value(child))
-        return sanitized
+            changed = _sanitize_local_json_value(child) or changed
+            value[write_index] = child
+            write_index += 1
+        if write_index < len(value):
+            del value[write_index:]
+        return changed
     if isinstance(value, dict):
-        return {
-            key: _sanitize_local_json_value(child)
-            for key, child in value.items()
-            if key != "encrypted_content"
-        }
-    return value
+        if "encrypted_content" in value:
+            del value["encrypted_content"]
+            changed = True
+        for child in value.values():
+            changed = _sanitize_local_json_value(child) or changed
+    return changed
 
 
 async def _read_local_json_response(response: httpx.Response) -> dict:
@@ -416,17 +417,21 @@ async def _read_local_json_response(response: httpx.Response) -> dict:
         raise ValueError("Codex local route received invalid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("Codex local route received a non-object JSON response")
-    return _sanitize_local_json_value(payload)
+    try:
+        _sanitize_local_json_value(payload)
+    except RecursionError as exc:
+        raise ValueError("Codex local route received invalid JSON") from exc
+    return payload
 
 
 class _LocalBody(AsyncIterator[bytes]):
     def __init__(self, response: httpx.Response, breaker: FailoverBreaker):
         self._response = response
         self._breaker = breaker
-        self._iterator = response.aiter_raw().__aiter__()
+        self._iterator = response.aiter_bytes().__aiter__()
         self._buffer = bytearray()
         self._scan_from = 0
-        self._dropped_indices: set[int] = set()
+        self._dropped_indices: list[int] = []
         self._dropped_item_ids: set[str] = set()
         self._closed = False
 
@@ -438,37 +443,41 @@ class _LocalBody(AsyncIterator[bytes]):
             raise StopAsyncIteration
         while True:
             frames: list[bytes] = []
+            cursor = 0
+            search_from = self._scan_from
             while True:
                 separators = [
                     (index, length)
                     for index, length in (
-                        (self._buffer.find(b"\n\n", self._scan_from), 2),
-                        (self._buffer.find(b"\r\n\r\n", self._scan_from), 4),
+                        (self._buffer.find(b"\n\n", search_from), 2),
+                        (self._buffer.find(b"\r\n\r\n", search_from), 4),
                     )
                     if index >= 0
                 ]
                 if not separators:
-                    if len(self._buffer) > _MAX_LOCAL_SSE_FRAME_BYTES:
+                    if len(self._buffer) - cursor > _MAX_LOCAL_SSE_FRAME_BYTES:
                         logger.warning(
                             "Codex local route exceeded the %d-byte SSE frame limit",
                             _MAX_LOCAL_SSE_FRAME_BYTES,
                         )
                         await self.aclose()
                         raise ValueError("Codex local SSE frame exceeded the size limit")
+                    if cursor:
+                        del self._buffer[:cursor]
                     self._scan_from = max(0, len(self._buffer) - 3)
                     break
                 frame_index, separator_length = min(separators)
                 frame_end = frame_index + separator_length
-                if frame_end > _MAX_LOCAL_SSE_FRAME_BYTES:
+                if frame_end - cursor > _MAX_LOCAL_SSE_FRAME_BYTES:
                     logger.warning(
                         "Codex local route exceeded the %d-byte SSE frame limit",
                         _MAX_LOCAL_SSE_FRAME_BYTES,
                     )
                     await self.aclose()
                     raise ValueError("Codex local SSE frame exceeded the size limit")
-                frame = bytes(self._buffer[:frame_end])
-                del self._buffer[:frame_end]
-                self._scan_from = 0
+                frame = bytes(self._buffer[cursor:frame_end])
+                cursor = frame_end
+                search_from = cursor
                 try:
                     sanitized = _sanitize_local_sse_frame(
                         frame,
@@ -487,9 +496,12 @@ class _LocalBody(AsyncIterator[bytes]):
             except StopAsyncIteration:
                 if self._buffer:
                     logger.warning(
-                        "Codex local route discarded an incomplete SSE frame"
+                        "Codex local route received an incomplete SSE frame"
                     )
-                    self._buffer = b""
+                    await self.aclose()
+                    raise ValueError(
+                        "Codex local route received an incomplete SSE frame"
+                    )
                 await self.aclose()
                 raise
             except BaseException:
@@ -610,6 +622,13 @@ async def _serve_local(
             raise HTTPException(
                 status_code=502, detail="Local Qwen rejected the request"
             )
+        content_encoding = response.headers.get("content-encoding", "").strip().lower()
+        if content_encoding and content_encoding != "identity":
+            await response.aclose()
+            response = None
+            raise HTTPException(
+                status_code=502, detail="Local Qwen returned an invalid response"
+            )
         logger.info(
             "Codex route id=%s path=local model=%s input_tokens=%d memories=%d "
             "tools=%d dropped_tools=%d elapsed_ms=%d",
@@ -624,6 +643,10 @@ async def _serve_local(
         if not local_payload["stream"]:
             try:
                 local_json = await _read_local_json_response(response)
+            except httpx.DecodingError as exc:
+                raise HTTPException(
+                    status_code=502, detail="Local Qwen returned an invalid response"
+                ) from exc
             except httpx.TransportError as exc:
                 logger.warning(
                     "Codex local response failed id=%s error=%s",
@@ -640,7 +663,7 @@ async def _serve_local(
             headers = {
                 key: value
                 for key, value in response.headers.items()
-                if key.lower() not in _DECODED_SKIP_RESPONSE_HEADERS
+                if key.lower() not in _SANITIZED_LOCAL_SKIP_RESPONSE_HEADERS
             }
             content = json.dumps(local_json, separators=(",", ":")).encode()
             status_code = response.status_code
@@ -656,13 +679,14 @@ async def _serve_local(
         headers = {
             key: value
             for key, value in response.headers.items()
-            if key.lower() not in _SKIP_RESPONSE_HEADERS
+            if key.lower() not in _SANITIZED_LOCAL_SKIP_RESPONSE_HEADERS
         }
         stream = _local_body(response, breaker, reserved=True)
         return _ManagedStreamingResponse(
             stream,
             status_code=response.status_code,
             headers=headers,
+            media_type="text/event-stream",
             background=BackgroundTask(stream.aclose),
         )
     except BaseException:

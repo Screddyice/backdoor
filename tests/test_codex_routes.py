@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import logging
 from pathlib import Path
@@ -60,6 +61,43 @@ class FailingStream(httpx.AsyncByteStream):
 
     async def aclose(self):
         return None
+
+
+class ForbiddenReadStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        raise AssertionError("encoded response body must not be read")
+        yield b""
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stream", "expected_accept"),
+    [(True, "text/event-stream"), (False, "application/json")],
+)
+async def test_local_request_accept_matches_response_mode(
+    codex_app, monkeypatch, stream, expected_accept
+):
+    _, settings, _ = codex_app
+    requests = []
+
+    def local(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, stream=BytesStream(b"{}"))
+
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+
+    response = await codex_routes._send_local({"stream": stream}, settings)
+    await response.aclose()
+
+    assert requests[0].headers["accept"] == expected_accept
+    assert requests[0].headers["accept-encoding"] == "identity"
 
 
 @pytest.mark.asyncio
@@ -413,6 +451,39 @@ def one_shot_breaker(tmp_path, now_fn=lambda: 1_000.0):
     )
 
 
+async def _post_local_failover(
+    codex_app, monkeypatch, tmp_path, local_handler, content: bytes
+):
+    app, settings, _ = codex_app
+    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
+
+    def cloud(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "offline"})
+
+    async def no_recall(_query, _settings):
+        return []
+
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local_handler)),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        return await client.post("/backend-api/codex/responses", content=content)
+
+
 @pytest.mark.asyncio
 async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
     codex_app, monkeypatch, tmp_path
@@ -620,41 +691,15 @@ async def test_disabling_local_failover_always_relays_trigger_statuses(
 async def test_empty_cognee_recall_still_serves_current_task_from_qwen(
     codex_app, monkeypatch, tmp_path
 ):
-    app, settings, _ = codex_app
-    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
-
-    def cloud(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"error": "offline"})
-
     local_payloads = []
 
     def local(request: httpx.Request) -> httpx.Response:
         local_payloads.append(json.loads(request.content))
         return httpx.Response(200, stream=BytesStream(SSE))
 
-    async def no_recall(query, recall_settings):
-        return []
-
-    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
-    monkeypatch.setattr(
-        codex_routes,
-        "_chatgpt_client",
-        httpx.AsyncClient(
-            base_url=settings.codex_chatgpt_upstream,
-            transport=httpx.MockTransport(cloud),
-        ),
+    response = await _post_local_failover(
+        codex_app, monkeypatch, tmp_path, local, FIXTURE.read_bytes()
     )
-    monkeypatch.setattr(
-        codex_routes,
-        "_ollama_client",
-        httpx.AsyncClient(transport=httpx.MockTransport(local)),
-    )
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
-    ) as client:
-        response = await client.post(
-            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
-        )
 
     assert response.status_code == 200
     assert "active task" in json.dumps(local_payloads[0])
@@ -665,15 +710,10 @@ async def test_empty_cognee_recall_still_serves_current_task_from_qwen(
 async def test_non_streaming_local_response_drops_reasoning_and_returns_json(
     codex_app, monkeypatch, tmp_path
 ):
-    app, settings, _ = codex_app
-    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
     request_payload = json.loads(FIXTURE.read_bytes())
     request_payload["stream"] = False
     local_payloads = []
     local_responses = []
-
-    def cloud(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"error": "offline"})
 
     def local(request: httpx.Request) -> httpx.Response:
         local_payloads.append(json.loads(request.content))
@@ -702,36 +742,18 @@ async def test_non_streaming_local_response_drops_reasoning_and_returns_json(
                     }
                 ).encode()
             ),
-            headers={"content-type": "application/json"},
+            headers={"content-type": "text/event-stream"},
         )
         local_responses.append(response)
         return response
 
-    async def no_recall(_query, _settings):
-        return []
-
-    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
-    monkeypatch.setattr(
-        codex_routes,
-        "_chatgpt_client",
-        httpx.AsyncClient(
-            base_url=settings.codex_chatgpt_upstream,
-            transport=httpx.MockTransport(cloud),
-        ),
+    response = await _post_local_failover(
+        codex_app,
+        monkeypatch,
+        tmp_path,
+        local,
+        json.dumps(request_payload).encode(),
     )
-    monkeypatch.setattr(
-        codex_routes,
-        "_ollama_client",
-        httpx.AsyncClient(transport=httpx.MockTransport(local)),
-    )
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
-    ) as client:
-        response = await client.post(
-            "/backend-api/codex/responses",
-            content=json.dumps(request_payload).encode(),
-        )
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
@@ -753,14 +775,9 @@ async def test_non_streaming_local_response_drops_reasoning_and_returns_json(
 async def test_non_streaming_local_body_read_failure_returns_clean_502(
     codex_app, monkeypatch, tmp_path
 ):
-    app, settings, _ = codex_app
-    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
     request_payload = json.loads(FIXTURE.read_bytes())
     request_payload["stream"] = False
     local_responses = []
-
-    def cloud(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"error": "offline"})
 
     def local(_request: httpx.Request) -> httpx.Response:
         response = httpx.Response(
@@ -771,34 +788,70 @@ async def test_non_streaming_local_body_read_failure_returns_clean_502(
         local_responses.append(response)
         return response
 
-    async def no_recall(_query, _settings):
-        return []
-
-    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
-    monkeypatch.setattr(
-        codex_routes,
-        "_chatgpt_client",
-        httpx.AsyncClient(
-            base_url=settings.codex_chatgpt_upstream,
-            transport=httpx.MockTransport(cloud),
-        ),
+    response = await _post_local_failover(
+        codex_app,
+        monkeypatch,
+        tmp_path,
+        local,
+        json.dumps(request_payload).encode(),
     )
-    monkeypatch.setattr(
-        codex_routes,
-        "_ollama_client",
-        httpx.AsyncClient(transport=httpx.MockTransport(local)),
-    )
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
-    ) as client:
-        response = await client.post(
-            "/backend-api/codex/responses",
-            content=json.dumps(request_payload).encode(),
-        )
 
     assert response.status_code == 502
     assert response.json() == {"detail": "Local Qwen unavailable"}
+    assert local_responses[0].is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "headers", "size_limit"),
+    [
+        (
+            (b'{"nested":' * 999) + b"{}" + (b"}" * 999),
+            {"content-type": "application/json"},
+            None,
+        ),
+        (
+            b"not a gzip stream",
+            {"content-type": "application/json", "content-encoding": "gzip"},
+            None,
+        ),
+        (b"{broken}", {"content-type": "application/json"}, None),
+        (b"[]", {"content-type": "application/json"}, None),
+        (b'{"large":"xxxxxxxxxxxxxxxx"}', {"content-type": "application/json"}, 16),
+    ],
+    ids=["deep", "invalid-gzip", "malformed", "non-object", "oversized"],
+)
+async def test_non_streaming_invalid_local_response_returns_clean_502(
+    codex_app, monkeypatch, tmp_path, body, headers, size_limit
+):
+    if size_limit is not None:
+        monkeypatch.setattr(
+            codex_routes, "_MAX_LOCAL_JSON_BODY_BYTES", size_limit
+        )
+    request_payload = json.loads(FIXTURE.read_bytes())
+    request_payload["stream"] = False
+    local_responses = []
+
+    def local(_request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(
+            200,
+            stream=BytesStream(body),
+            headers=headers,
+        )
+        local_responses.append(response)
+        return response
+
+    response = await _post_local_failover(
+        codex_app,
+        monkeypatch,
+        tmp_path,
+        local,
+        json.dumps(request_payload).encode(),
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Local Qwen returned an invalid response"}
     assert local_responses[0].is_closed
     assert codex_routes._local_inflight == 0
 
@@ -812,12 +865,18 @@ async def test_half_open_success_returns_same_thread_to_cloud(
     breaker = one_shot_breaker(tmp_path, now_fn=lambda: now["value"])
     monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
     cloud_attempts = 0
+    cloud_requests = []
 
     def cloud(request: httpx.Request) -> httpx.Response:
         nonlocal cloud_attempts
         cloud_attempts += 1
+        cloud_requests.append(request)
         if cloud_attempts == 1:
             return httpx.Response(503, json={"error": "offline"})
+        if b"encrypted_content" in request.content:
+            return httpx.Response(
+                400, json={"error": {"code": "invalid_encrypted_content"}}
+            )
         return httpx.Response(
             200,
             stream=BytesStream(SSE.replace(b"resp_local", b"resp_cloud")),
@@ -827,7 +886,7 @@ async def test_half_open_success_returns_same_thread_to_cloud(
     def local(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            stream=BytesStream(SSE.replace(b"resp_local", b"resp_qwen")),
+            stream=BytesStream(LOCAL_REASONING_SSE),
             headers={"content-type": "text/event-stream"},
         )
 
@@ -858,13 +917,24 @@ async def test_half_open_success_returns_same_thread_to_cloud(
         local_response = await client.post(
             "/backend-api/codex/responses", content=FIXTURE.read_bytes()
         )
+        completed = [
+            json.loads(line[6:])
+            for line in local_response.content.splitlines()
+            if line.startswith(b"data: ")
+        ][-1]
+        replay_payload = json.loads(FIXTURE.read_bytes())
+        replay_payload["input"].extend(completed["response"]["output"])
         now["value"] += 61
         cloud_response = await client.post(
-            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+            "/backend-api/codex/responses", content=json.dumps(replay_payload).encode()
         )
 
-    assert b"resp_qwen" in local_response.content
+    assert b'"type":"function_call"' in local_response.content
+    assert b"encrypted_content" not in local_response.content
+    assert b'"type":"reasoning"' not in local_response.content
     assert b"resp_cloud" in cloud_response.content
+    assert b"encrypted_content" not in cloud_requests[1].content
+    assert b'"type": "reasoning"' not in cloud_requests[1].content
     assert breaker.open is False
     assert cloud_attempts == 2
 
@@ -1020,7 +1090,7 @@ async def test_local_stream_drops_reasoning_items_that_cloud_cannot_verify(
 
 
 def test_local_sse_sanitizer_reindexes_multiple_reasoning_items():
-    dropped_indices = set()
+    dropped_indices = []
 
     def frame(event_type, output_index, item_type):
         payload = {
@@ -1076,7 +1146,7 @@ def test_local_sse_sanitizer_drops_reasoning_type_variants(item_type):
         "item": {"id": "rs_variant", "type": item_type},
     }
     frame = b"data: " + json.dumps(payload).encode() + b"\n\n"
-    dropped_indices = set()
+    dropped_indices = []
     dropped_item_ids = set()
 
     assert (
@@ -1085,12 +1155,12 @@ def test_local_sse_sanitizer_drops_reasoning_type_variants(item_type):
         )
         == b""
     )
-    assert dropped_indices == {0}
+    assert dropped_indices == [0]
     assert dropped_item_ids == {"rs_variant"}
 
 
 def test_local_sse_sanitizer_preserves_guard_frames_byte_for_byte():
-    dropped_indices = set()
+    dropped_indices = []
     dropped_item_ids = set()
     for frame in (b"data: [DONE]\n\n", b"data: []\n\n"):
         assert (
@@ -1099,6 +1169,83 @@ def test_local_sse_sanitizer_preserves_guard_frames_byte_for_byte():
             )
             == frame
         )
+
+
+def test_local_sse_sanitizer_removes_encrypted_content_from_retained_payload():
+    payload = {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "id": "fc_local",
+            "type": "function_call",
+            "call_id": "call_local",
+            "encrypted_content": "local ciphertext",
+        },
+    }
+    frame = b"data: " + json.dumps(payload).encode() + b"\n\n"
+
+    sanitized = codex_routes._sanitize_local_sse_frame(frame, [], set())
+
+    assert b'"type":"function_call"' in sanitized
+    assert b'"call_id":"call_local"' in sanitized
+    assert b"encrypted_content" not in sanitized
+    assert b"local ciphertext" not in sanitized
+
+
+@pytest.mark.asyncio
+async def test_streaming_local_response_sets_sse_content_type(
+    codex_app, monkeypatch, tmp_path
+):
+    local_responses = []
+
+    def local(_request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(
+            200,
+            stream=BytesStream(LOCAL_REASONING_SSE),
+            headers={"content-type": "application/json"},
+        )
+        local_responses.append(response)
+        return response
+
+    response = await _post_local_failover(
+        codex_app, monkeypatch, tmp_path, local, FIXTURE.read_bytes()
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "content-encoding" not in response.headers
+    assert b'"type":"function_call"' in response.content
+    assert b"encrypted_content" not in response.content
+    assert local_responses[0].is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_local_response_rejects_encoding_before_reading(
+    codex_app, monkeypatch, tmp_path
+):
+    local_responses = []
+
+    def local(_request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(
+            200,
+            stream=ForbiddenReadStream(),
+            headers={
+                "content-type": "text/event-stream",
+                "content-encoding": "gzip",
+            },
+        )
+        local_responses.append(response)
+        return response
+
+    response = await _post_local_failover(
+        codex_app, monkeypatch, tmp_path, local, FIXTURE.read_bytes()
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Local Qwen returned an invalid response"}
+    assert local_responses[0].is_closed
+    assert codex_routes._local_inflight == 0
 
 
 @pytest.mark.asyncio
@@ -1159,7 +1306,42 @@ async def test_local_stream_rejects_an_oversized_sse_frame(
 
 
 @pytest.mark.asyncio
-async def test_local_stream_discards_an_incomplete_trailing_frame(
+async def test_local_stream_rejects_an_oversized_complete_sse_frame(
+    codex_app, monkeypatch, tmp_path
+):
+    breaker = one_shot_breaker(tmp_path)
+    monkeypatch.setattr(codex_routes, "_MAX_LOCAL_SSE_FRAME_BYTES", 16)
+    response = httpx.Response(
+        200,
+        stream=ChunkedStream(b"data: " + (b"x" * 11) + b"\n\n"),
+    )
+    stream = codex_routes._local_body(response, breaker)
+
+    with pytest.raises(ValueError, match="size limit"):
+        await anext(stream)
+
+    assert response.is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_local_stream_read_failure_closes_response_and_releases_slot(
+    codex_app, tmp_path
+):
+    breaker = one_shot_breaker(tmp_path)
+    response = httpx.Response(200, stream=FailingStream())
+    stream = codex_routes._local_body(response, breaker)
+
+    assert await anext(stream) == b"event: response.created\ndata: {}\n\n"
+    with pytest.raises(httpx.ReadError, match="stream failed"):
+        await anext(stream)
+
+    assert response.is_closed
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_local_stream_rejects_an_incomplete_trailing_frame(
     codex_app, tmp_path
 ):
     breaker = one_shot_breaker(tmp_path)
@@ -1169,7 +1351,9 @@ async def test_local_stream_discards_an_incomplete_trailing_frame(
     )
     stream = codex_routes._local_body(response, breaker)
 
-    assert b"".join([chunk async for chunk in stream]) == b""
+    with pytest.raises(ValueError, match="incomplete SSE frame"):
+        b"".join([chunk async for chunk in stream])
+
     assert response.is_closed
     assert codex_routes._local_inflight == 0
 
