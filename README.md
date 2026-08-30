@@ -360,6 +360,28 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 ## Offline failover (hybrid mode)
 
+### Keep Codex Desktop active while offline
+
+Codex Desktop can confuse a failed ChatGPT token lookup with an explicit logout. When that happens, the app switches to its login screen and pauses the local task stream before Backdoor receives an inference request. The offline-auth compatibility patch keeps a saved identity active when the token lookup is temporarily unavailable. A real logout still clears the underlying Codex identity.
+
+Install it against the signed application bundle:
+
+```bash
+uv run python local/patch-codex-desktop-offline.py
+```
+
+The installer validates the `com.openai.codex` bundle, requires one known renderer expression, creates and verifies a complete versioned application backup, changes the ASAR in place without moving offsets, and ad-hoc signs and verifies the result. It serializes concurrent installs and restores the complete original application after any patch or signing failure. Restart Codex Desktop after installation. OpenAI application updates replace the patched bundle, so rerun the installer after an update until the upstream app distinguishes offline token errors from logout.
+
+Changing the bundle replaces OpenAI's publisher signature with an ad-hoc signature. Structural signature verification still passes, but macOS no longer sees OpenAI's original designated requirement or TeamIdentifier. After restarting, confirm that Codex Desktop launches, stays signed in, and can read its existing tasks before testing an outage. If launch, login, or Keychain access fails, restore the signed bundle:
+
+```bash
+uv run python local/patch-codex-desktop-offline.py --restore
+```
+
+The installer retains one full rollback bundle per Codex version and build. Remove older backups by hand only after the current build passes the restart and offline canaries.
+
+The patch keeps the Desktop task stream alive. Backdoor still decides whether an inference request uses ChatGPT or local Qwen. Online Qwen requests can opt into the specific MCP tools they need; internet-dependent MCP servers remain unavailable during a genuine network outage.
+
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
 > **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
