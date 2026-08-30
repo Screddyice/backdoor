@@ -41,9 +41,9 @@ MLX_HEALTH_URL = "http://127.0.0.1:8080/health"
 MLX_LAUNCHD_LABEL = "com.aicollective.qwen38-mlx"
 MLX_LONG_LAUNCHD_LABEL = "com.aicollective.qwen38-mlx-long"
 
-# Where a request goes when the MLX server will not come up. The 9B on Ollama
-# loads lazily and needs no supervision, which is exactly what a fallback wants.
-MLX_FALLBACK_PROFILE = "local-failover-heavy"
+# Where a request goes when the MLX server will not come up. The 4B fast tier
+# loads through Ollama on demand and leaves enough memory headroom for recovery.
+MLX_FALLBACK_PROFILE = "local-fast"
 
 # These Ollama profiles are large enough that loading them beside the MLX 27B
 # can cross the host's Metal wired-memory ceiling.  resolve_profile enforces

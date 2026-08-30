@@ -1,6 +1,5 @@
-# qwen3.8:27b-bare — the cloud→local failover brain (profiles/
-# local-failover-heavy.env). "bare" is the whole point: NO baked system prompt,
-# 32K window, and a model that can still call tools.
+# qwen3.8:27b-bare — an archived bare-profile recipe. "bare" means no baked
+# system prompt, a 32K window, and a model that can still call tools.
 #
 # Upgraded 2026-08-16 from qwen3.5:27b-bare. Note the version jump skips 3.7:
 # Qwen never shipped a 3.7 on Ollama, the library goes 3.5 → 3.6 → 3.8, so
@@ -19,14 +18,14 @@
 # THIS DIRECTORY EXISTS TO STAY OUT OF ../build.sh's GLOB, and that is not
 # theoretical. build.sh appends prompts/claude-fable-5-system.md as a SYSTEM
 # directive to every *.Modelfile it builds and defaults to building ALL of them.
-# Measured 2026-08-06: every local qwen3.5 tag (9b, 4b, and each -64k/-128k/
-# -256k failover tier) carries 186,647 bytes — roughly 43K tokens — of baked
+# Measured 2026-08-06: local tags built through the parent script carried
+# 186,647 bytes — roughly 43K tokens — of baked
 # system prompt as a result. A subdirectory does not match `*.Modelfile`, so a
 # bare `./build.sh` cannot reach this file.
 #
 # BUILD FROM THE REGISTRY TAG, NEVER FROM A LOCAL ONE. `FROM` inherits the
-# base's SYSTEM directive, so `FROM qwen3.5:9b` produces a "bare" model carrying
-# all 43K tokens. That happened on the first attempt here and was not subtle:
+# base's SYSTEM directive, so a locally modified base can produce a "bare"
+# model carrying all 43K tokens. That happened on the first attempt here:
 # the model answered from the baked prompt's tool vocabulary, inventing a
 # `weather_fetch` tool that the request never defined. qwen3.8:27b is a pristine
 # registry pull (verified: `ollama show --system` returns 0 bytes), so this tag

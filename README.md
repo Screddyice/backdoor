@@ -601,16 +601,19 @@ Profiles whose window assumes bare mode now say so:
 ROUTE_BARE=true
 ```
 
-Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwen-9b` backs the `fusion-qwen` subagent, which needs its system prompt and its tools to do anything at all. Stripping every named route would break that quietly.
+Set it only on profiles whose windows assume a stripped prompt. The 64K
+`qwen-fast` route retains its system prompt and tools.
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
 | `qwen` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | 32K | yes |
 | `qwen38-obliterated` | `local-qwen38-obliterated` | the same tier, named directly | 32K | yes |
 | `qwen38-action` | `local-qwen38-action` | action-tuned MLX rollback | 64K | yes |
-| `qwen-stock` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
-| `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
+
+The `qwen-9b` and `qwen-stock` routes were removed with the local Qwen 3.5 9B
+artifacts. The terminal `fusion-qwen` agent now uses `qwen-fast` for its local
+orchestration step; the verifier council keeps its separate models.
 
 Stripping reuses the `failover_*` keep-list and truncation budget, so both paths build the same request shape. A route that stripped differently from failover would be a second behaviour to keep in sync for no gain.
 
@@ -643,7 +646,6 @@ Claude Code does not recognise the model name `qwen`, so it falls back to assumi
 The wrapper now states the real window before launching:
 
 ```
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-heavy
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-qwen38-obliterated
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
 ```
@@ -713,7 +715,6 @@ The wrapper warms its tier at launch so the first turn skips the cold load, then
 | Profile | `keep_alive` |
 |---|---|
 | `local-qwen38-obliterated` | **10m** |
-| `local-failover-heavy` | **10m** |
 | `local-qwen38-action` | n/a, not an Ollama tag |
 | every other profile | 30m |
 
@@ -794,7 +795,6 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 
 | Tier | Params | On disk | Resident | Tools | Notes |
 |---|---|---|---|---|---|
-| `qwen3.5:9b-64k` | 9B | 6.6 GB | ~10-12 GB | yes | Default heavy tier since 2026-08-25 |
 | `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Removed 2026-08-25 to free disk. Modelfile kept; see below |
 | `qwen3.5:27b-bare` | 27.8B | 17.4 GB | 23 GB | yes | Predecessor, removed 2026-08-16 |
 | `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
@@ -833,19 +833,20 @@ The 27B GGUF and the 27B MLX server cannot share memory safely. Before the route
 
 Qwen3.8-27B Action-Abliterated comes from `ajsai47/qwen38-action-abliterated-research`: a pinned Qwen3.8-27B checkpoint trained on action contracts, then put through a bounded refusal-direction ablation. Its model card records a 92.5% HarmBench direct-request attack-success rate, and StrongREJECT assistance on forbidden prompts at 87.22% against the base model's 10.54%. Capability held flat, with 62.50% on a frozen 280-item MMLU-Pro sample, matching upstream.
 
-From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. `qwen38-action` still names this checkpoint directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
+From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. `qwen38-action` still names this checkpoint directly.
 
 Read the model card before you lean on it. Reduced refusal is not permission, and it says so itself: the card puts unsupervised execution with destructive, financial, credential, or otherwise high-impact tools out of scope, and this wiring puts the model on exactly those paths. Failover fires with nobody watching, and `local-worker` gets dispatched with Bash and Write. Scoped tool permissions and reading what an unattended agent actually did are the controls now, because the model is no longer one of them.
 
 #### It is the one tier nothing loads lazily
 
-Every other local tier is an Ollama tag that loads on first request and gets evicted on a timer. This one is a launchd job holding about 19GB, up or absent, with nothing in between. Pointing failover at a tier that cannot start itself would break the fallback in the one situation it exists for, so `src/proxy/mlx_admin.py` probes `127.0.0.1:8080/health`, runs `launchctl kickstart` when it finds nothing, and waits up to 90 seconds for the weights to load. When the server will not come up, the request goes to `local-failover-heavy` and the log says so:
+Every other local tier is an Ollama tag that loads on first request and gets evicted on a timer. This one is a launchd job holding about 19GB, up or absent, with nothing in between. Pointing failover at a tier that cannot start itself would break the fallback in the one situation it exists for, so `src/proxy/mlx_admin.py` probes `127.0.0.1:8080/health`, runs `launchctl kickstart` when it finds nothing, and waits up to 90 seconds for the weights to load. When the server will not come up, the request goes to `local-fast`:
 
 ```
-⇢ MLX FALLBACK [local-qwen38-action → local-failover-heavy] /v1/messages
+⇢ MLX FALLBACK [local-qwen38-action → local-fast] /v1/messages
 ```
 
-That fallback is why `local-failover-heavy` still exists. Deleting it because `qwen` points elsewhere now would leave an offline host with no answer at all.
+The 4B fast tier loads through Ollama on demand and leaves enough memory
+headroom for recovery after an MLX startup failure.
 
 Ollama cannot evict this server either, so `qwen38 stop` before an `llmjury solve` run rather than letting a 19GB server and a 21GB council fight over a 36GB host.
 
@@ -958,32 +959,14 @@ Build from the **registry** tag, never from a local one. `modelfiles/build.sh` a
 
 Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` cannot glob. Check any new tag with `ollama show --system <tag>`, which must return nothing.
 
-#### The base tags were poisoned, which made that check lie
+#### Protect upstream base tags
 
-`build.sh` derives its tag from the filename with the first `-` turned into `:`, so `qwen3.5-9b.Modelfile` built **`qwen3.5:9b`** — the exact name `ollama pull` uses for the pristine base. It overwrote the registry pull with a prompt-baked copy, and from then on every `FROM qwen3.5:9b` in this directory inherited 43K tokens.
-
-That is the same inheritance bug described above, but far harder to see: the Modelfile you read has no `SYSTEM` line anywhere in it, and neither does the one it inherits from. Only the tag does.
-
-Found 2026-08-16 with `ollama show --system qwen3.5:9b` returning 186,647 bytes where it should return 0. `qwen3.5:4b` was poisoned the same way. Both are fixed, and the repair is cheap because only the manifest differs:
-
-```
-ollama pull qwen3.5:9b     # 4 seconds — the model blob was already on disk
-```
-
-`build.sh` now refuses any tag with no suffix after the colon, so it cannot happen again. If you want a persona build of a base model, give it a variant name (`qwen3.5:9b-fable`), which is the convention `llama3.1:8b-fable` and `gemma3:12b-fable` already follow.
+`build.sh` derives its tag from the filename with the first `-` turned into `:`.
+A file without a variant suffix can overwrite the matching upstream registry
+tag with a prompt-baked manifest. The build script rejects those filenames.
+Give persona builds a suffixed tag such as `*-fable`.
 
 **`SYSTEM ""` does not undo it.** Rebuilding `FROM` a poisoned base with an empty `SYSTEM` still reports 186,647 bytes. The base itself has to be re-pulled.
-
-#### `qwen3.5:9b-64k` is built bare
-
-Listed in `build.sh`'s `BARE_TAGS`. The baked prompt only applies when a request sends no system message, and both consumers of this tag (`/model qwen-9b`, the `fusion-qwen` subagent) always send one, so it bought them nothing. The one thing it could have served, bare `ollama run`, was unusable on a 9B:
-
-| | prompt tokens | wall clock |
-|---|---|---|
-| With baked prompt | 43,092 | 8+ min, then `500` |
-| Built bare | 12 | 2.4 s |
-
-The 4B tiers keep theirs, since bare usage there completes.
 
 ### When `ollama pull` will not finish
 

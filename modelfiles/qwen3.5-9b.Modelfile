@@ -1,8 +1,0 @@
-# qwen3.5:9b — base tag rebuilt in place to carry the shared default system
-# prompt (prompts/claude-fable-5-system.md, ~43K tokens), with num_ctx 65536
-# so the prompt actually fits (the Ollama server default is 32K). FROM
-# resolves to the existing local manifest, so this is a manifest-only rebuild.
-# NOTE: `ollama pull qwen3.5:9b` overwrites this manifest — rerun build.sh after.
-# Build: modelfiles/build.sh qwen3.5-9b.Modelfile
-FROM qwen3.5:9b
-PARAMETER num_ctx 65536

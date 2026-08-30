@@ -152,11 +152,10 @@ async def test_the_users_actual_question_survives(routed_app):
 
 
 async def test_route_without_route_bare_is_left_alone(routed_app):
-    """The 64K tiers (`qwen-fast`, `qwen-9b`) must NOT be stripped.
+    """The 64K `qwen-fast` tier must NOT be stripped.
 
     Blanket-stripping every MODEL_ROUTES hit would silently delete the system
-    prompt and MCP tools out from under the fusion subagent, which is a worse
-    bug than the one being fixed.
+    prompt and MCP tools out from under callers that selected the full profile.
     """
     app, recorder, monkeypatch = routed_app
     _pin(monkeypatch, route_bare=False)
