@@ -75,6 +75,8 @@ def _harness_request(model: str = "qwen") -> dict:
         "tools": [
             {"name": "Bash", "description": "run a command", "input_schema": {}},
             {"name": "Read", "description": "read a file", "input_schema": {}},
+            {"name": "WebSearch", "description": "search the web", "input_schema": {}},
+            {"name": "WebFetch", "description": "fetch a URL", "input_schema": {}},
             {"name": "mcp__plugin_mem0_mem0__search_memories",
              "description": "recall", "input_schema": {}},
         ],
@@ -117,8 +119,10 @@ async def test_explicit_route_arrives_stripped(routed_app):
     assert "Z" * 5000 not in sent, "80KB tool result survived the strip"
 
     names = [t.get("function", {}).get("name", "") for t in (recorder.payload.get("tools") or [])]
-    assert "Bash" in names and "Read" in names, names
+    assert {"Bash", "Read", "WebSearch", "WebFetch"}.issubset(names), names
     assert not any(n.startswith("mcp__") for n in names), names
+    assert "When current information would improve the answer" in sent
+    assert "lost its network connection" not in sent
 
 
 async def test_explicit_route_externalizes_large_fetched_page(routed_app):

@@ -267,7 +267,7 @@ All in `src/proxy/`, committed to the Screddyice/backdoor repo:
 6. **`client.py` — upstream read timeout 120s → 600s.** 120s killed any
    prefill over 2 minutes (this was the actual source of the kill/retry loop).
 
-## MCP defaults: OFF in every mode
+## MCP servers attach per request
 
 MCP tool schemas are huge — **~142K tokens** for this machine's global
 `~/.claude.json` set, and even the curated stack overflows the 64K window. That
@@ -275,9 +275,20 @@ giant schema prefill was half of why full mode crawled, so **MCP is OFF by
 default in all modes** (`--strict-mcp-config --mcp-config ~/backdoor/empty-mcp.json`),
 which also keeps full mode truly offline.
 
-Opt in with `QWEN_MCP=1` — but switch `PROVIDER_MODEL` to a bigger-context tag
-first (`qwen3.5:9b-256k`), since the schemas don't fit 64K. `QWEN_MCP_SERVERS=a,b,c`
-picks which servers to load (no default — set it to the servers you want).
+Keep the default session lean, then attach only the server needed for a request:
+
+```bash
+qwen mcp list
+qwen mcp screddy-hermes -p "check the requested conversation"
+qwen mcp composio-tmn,atlassian
+```
+
+The wrapper validates names against `~/.claude.json` and enables the selected
+servers only when its certificate-verifying internet probe succeeds. The
+compact Cognee memory shim stays attached when Cognee is enabled. Missing
+names fail before Qwen starts. An offline Mac skips the MCP connection and
+continues with local tools. The environment form remains available for scripts:
+`QWEN_MCP=1 QWEN_MCP_SERVERS=a,b qwen`.
 
 ## Full harness is the default (lean is the speed escape hatch)
 
@@ -329,7 +340,7 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
 - `QWEN_LEAN=1 qwen` / `qwen lean` — minimal prompt, no auto hooks.
 - `QWEN_FULL=1 qwen` — force full mode (e.g. `QWEN_FULL=1 qwen fast`).
 - `QWEN_MCP=0 qwen`  — drop global MCP servers (true-offline full mode).
-- `QWEN_MCP=1 qwen lean` — force MCP on in lean/fast modes.
+- `qwen mcp NAME lean` — attach one named MCP server in lean mode.
 
 ## Performance reality (local Qwen3.5, full harness)
 

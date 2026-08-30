@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# qwen: launch Claude Code against a fully offline local Qwen model.
+# qwen: launch Claude Code against a local Qwen model.
 # (alias: claude-local)
 #
 #   Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
 #
-# Everything runs on-device. No internet required once models are pulled.
+# Inference runs on-device. Local work remains available without internet;
+# WebSearch, WebFetch, and public HTTP calls can use a live connection.
 #
 # Modes (default changed 2026-08-28 to the obliterated 27B GGUF):
 #   qwen            LEAN (default, 2026-07-09). Minimal prompt (~945 tok) on
@@ -25,6 +26,9 @@
 #   qwen fast       Lean on Qwen3.5 4B @ 64K — the snappiest local brain, and
 #                   the escape hatch when the 27B is too heavy or too slow.
 #                   (qwen coder / qwen2.5-coder removed 2026-07-04.)
+#   qwen mcp NAME   Attach only the named ~/.claude.json MCP server for this
+#                   session. NAME may be a comma-separated list. Use
+#                   `qwen mcp list` to see valid names.
 #   qwen [args...]  Extra args pass straight through to `claude`.
 #
 # The launch banner prints the resolved model — read it if you are unsure which
@@ -52,19 +56,59 @@
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"   # bd + claude live here
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+if [ -f "$SCRIPT_DIR/local/qwen-mcp-config.py" ]; then
+  QWEN_SOURCE="$SCRIPT_DIR"
+else
+  QWEN_SOURCE="$HOME/backdoor"
+fi
+QWEN_MCP_HELPER="$QWEN_SOURCE/local/qwen-mcp-config.py"
+
 PROFILE=""    # empty = derive from the FINAL mode below
 MODE="lean"   # default flipped full→lean 2026-07-09 (offline responsiveness)
+MCP_REQUESTED=""
 # Leading mode keywords (consume them; rest passes to claude).
 while :; do
   case "${1:-}" in
     lean) MODE="lean"; shift ;;
     fast) PROFILE="local-fast"; MODE="lean"; shift ;;
     full) MODE="full"; shift ;;
+    mcp)
+      shift
+      if [ "${1:-}" = "list" ]; then
+        python3 "$QWEN_MCP_HELPER" list
+        exit 0
+      fi
+      [ -n "${1:-}" ] || {
+        echo "Usage: qwen mcp SERVER[,SERVER...] [lean|fast|full] [claude args...]" >&2
+        echo "Run 'qwen mcp list' to see configured server names." >&2
+        exit 2
+      }
+      MCP_REQUESTED="$1"
+      shift
+      ;;
     *) break ;;
   esac
 done
 [ "${QWEN_FULL:-0}" = "1" ] && MODE="full"
 [ "${QWEN_LEAN:-0}" = "1" ] && MODE="lean"
+
+if [ -n "$MCP_REQUESTED" ]; then
+  python3 "$QWEN_MCP_HELPER" validate --servers "$MCP_REQUESTED"
+  QWEN_MCP=1
+  QWEN_MCP_SERVERS="$MCP_REQUESTED"
+
+  # Use the router's certificate-verifying reachability probe. A targeted MCP
+  # request should not hold startup open on SSH/HTTP timeouts when the Mac is
+  # offline. QWEN_MCP_ASSUME_ONLINE is an operator escape hatch for networks
+  # whose policy blocks both public probe endpoints while allowing the MCP.
+  if [ "${QWEN_MCP_ASSUME_ONLINE:-0}" != "1" ] && ! \
+      python3 "$QWEN_MCP_HELPER" online; then
+    echo "qwen: internet unavailable; requested MCP skipped for this session" >&2
+    QWEN_MCP=0
+    QWEN_MCP_SERVERS=""
+  fi
+fi
 
 # Resolve the profile from the FINAL mode, so env overrides that flip the mode
 # (QWEN_FULL/QWEN_LEAN) cannot leave a profile that contradicts it. `fast` is
@@ -181,7 +225,9 @@ MCP_ARGS=()
 # an empty MCP config below, so a genuinely offline run still works. Set
 # QWEN_COGNEE=0 to force it off (true-offline, zero network calls).
 COGNEE_DEFAULT=1
-if [ "${QWEN_COGNEE:-${QWEN_MEM0:-$COGNEE_DEFAULT}}" = "1" ] && [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
+COGNEE_ENABLED="${QWEN_COGNEE:-${QWEN_MEM0:-$COGNEE_DEFAULT}}"
+COGNEE_SHIM=""
+if [ "$COGNEE_ENABLED" = "1" ]; then
   if [ -n "${QWEN_MEM0:-}" ] && [ "${QWEN_MEM0:-0}" = "1" ] && [ -z "${QWEN_COGNEE:-}" ]; then
     echo "qwen: QWEN_MEM0 is deprecated (Mem0 retired 2026-08-20) — using Cognee; set QWEN_COGNEE=1" >&2
   fi
@@ -198,6 +244,10 @@ if [ "${QWEN_COGNEE:-${QWEN_MEM0:-$COGNEE_DEFAULT}}" = "1" ] && [ "${QWEN_MCP:-$
     source "$HOME/projects/.env"
     set +a
   fi
+  [ -n "${COGNEE_API_KEY:-}" ] && COGNEE_SHIM="$HOME/.claude/scripts/cognee-mcp-shim.py"
+fi
+
+if [ "$COGNEE_ENABLED" = "1" ] && [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
   if [ -n "${COGNEE_API_KEY:-}" ]; then
     COGNEE_MCP_CONF="$HOME/.cache/backdoor/qwen-cognee-mcp.json"
     mkdir -p "$(dirname "$COGNEE_MCP_CONF")"
@@ -237,21 +287,10 @@ else
   mkdir -p "$(dirname "$MCP_CONF")"
   # umask 077 so the file is created 600 from its first byte (see the Mem0
   # branch above for why the chmod below stays as a backstop, not a duplicate).
-  (
-    umask 077
-    QWEN_MCP_SERVERS="${QWEN_MCP_SERVERS:-}" \
-      python3 - "$MCP_CONF" <<'PY'
-import json, os, sys
-cfg = json.load(open(os.path.expanduser('~/.claude.json')))
-names = [n.strip() for n in os.environ['QWEN_MCP_SERVERS'].split(',') if n.strip()]
-avail = cfg.get('mcpServers', {})
-servers = {n: avail[n] for n in names if n in avail}
-missing = [n for n in names if n not in avail]
-if missing:
-    print(f"qwen: WARNING — MCP servers not in ~/.claude.json, skipped: {', '.join(missing)}", file=sys.stderr)
-json.dump({'mcpServers': servers}, open(sys.argv[1], 'w'), indent=2)
-PY
-  )
+  COGNEE_BUILD_ARGS=()
+  [ -n "$COGNEE_SHIM" ] && COGNEE_BUILD_ARGS=(--cognee-shim "$COGNEE_SHIM")
+  python3 "$QWEN_MCP_HELPER" build --servers "${QWEN_MCP_SERVERS:-}" \
+    --output "$MCP_CONF" ${COGNEE_BUILD_ARGS[@]+"${COGNEE_BUILD_ARGS[@]}"}
   chmod 600 "$MCP_CONF"
   MCP_ARGS=(--strict-mcp-config --mcp-config "$MCP_CONF")
 fi
@@ -294,6 +333,9 @@ if [ "$MODE" = "full" ]; then
   # AUTO-HOOK mode: enable harness + claude-mem + ralph-loop (and their hooks),
   # disable the other heavy plugins so the prompt (~29K) stays manageable.
   EXTRA_ARGS=(--settings "$HOME/backdoor/hook-mode.settings.json")
+  if [ -n "${QWEN_MCP_SERVERS:-}" ]; then
+    EXTRA_ARGS+=(--append-system-prompt "MCP servers attached for this session: ${QWEN_MCP_SERVERS}. Use only the attached MCP tools needed for the request.")
+  fi
   MODE_NOTE="full-hooks(harness)"
 else
   # LEAN mode: --bare skips the heavy plugin/hook auto-injection (~30K tokens);
@@ -318,7 +360,16 @@ else
   # system-prompt` takes the text inline; there is no `-file` form despite what
   # the --bare help text implies.
   PR_RULES="$HOME/backdoor/prompts/qwen-pr-rules.md"
-  [ -f "$PR_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$(cat "$PR_RULES")")
+  ONLINE_RULES="$HOME/backdoor/prompts/qwen-online-tools.md"
+  LEAN_RULES=""
+  [ -f "$PR_RULES" ] && LEAN_RULES="$(cat "$PR_RULES")"
+  if [ -f "$ONLINE_RULES" ]; then
+    LEAN_RULES="${LEAN_RULES}${LEAN_RULES:+$'\n\n'}$(cat "$ONLINE_RULES")"
+  fi
+  if [ -n "${QWEN_MCP_SERVERS:-}" ]; then
+    LEAN_RULES="${LEAN_RULES}${LEAN_RULES:+$'\n\n'}MCP servers attached for this session: ${QWEN_MCP_SERVERS}. Use only the attached MCP tools needed for the request."
+  fi
+  [ -n "$LEAN_RULES" ] && EXTRA_ARGS+=(--append-system-prompt "$LEAN_RULES")
 
   MODE_NOTE="lean"
 fi

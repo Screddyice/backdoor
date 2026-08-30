@@ -123,6 +123,8 @@ async def test_failed_over_request_arrives_stripped(offline_app):
     names = [t.get("function", {}).get("name", "") for t in (recorder.payload.get("tools") or [])]
     assert "Bash" in names and "Read" in names, names
     assert not any(n.startswith("mcp__") for n in names), names
+    assert "lost its network connection" in sent
+    assert "When current information would improve the answer" not in sent
 
 
 async def test_the_users_actual_question_survives(offline_app):
@@ -301,7 +303,9 @@ async def test_profile_mode_runs_the_runtime_interlock_before_provider_call(monk
         provider_base_url="http://127.0.0.1:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
         runtime_profile="local-qwen38-obliterated",
-        route_max_input_tokens=27_000,
+        # This test isolates runtime supervision. Tier escalation has separate
+        # coverage and would replace the runtime profile before this assertion.
+        route_max_input_tokens=0,
     )
     try:
         resp = await _post(app, _route_request(turns=1))
