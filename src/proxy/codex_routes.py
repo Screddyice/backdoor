@@ -302,6 +302,12 @@ async def _release_claims(breaker: FailoverBreaker) -> None:
             await ollama_admin.unload(base_url, model)
 
 
+def _is_reasoning_type(value: object) -> bool:
+    return isinstance(value, str) and (
+        value == "reasoning" or value.startswith("reasoning_")
+    )
+
+
 def _sanitize_local_sse_frame(
     frame: bytes,
     dropped_indices: set[int],
@@ -325,10 +331,8 @@ def _sanitize_local_sse_frame(
     item_id = payload.get("item_id")
     part = payload.get("part")
     reasoning_event = event_type.startswith("response.reasoning")
-    reasoning_item = isinstance(item, dict) and item.get("type") == "reasoning"
-    reasoning_part = (
-        isinstance(part, dict) and str(part.get("type") or "").startswith("reasoning")
-    )
+    reasoning_item = isinstance(item, dict) and _is_reasoning_type(item.get("type"))
+    reasoning_part = isinstance(part, dict) and _is_reasoning_type(part.get("type"))
     if (
         reasoning_event
         or reasoning_item
@@ -351,7 +355,8 @@ def _sanitize_local_sse_frame(
         filtered = [
             value
             for value in output
-            if not isinstance(value, dict) or value.get("type") != "reasoning"
+            if not isinstance(value, dict)
+            or not _is_reasoning_type(value.get("type"))
         ]
         if len(filtered) != len(output):
             response["output"] = filtered
@@ -386,10 +391,8 @@ def _sanitize_local_json_value(value):
     if isinstance(value, list):
         sanitized = []
         for child in value:
-            if isinstance(child, dict):
-                child_type = str(child.get("type") or "")
-                if child_type == "reasoning" or child_type.startswith("reasoning_"):
-                    continue
+            if isinstance(child, dict) and _is_reasoning_type(child.get("type")):
+                continue
             sanitized.append(_sanitize_local_json_value(child))
         return sanitized
     if isinstance(value, dict):

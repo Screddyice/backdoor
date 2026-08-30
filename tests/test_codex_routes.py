@@ -1068,6 +1068,27 @@ def test_local_sse_sanitizer_reindexes_multiple_reasoning_items():
     assert b'"output_index":2' in final
 
 
+@pytest.mark.parametrize("item_type", ["reasoning_summary", "reasoning_text"])
+def test_local_sse_sanitizer_drops_reasoning_type_variants(item_type):
+    payload = {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {"id": "rs_variant", "type": item_type},
+    }
+    frame = b"data: " + json.dumps(payload).encode() + b"\n\n"
+    dropped_indices = set()
+    dropped_item_ids = set()
+
+    assert (
+        codex_routes._sanitize_local_sse_frame(
+            frame, dropped_indices, dropped_item_ids
+        )
+        == b""
+    )
+    assert dropped_indices == {0}
+    assert dropped_item_ids == {"rs_variant"}
+
+
 def test_local_sse_sanitizer_preserves_guard_frames_byte_for_byte():
     dropped_indices = set()
     dropped_item_ids = set()
