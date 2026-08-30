@@ -370,7 +370,13 @@ Install it against the signed application bundle:
 uv run python local/patch-codex-desktop-offline.py
 ```
 
-The installer validates the `com.openai.codex` bundle, requires one known renderer expression, creates and verifies a complete versioned application backup, changes the ASAR in place without moving offsets, and ad-hoc signs and verifies the result. It serializes concurrent installs and restores the complete original application after any patch or signing failure. Restart Codex Desktop after installation. OpenAI application updates replace the patched bundle, so rerun the installer after an update until the upstream app distinguishes offline token errors from logout.
+The installer validates the `com.openai.codex` bundle, requires one known renderer expression, and creates a verified backup for the installed version and build. It patches a staged copy without moving ASAR offsets, ad-hoc signs and verifies that copy, then swaps the complete bundle into place. A process lock serializes installs. If Codex updates during activation, the installer verifies the competing bundle before choosing whether to restore or preserve it for recovery. Restart Codex Desktop after installation. OpenAI application updates replace the patch, so rerun the installer after each update until the upstream app distinguishes offline token errors from logout.
+
+| Option | Default | Use |
+| --- | --- | --- |
+| `--app` | `/Applications/ChatGPT.app` | Patch or restore a different Codex Desktop bundle. |
+| `--backup-root` | `~/Library/Application Support/Backdoor/Codex Desktop Backups` | Store full-bundle and ASAR backups elsewhere. |
+| `--restore` | Off | Restore the verified original bundle for the installed version and build. |
 
 Changing the bundle replaces OpenAI's publisher signature with an ad-hoc signature. Structural signature verification still passes, but macOS no longer sees OpenAI's original designated requirement or TeamIdentifier. After restarting, confirm that Codex Desktop launches, stays signed in, and can read its existing tasks before testing an outage. If launch, login, or Keychain access fails, restore the signed bundle:
 
