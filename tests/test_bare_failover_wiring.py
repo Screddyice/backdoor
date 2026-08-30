@@ -241,7 +241,7 @@ async def test_profile_mode_oversized_session_escalates(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:9b-64k",
+        provider_model="qwen3.5:4b-64k",
         route_max_input_tokens=28_000,
     )
     try:
@@ -267,7 +267,7 @@ async def test_profile_mode_normal_session_stays_put(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:9b-64k",
+        provider_model="qwen3.5:4b-64k",
         route_max_input_tokens=28_000,
     )
     try:
@@ -394,14 +394,14 @@ def test_memory_injected_for_local_provider(monkeypatch):
 
     monkeypatch.setattr(translate, "_hoist_system_messages", lambda m: m)
     import src.proxy.memory as memory
-    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["the 27B tier is qwen3.5:9b-64k"])
+    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["the fast tier is qwen3.5:4b-64k"])
 
     out = translate._inject_memory(
         [{"role": "system", "content": "You are offline."}, {"role": "user", "content": "which tier?"}],
         _mem_settings(),
     )
     assert memory.BLOCK_OPEN in out[0]["content"]
-    assert "qwen3.5:9b-64k" in out[0]["content"]
+    assert "qwen3.5:4b-64k" in out[0]["content"]
     assert "You are offline." in out[0]["content"], "the real system prompt must survive"
 
 
