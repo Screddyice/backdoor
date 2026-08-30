@@ -218,9 +218,23 @@ async def _cloud_body(
         breaker.record_failure(type(exc).__name__)
         raise
     else:
-        was_open = breaker.open
-        breaker.record_success()
-        if was_open:
+        # Reachability is NOT credited here — `codex_route` already did that the
+        # moment the response headers arrived. What is deliberately held back to
+        # this point is releasing the local tier, because the two questions have
+        # different answers:
+        #
+        #   "Is ChatGPT reachable?"      answered by the headers.
+        #   "Is the qwen tier spare?"    answered only by a stream that finished.
+        #
+        # A probe whose stream dies mid-flight is about to be retried, and
+        # unloading the tier that will serve that retry only buys a reload — see
+        # test_half_open_stream_failure_keeps_breaker_open_and_qwen_claimed.
+        #
+        # `not breaker.open` rather than a captured `was_open`: by the time this
+        # runs the breaker is normally already closed (headers did it), so the
+        # question that matters is whether it is closed NOW, not whether this
+        # particular response is the one that closed it.
+        if not breaker.open:
             await _release_claims(breaker)
 
 
@@ -713,4 +727,24 @@ async def codex_responses(
     )
     if not failover_enabled:
         return _relay_passthrough(response)
+    # Credit reachability HERE, on the headers, exactly as the Anthropic path
+    # does (see routes.py `_try_upstream`) — not at the end of the relayed
+    # stream.
+    #
+    # Recording it at the end of the stream is what pinned Codex to a local 27B
+    # for 19 minutes on 2026-08-30. A blip opened the breaker at 23:09:48; the
+    # half-open probes at 23:13:46 and 23:15:23 both reached ChatGPT and logged
+    # `path=cloud status=200`, and the breaker still never closed — because the
+    # client hung up before the body finished, and a client disconnect closes
+    # this generator with GeneratorExit at the `yield`. That runs NEITHER the
+    # `except httpx.TransportError` branch nor the `else`, so a demonstrably
+    # successful probe was silently discarded. Worse, a client that hangs up
+    # before the first chunk leaves the generator never started at all, so no
+    # amount of care inside the body can see that probe succeed.
+    #
+    # Headers are the right place on the merits too, not just for reachability:
+    # the breaker's whole question is "can this host still talk to ChatGPT", and
+    # a status line is proof that it can. What the body is still needed for is
+    # the tier release — see `_cloud_body`.
+    breaker.record_success()
     return _relay_cloud(response, breaker)

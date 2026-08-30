@@ -1321,3 +1321,167 @@ async def test_oversized_local_instruction_is_rejected_before_cognee(
 
     assert getattr(caught.value, "status_code", None) == 413
     assert calls == []
+
+
+class HangUpStream(httpx.AsyncByteStream):
+    """Cloud body that dies from something other than a transport error.
+
+    The gap this covers: `_cloud_body` only recorded success in its `else`
+    branch and only recorded failure for `httpx.TransportError`. Anything
+    else — a client disconnect, a bug, a cancellation — fell between the two
+    and the probe's outcome was discarded.
+    """
+
+    async def __aiter__(self):
+        yield b'event: response.created\ndata: {"type":"response.created"}\n\n'
+        raise RuntimeError("client hung up")
+
+    async def aclose(self):
+        return None
+
+
+def _half_open_codex_breaker(tmp_path, now):
+    """An OPEN codex breaker holding a qwen claim, with its probe window due."""
+    breaker = one_shot_breaker(tmp_path, now_fn=lambda: now["value"])
+    assert breaker.record_failure("ConnectError") is True
+    breaker.note_claim("http://127.0.0.1:11434/v1", "qwen3.8:27b-obliterated")
+    now["value"] += 61
+    return breaker
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_closes_breaker_when_the_stream_never_completes(
+    codex_app, monkeypatch, tmp_path
+):
+    """A probe that reached ChatGPT must close the breaker even if the body dies.
+
+    Regression for 2026-08-30: a blip opened the codex breaker at 23:09:48 and
+    it was still open 19 minutes later, having logged `path=cloud status=200`
+    twice at 23:13:46 and 23:15:23. Both probes reached ChatGPT; neither closed
+    the breaker, because success was credited only after a fully relayed
+    stream. Codex answered from a local 27B for 309s and 385s while the cloud
+    was fine.
+    """
+    app, settings, _ = codex_app
+    now = {"value": 1_000.0}
+    breaker = _half_open_codex_breaker(tmp_path, now)
+    monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
+
+    def cloud(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=HangUpStream(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    unloaded = []
+
+    async def unload(base_url, model):
+        unloaded.append((base_url, model))
+        return True
+
+    monkeypatch.setattr(codex_routes.ollama_admin, "unload", unload)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+
+    with pytest.raises((RuntimeError, ExceptionGroup)):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+        ) as client:
+            await client.post(
+                "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+            )
+
+    # Reachability was proven by the status line, so the next Codex turn goes to
+    # the cloud instead of waiting out another probe interval on a local 27B.
+    assert breaker.open is False
+    # The tier stays claimed: this stream did not finish, so the retry that
+    # follows may still need it. Unloading now would only buy a reload.
+    assert unloaded == []
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_closes_breaker_when_the_client_disconnects(
+    codex_app, monkeypatch, tmp_path
+):
+    """The real 2026-08-30 shape: the client hangs up while the body streams.
+
+    Driven at the ASGI layer on purpose. httpx's ASGITransport always runs the
+    app to completion, so it cannot express a disconnect — and a disconnect is
+    precisely the case that used to be lost, since closing the generator raises
+    GeneratorExit at the `yield` and runs neither `except` nor `else`.
+    """
+    app, settings, _ = codex_app
+    now = {"value": 1_000.0}
+    breaker = _half_open_codex_breaker(tmp_path, now)
+    monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
+
+    def cloud(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=BytesStream(SSE.replace(b"resp_local", b"resp_cloud")),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+
+    payload = FIXTURE.read_bytes()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.1"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/backend-api/codex/responses",
+        "raw_path": b"/backend-api/codex/responses",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"backdoor.test"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+        "client": ("127.0.0.1", 51234),
+        "server": ("backdoor.test", 80),
+    }
+
+    # Starlette watches for a disconnect by polling `receive`, so it has to
+    # block after the request body rather than answer in a loop.
+    delivered = False
+    still_connected = asyncio.Event()
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await still_connected.wait()  # never set: the poll just parks here
+        return {"type": "http.disconnect"}
+
+    started = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            started.append(message["status"])
+            return
+        # First byte of the body is where the client goes away.
+        raise RuntimeError("client disconnected")
+
+    with pytest.raises((RuntimeError, ExceptionGroup)):
+        await app(scope, receive, send)
+
+    assert started == [200]
+    assert breaker.open is False
