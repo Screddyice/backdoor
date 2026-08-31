@@ -1,0 +1,73 @@
+#!/bin/bash
+# Restart the backdoor router with the smallest possible client impact.
+#
+# Every user-visible outage of this system on 2026-08-31 was a restart:
+#   kickstart -k (SIGKILL)  killed in-flight streams -> "Connection lost mid-response"
+#   bare kill TERM          closed the listener for the whole unbounded drain
+#                           -> "[Errno 61] Connection refused" for ~90s
+#
+# So this script (1) waits for the router to be IDLE before acting, because a
+# restart nobody is streaming through is invisible, and (2) sends SIGTERM, whose
+# drain serve.py now bounds at 20s. launchd's KeepAlive respawns the process.
+#
+#   bd-restart            wait up to 10 min for idle, then TERM
+#   bd-restart --now      skip the idle wait (drain still bounded)
+#   bd-restart --force    SIGKILL escape hatch for a wedged process
+set -euo pipefail
+
+LABEL="com.screddy.backdoor-router"
+WAIT_SECS="${BD_RESTART_MAX_WAIT:-600}"
+mode="idle"
+case "${1:-}" in
+  --now)   mode="now" ;;
+  --force) mode="force" ;;
+  "" )     ;;
+  * ) echo "usage: bd-restart [--now|--force]" >&2; exit 2 ;;
+esac
+
+pid=$(lsof -nP -iTCP:8083 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)
+if [ -z "$pid" ]; then
+  echo "no listener on :8083 — starting via launchd"
+  launchctl kickstart "gui/$(id -u)/$LABEL"
+  exit 0
+fi
+
+# In-flight work = ESTABLISHED connections into 8083/8084 held by the router.
+inflight() {
+  lsof -nP -a -p "$1" -iTCP -sTCP:ESTABLISHED 2>/dev/null \
+    | awk '$9 ~ /:(8083|8084)->/ {n++} END {print n+0}'
+}
+
+if [ "$mode" = "idle" ]; then
+  deadline=$((SECONDS + WAIT_SECS))
+  while :; do
+    n=$(inflight "$pid")
+    [ "$n" -eq 0 ] && { echo "idle — restarting"; break; }
+    if [ $SECONDS -ge $deadline ]; then
+      echo "still $n connection(s) after ${WAIT_SECS}s — restarting anyway (drain is bounded at 20s)"
+      break
+    fi
+    printf '\r%d in-flight connection(s), waiting… (%ds left)' "$n" $((deadline - SECONDS))
+    sleep 5
+  done
+  echo
+fi
+
+if [ "$mode" = "force" ]; then
+  echo "SIGKILL (wedged-process escape hatch — in-flight streams WILL be truncated)"
+  launchctl kickstart -k "gui/$(id -u)/$LABEL"
+else
+  launchctl kill TERM "gui/$(id -u)/$LABEL"
+fi
+
+# Wait for the replacement to come up and prove it serves.
+for _ in $(seq 1 60); do
+  if out=$(curl -fsS --max-time 2 http://127.0.0.1:8083/health 2>/dev/null); then
+    newpid=$(lsof -nP -iTCP:8083 -sTCP:LISTEN -t 2>/dev/null | head -1)
+    echo "healthy: $out (pid $pid -> ${newpid:-?})"
+    exit 0
+  fi
+  sleep 1
+done
+echo "router did not come back within 60s — check: launchctl print gui/$(id -u)/$LABEL" >&2
+exit 1

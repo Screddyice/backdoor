@@ -28,6 +28,9 @@ def test_launcher_uses_environment_and_preconfigures_logging(tmp_path, monkeypat
             "host": "127.0.0.9",
             "port": 8123,
             "log_config": None,
+            # Bounded drain: uvicorn closes the listener at the start of a
+            # SIGTERM drain, so an unbounded one is an unbounded refused window.
+            "timeout_graceful_shutdown": 20,
         }
     finally:
         clear_settings_cache()

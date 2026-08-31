@@ -43,6 +43,7 @@ participates in.
 from __future__ import annotations
 
 import asyncio
+import socket
 import contextlib
 import logging
 import ssl
@@ -192,6 +193,7 @@ class ForwardProxy:
         *,
         listen_host: str = "127.0.0.1",
         listen_port: int = 8084,
+        listen_sock: "socket.socket | None" = None,
         mitm_hosts: Iterable[str],
         router_host: str = "127.0.0.1",
         router_port: int = 8083,
@@ -201,6 +203,11 @@ class ForwardProxy:
     ) -> None:
         self.listen_host = listen_host
         self.listen_port = listen_port
+        # launchd-activated listener (socket activation). When set, start()
+        # serves on it instead of binding — launchd keeps its own reference,
+        # so this listener survives process restarts and connections queue
+        # rather than being refused while the process is down.
+        self.listen_sock = listen_sock
         self.mitm_hosts = {h.strip().lower() for h in mitm_hosts if h.strip()}
         self.router_host = router_host
         self.router_port = router_port
@@ -214,9 +221,14 @@ class ForwardProxy:
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(
-            self._accept, self.listen_host, self.listen_port
-        )
+        if self.listen_sock is not None:
+            self._server = await asyncio.start_server(
+                self._accept, sock=self.listen_sock
+            )
+        else:
+            self._server = await asyncio.start_server(
+                self._accept, self.listen_host, self.listen_port
+            )
         logger.info(
             "CONNECT forward proxy on %s:%d — intercepting %s → %s:%d",
             self.listen_host,
