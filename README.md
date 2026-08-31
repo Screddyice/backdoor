@@ -418,7 +418,7 @@ Backdoor enforces this allocation on the fresh request that it sends to Qwen:
 | Current task and active tool results | 21,000 tokens |
 | Reply reserve | 4,000 tokens |
 
-Backdoor removes extra recall, optional tools, old tool output, and attachments in that order. It never truncates the latest textual instruction. If that instruction cannot fit, Codex receives HTTP 413 with a clear error.
+Backdoor removes extra recall, optional tools, old tool output, attachments, then the oldest assistant updates and completed call/output pairs. It keeps the latest textual instruction and the newest progress from the active turn. If trimming removes every pair from a tool-only continuation, Backdoor inserts a small continuation instruction instead of sending Qwen an empty task. Codex receives HTTP 413 only when the latest textual instruction or a required tool cannot fit.
 
 Set `CODEX_LOCAL_TOOLS=` to remove all local tools. The default `local` keeps non-MCP Code Mode tools. Remote `mcp__*` namespaces stay out of the outage request because they cannot work without the network.
 

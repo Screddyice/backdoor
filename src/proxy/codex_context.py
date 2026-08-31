@@ -318,24 +318,83 @@ def _trim_active_items(
         if attachments:
             item["content"] = [part for part in content if part not in attachments]
             trimmed += len(attachments)
-    while count_text(json.dumps(items, ensure_ascii=False, separators=(",", ":"))) > budget:
-        changed = False
-        for item in items:
-            if (
-                item.get("type") == "function_call_output"
-                and item.get("output") != "[output omitted]"
-            ):
-                item["output"] = "[output omitted]"
-                trimmed += 1
-                changed = True
-                break
-        if changed:
-            continue
-        if not changed:
-            raise CodexRequestError(
-                "Active Codex turn does not fit the local context budget",
-                status_code=413,
-            )
+
+    def token_count(values: list[dict[str, Any]]) -> int:
+        return count_text(json.dumps(values, ensure_ascii=False, separators=(",", ":")))
+
+    if token_count(items) <= budget:
+        return items, trimmed
+
+    output_indices = [
+        index
+        for index, item in enumerate(items)
+        if item.get("type") == "function_call_output"
+        and item.get("output") != "[output omitted]"
+    ]
+
+    def with_omitted_outputs(count: int) -> list[dict[str, Any]]:
+        omitted = set(output_indices[:count])
+        return [
+            {**item, "output": "[output omitted]"} if index in omitted else item
+            for index, item in enumerate(items)
+        ]
+
+    if output_indices and token_count(with_omitted_outputs(len(output_indices))) <= budget:
+        low, high = 1, len(output_indices)
+        while low < high:
+            middle = (low + high) // 2
+            if token_count(with_omitted_outputs(middle)) <= budget:
+                high = middle
+            else:
+                low = middle + 1
+        items = with_omitted_outputs(low)
+        return items, trimmed + low
+
+    for output_index in output_indices:
+        items[output_index]["output"] = "[output omitted]"
+    trimmed += len(output_indices)
+
+    pairs = _paired_call_indices(items)
+    removable: list[tuple[int, tuple[int, ...]]] = []
+    for item_index, item in enumerate(items):
+        if item.get("type") == "message" and item.get("role") == "assistant":
+            removable.append((item_index, (item_index,)))
+    removable.extend(
+        (min(call_index, output_index), (call_index, output_index))
+        for output_index, call_index in pairs.items()
+    )
+    removable.sort(key=lambda candidate: candidate[0])
+
+    def without_history(count: int) -> tuple[list[dict[str, Any]], int]:
+        removed = {
+            item_index
+            for _, indices in removable[:count]
+            for item_index in indices
+        }
+        return (
+            [item for index, item in enumerate(items) if index not in removed],
+            len(removed),
+        )
+
+    if removable:
+        all_removed, _ = without_history(len(removable))
+        if token_count(all_removed) <= budget:
+            low, high = 1, len(removable)
+            while low < high:
+                middle = (low + high) // 2
+                trial, _ = without_history(middle)
+                if token_count(trial) <= budget:
+                    high = middle
+                else:
+                    low = middle + 1
+            items, removed_count = without_history(low)
+            return items, trimmed + removed_count
+
+    if token_count(items) > budget:
+        raise CodexRequestError(
+            "Active Codex turn does not fit the local context budget",
+            status_code=413,
+        )
     return items, trimmed
 
 
@@ -381,6 +440,14 @@ def build_local_payload(
     active, trimmed = _trim_active_items(
         active, latest_text, settings.codex_active_turn_budget_tokens
     )
+    if not active:
+        active = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": latest_text}],
+            }
+        ]
 
     memory_lines, memory_tokens = _bounded_memories(
         memories, settings.codex_memory_budget_tokens

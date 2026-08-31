@@ -398,6 +398,27 @@ def test_build_local_payload_accepts_a_paired_tool_continuation_without_user_tex
     assert "pwd" not in extract_recall_query(cloud)
 
 
+def test_trimmed_tool_continuation_keeps_a_synthetic_instruction():
+    cloud = load_request()
+    cloud["input"] = cloud["input"][-2:]
+    cloud["input"][0]["arguments"] = json.dumps({"source": "x" * 8_000})
+    cloud["input"][1]["output"] = "y" * 20_000
+    settings = Settings(
+        codex_context_window=1_000,
+        codex_reply_reserve_tokens=300,
+        codex_system_budget_tokens=100,
+        codex_memory_budget_tokens=100,
+        codex_tools_budget_tokens=100,
+        codex_active_turn_budget_tokens=100,
+    )
+
+    local, budget = build_local_payload(cloud, [], settings)
+
+    assert "Continue after local tool calls: exec" in content_text(local)
+    assert "call_local" not in json.dumps(local)
+    assert budget.input_tokens <= 700
+
+
 def test_attachment_only_latest_user_turn_never_falls_back_to_older_text():
     cloud = load_request()
     cloud["input"].append(
@@ -428,6 +449,76 @@ def test_active_turn_trimming_omits_old_tool_output_before_new_output():
     assert count == 1
     assert trimmed[2]["output"] == "[output omitted]"
     assert "NEW" in trimmed[4]["output"]
+
+
+def test_build_local_payload_prunes_stale_same_turn_history_before_413():
+    cloud = load_request()
+    active = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "continue the approved plan"},
+            ],
+        }
+    ]
+    for index in range(24):
+        active.extend(
+            [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": f"stale-checkpoint-{index} " + "review " * 80,
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": f"call-{index}",
+                    "name": "exec",
+                    "arguments": json.dumps(
+                        {"source": f"stale-command-{index} " + "x" * 800}
+                    ),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": f"call-{index}",
+                    "output": f"stale-output-{index} " + "y" * 2_000,
+                },
+            ]
+        )
+    active.append(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "current checkpoint survives"},
+            ],
+        }
+    )
+    cloud["input"] = active
+    settings = Settings(
+        codex_context_window=2_000,
+        codex_reply_reserve_tokens=500,
+        codex_system_budget_tokens=100,
+        codex_memory_budget_tokens=100,
+        codex_tools_budget_tokens=100,
+        codex_active_turn_budget_tokens=1_000,
+    )
+
+    local, budget = build_local_payload(cloud, [], settings)
+    rendered = json.dumps(local)
+
+    assert "continue the approved plan" in rendered
+    assert "current checkpoint survives" in rendered
+    assert "stale-checkpoint-0" not in rendered
+    assert "stale-command-0" not in rendered
+    assert "stale-command-23" in rendered
+    assert budget.input_tokens <= 1_500
+    assert budget.trimmed_items > 24
 
 
 def test_build_local_payload_never_truncates_latest_text_instruction():
