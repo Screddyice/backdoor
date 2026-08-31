@@ -1158,6 +1158,25 @@ For OAuth mode, proxy these paths to the same bridge process: `/mcp`, `/login`,
 custom connector needs only the public `https://.../mcp` URL; leave its advanced client
 credential fields empty so Claude uses dynamic registration.
 
+### Account-synced product connector
+
+`src/products_mcp/` publishes HyperCrawl, HyperScale, and EngageMate through one OAuth MCP for
+Claude desktop, web, and mobile. Each product has three namespaced tools: `*_status`,
+`*_list_tools`, and `*_call`. The list tool returns the upstream operation names and schemas; the
+call tool accepts only an advertised operation, so a caller cannot turn the bridge into an open
+HTTP proxy.
+
+The bridge reuses `src/hermes_mcp/oauth.py` for dynamic client registration, PKCE, one-hour access
+tokens, and rotating refresh tokens. It keeps product authorization separate behind the bridge:
+HyperCrawl uses its tenant REST token, HyperScale uses its organization API key, and EngageMate
+uses its internal key plus explicit user ID. Credentials stay in their existing protected
+environment files. The Claude connector receives only the public MCP URL.
+
+Install [`deploy/products-mcp-http.service`](deploy/products-mcp-http.service) as a user service,
+route the public OAuth and MCP paths to its loopback port, then add the public `/mcp` URL as a
+Claude custom connector. Verification requires OAuth completion, nine tools in `tools/list`, one
+successful `*_status` call per product, and connector persistence after a Claude reload.
+
 ---
 
 <div align="center">
