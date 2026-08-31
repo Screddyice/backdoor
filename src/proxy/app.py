@@ -47,10 +47,13 @@ async def lifespan(app: FastAPI):
         try:
             from .ca import LocalCA
             from .forward import ForwardProxy
+            from .socket_activation import activated_socket
 
             forward = ForwardProxy(
                 listen_host=settings.forward_host,
                 listen_port=settings.forward_port,
+                # None outside launchd -> ForwardProxy binds as before.
+                listen_sock=activated_socket("forward"),
                 mitm_hosts=settings.forward_mitm_hosts.split(","),
                 router_host=settings.forward_router_host,
                 router_port=settings.forward_router_port,
