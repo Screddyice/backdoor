@@ -296,7 +296,7 @@ The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), 
 
 ```
 cd ~/projects/Screddyice/backdoor-service && git fetch origin && git checkout <sha>
-launchctl kill TERM gui/$(id -u)/com.screddy.backdoor-router  # graceful: see below
+launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
 ```
 
 A dev-clone process started by hand on the same port hides this completely, because it answers
@@ -613,7 +613,7 @@ Detached rather than a checked-out branch, so `git checkout main` still works in
 git -C ../backdoor-service fetch origin main
 git -C ../backdoor-service checkout --detach origin/main
 (cd ../backdoor-service && uv sync --frozen)
-launchctl kill TERM gui/$(id -u)/com.screddy.backdoor-router  # graceful: see below
+launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
 ```
 
 The tradeoff is that editing code in your clone no longer deploys. That is the point: a restart
@@ -1115,26 +1115,6 @@ Claude Code reads that variable once at startup, so a session that began unroute
 Claude and Codex also write a process-scoped lease under `~/.backdoor/compute-leases/` before `qwen3.8:27b-obliterated` starts inference. This covers explicit Qwen sessions as well as failover and closes the load-time gap before Ollama lists the model in `/api/ps`. LLM-Jury checks the breaker, active leases, and Ollama residency before it constructs any backend. If the 27B model owns compute, LLM-Jury disables the local council and all frontier providers, including OpenRouter. Expired leases and leases from dead router processes are ignored.
 
 Writing is best-effort. A router that cannot publish state still routes, and LLM-Jury treats missing or unreadable state as inactive. Ollama residency remains the final backstop after a lease expires.
-
-**The file belongs to whoever is serving, and a newcomer cannot take it from a live owner.** Transitions publish unconditionally, because reaching one means this process handled a request and therefore owns the port. The one publish that happens before the process has done anything — construction — writes only when the file is missing, unparseable, pid-less, ours, or owned by a pid that is no longer running.
-
-That asymmetry is load-bearing. Launching a second router against an already-bound port builds its breakers, fails to bind, and exits, and an unconditional publish on construction let that doomed process stamp `failover_active: false` and its own pid over a live router in the middle of a failover. llm-jury would then read "GPU free" while a qwen tier was resident — the exact co-residency the file exists to prevent. Its pid-liveness check cannot catch this one, because the clobbering pid is genuinely alive at the moment it writes.
-
-Deferring the initial write costs nothing. It exists to clear a flag left behind by a router that died while OPEN, and such a flag names a dead pid: unowned here, and inactive to llm-jury.
-
-The **first request the new process serves** then claims the file unconditionally. A restart hands the port over while the outgoing router is still shutting down, so the incoming one builds its breakers, sees an owner that is still alive, and defers — leaving the file naming a pid that is seconds from death. Nothing is broken in that window, because both readers treat a dead pid as inactive, but without this the file would stay stale until the next transition, and on a healthy host that may be days away. Only one process can hold the port, so serving a request is proof of ownership, and it is the earliest proof available: uvicorn runs lifespan startup *before* it binds, so a startup hook would fire inside a doomed instance too. It happens once, not per request — `allow_upstream()` is the hot path.
-
-**Restarts cannot refuse connections: launchd owns the listen sockets.** The LaunchAgent's `Sockets` key declares :8083 ("api") and :8084 ("forward"); launchd creates them once and keeps its own reference open forever, and the process fetches duplicated fds at startup (`src/proxy/socket_activation.py`, `launch_activate_socket(3)` via ctypes). While the process is down or draining, new connections queue in the still-open listen backlog and the replacement accepts them seconds later — the `[Errno 61] Connection refused` restart window does not exist. Outside launchd the module fails open and the process binds host/port itself, so dev runs and tests are unchanged. A stray manually launched instance gets EADDRINUSE against launchd's listener and dies loudly instead of half-starting. Design: `docs/superpowers/specs/2026-08-31-zero-downtime-router-restarts-design.md`.
-
-**Restart the router with `scripts/bd-restart`, never a bare `kickstart -k`.** Every user-visible outage of this system on 2026-08-31 was a restart. `bd-restart` waits for the router to be idle (no ESTABLISHED connections into :8083/:8084) before acting, so the restart is invisible; `--now` skips the wait, `--force` is the SIGKILL escape hatch for a wedged process. `serve.py` bounds the SIGTERM drain at 20s, because uvicorn closes the *listener* at the start of a drain and launchd only respawns after exit — an unbounded drain held a restart open ~90s behind one long SSE stream while every other session got `[Errno 61] Connection refused`.
-
-`-k` is a SIGKILL: every in-flight streamed response across every routed session dies mid-body, and each of those clients reports `Connection lost mid-response. The response above may be incomplete.` `uvicorn.run()` is called without `timeout_graceful_shutdown`, so on SIGTERM it drains in-flight requests first, and the LaunchAgent's `KeepAlive` brings the process straight back:
-
-```bash
-launchctl kill TERM gui/$(id -u)/com.screddy.backdoor-router
-```
-
-Reach for `-k` only when the process is wedged and cannot drain.
 
 | Setting | Default | Effect |
 |---|---|---|
