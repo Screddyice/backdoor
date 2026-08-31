@@ -296,7 +296,7 @@ The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), 
 
 ```
 cd ~/projects/Screddyice/backdoor-service && git fetch origin && git checkout <sha>
-launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
+launchctl kill TERM gui/$(id -u)/com.screddy.backdoor-router  # graceful: see below
 ```
 
 A dev-clone process started by hand on the same port hides this completely, because it answers
@@ -613,7 +613,7 @@ Detached rather than a checked-out branch, so `git checkout main` still works in
 git -C ../backdoor-service fetch origin main
 git -C ../backdoor-service checkout --detach origin/main
 (cd ../backdoor-service && uv sync --frozen)
-launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
+launchctl kill TERM gui/$(id -u)/com.screddy.backdoor-router  # graceful: see below
 ```
 
 The tradeoff is that editing code in your clone no longer deploys. That is the point: a restart
@@ -1121,6 +1121,16 @@ Writing is best-effort. A router that cannot publish state still routes, and LLM
 That asymmetry is load-bearing. Launching a second router against an already-bound port builds its breakers, fails to bind, and exits, and an unconditional publish on construction let that doomed process stamp `failover_active: false` and its own pid over a live router in the middle of a failover. llm-jury would then read "GPU free" while a qwen tier was resident — the exact co-residency the file exists to prevent. Its pid-liveness check cannot catch this one, because the clobbering pid is genuinely alive at the moment it writes.
 
 Deferring the initial write costs nothing. It exists to clear a flag left behind by a router that died while OPEN, and such a flag names a dead pid: unowned here, and inactive to llm-jury.
+
+The **first request the new process serves** then claims the file unconditionally. A restart hands the port over while the outgoing router is still shutting down, so the incoming one builds its breakers, sees an owner that is still alive, and defers — leaving the file naming a pid that is seconds from death. Nothing is broken in that window, because both readers treat a dead pid as inactive, but without this the file would stay stale until the next transition, and on a healthy host that may be days away. Only one process can hold the port, so serving a request is proof of ownership, and it is the earliest proof available: uvicorn runs lifespan startup *before* it binds, so a startup hook would fire inside a doomed instance too. It happens once, not per request — `allow_upstream()` is the hot path.
+
+**Restart the router with `kill TERM`, not `kickstart -k`.** `-k` is a SIGKILL: every in-flight streamed response across every routed session dies mid-body, and each of those clients reports `Connection lost mid-response. The response above may be incomplete.` `uvicorn.run()` is called without `timeout_graceful_shutdown`, so on SIGTERM it drains in-flight requests first, and the LaunchAgent's `KeepAlive` brings the process straight back:
+
+```bash
+launchctl kill TERM gui/$(id -u)/com.screddy.backdoor-router
+```
+
+Reach for `-k` only when the process is wedged and cannot drain.
 
 | Setting | Default | Effect |
 |---|---|---|

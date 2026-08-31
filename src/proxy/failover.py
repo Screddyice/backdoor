@@ -240,6 +240,8 @@ class FailoverBreaker:
         # (provider_base_url, model) pairs this breaker has caused to be loaded.
         # Held so closing can hand them back — see note_claim/drain_claims.
         self._claims: set[tuple[str, str]] = set()
+        # Set once, by the first request this process serves. See _confirm_ownership.
+        self._ownership_confirmed = False
         self._publish(claim_only_if_unowned=True)
 
     def _owner_is_alive(self) -> bool:
@@ -321,9 +323,38 @@ class FailoverBreaker:
         except OSError:
             pass
 
+    def _confirm_ownership(self) -> None:
+        """Serving a request proves this process holds the port — take the file.
+
+        Construction deliberately declines to claim a file a live process owns
+        (see _publish), and that is right: a router that cannot bind must never
+        overwrite the one that did. But a restart hands the port over while the
+        outgoing process is still shutting down, so the incoming one builds its
+        breakers, sees an owner that is still alive, and defers — leaving the
+        file naming a pid that is seconds from death.
+
+        Nothing is broken in that window (both readers treat a dead pid as
+        inactive), but the file then stays stale until the next transition, and
+        transitions are rare by design: on a healthy host there may not be one
+        for days.
+
+        The first served request settles it, and it is the earliest available
+        proof. Only one process can hold the port, so reaching here at all means
+        this is that process. A server-startup hook would not do: uvicorn runs
+        lifespan startup BEFORE it binds, so it fires in a doomed instance too.
+
+        Once only. This sits on the hot path, and re-publishing per request would
+        turn a coordination file into a write amplifier for nothing.
+        """
+        if self._ownership_confirmed:
+            return
+        self._ownership_confirmed = True
+        self._publish()
+
     def allow_upstream(self) -> bool:
         """Should this request attempt the real API? Always yes while CLOSED;
         while OPEN, yes once per probe interval (half-open)."""
+        self._confirm_ownership()
         if not self.open:
             return True
         now = self._now()
