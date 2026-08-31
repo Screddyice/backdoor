@@ -5,6 +5,28 @@
     <key>Label</key>
     <string>com.screddy.backdoor-router</string>
 
+    <!-- launchd owns the listen sockets (socket activation). Its reference
+         stays open across restarts, so connections QUEUE in the backlog
+         instead of being refused while the process restarts. The names "api"
+         and "forward" are fetched by src/proxy/socket_activation.py; without
+         this key the process falls back to binding host/port itself. -->
+    <key>Sockets</key>
+    <dict>
+        <key>api</key>
+        <dict>
+            <key>SockNodeName</key>
+            <string>127.0.0.1</string>
+            <key>SockServiceName</key>
+            <string>8083</string>
+        </dict>
+        <key>forward</key>
+        <dict>
+            <key>SockNodeName</key>
+            <string>127.0.0.1</string>
+            <key>SockServiceName</key>
+            <string>8084</string>
+        </dict>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/you/projects/Screddyice/backdoor-service/.venv/bin/python</string>
