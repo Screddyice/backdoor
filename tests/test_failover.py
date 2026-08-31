@@ -7,7 +7,10 @@ the published state file so a test run never writes to ~/.backdoor.
 
 import contextlib
 import json
+import os
 import ssl
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -455,6 +458,80 @@ def test_unwritable_state_path_does_not_break_the_breaker():
     for _ in range(3):
         br.record_failure("ConnectError")
     assert br.open
+
+
+@contextlib.contextmanager
+def _live_stranger():
+    """A pid that is running and is not this process."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        yield proc.pid
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _dead_pid():
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid  # reaped, so the pid is gone rather than a zombie
+
+
+def _write_state(path, *, active, pid):
+    path.write_text(
+        json.dumps(
+            {"failover_active": active, "reason": "ConnectError",
+             "updated_at": 1.0, "pid": pid}
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_construction_does_not_clobber_a_live_router():
+    """A second instance must not take the file from the router that owns it.
+
+    Launching a router against an already-bound port builds its breakers, fails
+    to bind, and exits. Publishing on construction let that doomed process stamp
+    `failover_active: false` and its own pid over a LIVE router mid-failover, and
+    llm-jury would then read "GPU free" while a qwen tier was resident. The
+    reader's pid check cannot save it: the clobbering pid is alive as it writes.
+    """
+    state_path = _STATE_DIR / f"state-{next(_state_seq)}.json"
+    with _live_stranger() as owner_pid:
+        _write_state(state_path, active=True, pid=owner_pid)
+        make(Clock(), state_path=state_path)
+        survived = json.loads(state_path.read_text(encoding="utf-8"))
+    assert survived["failover_active"] is True
+    assert survived["pid"] == owner_pid
+
+
+def test_construction_claims_state_abandoned_by_a_dead_router():
+    """The reason the initial publish exists: clearing a crashed router's flag.
+
+    A router killed while OPEN leaves `failover_active: true` behind forever, so
+    a fresh one has to be able to take the file over. A dead owner is no owner.
+    """
+    state_path = _STATE_DIR / f"state-{next(_state_seq)}.json"
+    _write_state(state_path, active=True, pid=_dead_pid())
+    make(Clock(), state_path=state_path)
+    claimed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert claimed["failover_active"] is False
+    assert claimed["pid"] == os.getpid()
+
+
+def test_a_transition_publishes_even_over_a_live_owner():
+    """Only construction defers. Reaching a transition means we own the port."""
+    state_path = _STATE_DIR / f"state-{next(_state_seq)}.json"
+    clock = Clock()
+    with _live_stranger() as owner_pid:
+        _write_state(state_path, active=False, pid=owner_pid)
+        br, _ = make(clock, state_path=state_path)
+        for _ in range(3):
+            br.record_failure("ConnectError")
+        published = json.loads(state_path.read_text(encoding="utf-8"))
+    assert br.open is True
+    assert published["failover_active"] is True
+    assert published["pid"] == os.getpid()
 
 
 # ── Failover ladder (size → local tier) ──────────────────────────────────────
