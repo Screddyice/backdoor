@@ -194,6 +194,41 @@ def extract_recall_query(
     return latest_text
 
 
+def isolate_active_turn(payload: dict[str, Any]) -> dict[str, Any]:
+    active, _ = _active_turn(payload)
+    local = {
+        key: copy.deepcopy(payload[key])
+        for key in (
+            "stream",
+            "max_output_tokens",
+            "parallel_tool_calls",
+            "tools",
+            "tool_choice",
+            "text",
+        )
+        if key in payload
+    }
+    tools = local.get("tools")
+    normalized_tools = tools if isinstance(tools, list) else []
+    items = payload.get("input")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("role") == "user":
+                break
+            if item.get("type") == "additional_tools" and isinstance(
+                item.get("tools"), list
+            ):
+                normalized_tools.extend(copy.deepcopy(item["tools"]))
+    if normalized_tools:
+        local["tools"] = normalized_tools
+    else:
+        local.pop("tools", None)
+    local["input"] = active
+    return local
+
+
 def _function_tool(tool: dict[str, Any]) -> dict[str, Any] | None:
     if tool.get("type") != "function" or not isinstance(tool.get("name"), str):
         return None

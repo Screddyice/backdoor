@@ -19,6 +19,7 @@ from .codex_context import (
     build_local_payload,
     decode_codex_body,
     extract_recall_query,
+    isolate_active_turn,
 )
 from .external_context import (
     prepare_codex_external_context,
@@ -432,13 +433,14 @@ async def _serve_local(
             _deferred_claims.update(breaker.drain_claims())
 
         try:
+            local_source = isolate_active_turn(cloud_payload)
             query = extract_recall_query(
-                cloud_payload, settings.codex_active_turn_budget_tokens
+                local_source, settings.codex_active_turn_budget_tokens
             )
-            local_source = await prepare_codex_external_context(cloud_payload, settings)
+            local_source = await prepare_codex_external_context(local_source, settings)
             if settings.qwen_cognee:
                 external_memories, agent_memories = await asyncio.gather(
-                    recall_codex_external_context(cloud_payload, settings),
+                    recall_codex_external_context(local_source, settings),
                     recall_context(query, settings),
                 )
                 memories = agent_memories + external_memories

@@ -1212,6 +1212,57 @@ async def test_local_request_reserves_qwen_before_its_stream_is_iterated(
 
 
 @pytest.mark.asyncio
+async def test_local_external_context_never_receives_old_cloud_history(
+    codex_app, monkeypatch, tmp_path
+):
+    _, settings, _ = codex_app
+    breaker = one_shot_breaker(tmp_path)
+    assert breaker.record_failure("HTTP 503") is True
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    prepared = []
+
+    async def prepare(local_source, _settings):
+        prepared.append(local_source)
+        return local_source
+
+    async def no_external_recall(_payload, _settings):
+        return []
+
+    async def no_recall(_query, _settings):
+        return []
+
+    async def send_local(_payload, _settings):
+        return httpx.Response(200, stream=BytesStream(SSE))
+
+    monkeypatch.setattr(codex_routes, "prepare_codex_external_context", prepare)
+    monkeypatch.setattr(
+        codex_routes, "recall_codex_external_context", no_external_recall
+    )
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    monkeypatch.setattr(codex_routes, "_send_local", send_local)
+    monkeypatch.setattr(
+        compute_lease, "claim_exclusive_model", lambda *_args, **_kwargs: None
+    )
+
+    response = await codex_routes._serve_local(
+        payload,
+        settings,
+        breaker,
+        "active-turn-test",
+        0.0,
+    )
+    await response.body_iterator.aclose()
+
+    rendered = json.dumps(prepared[0])
+    assert "active task" in rendered
+    assert "bounded result" in rendered
+    assert "older task" not in rendered
+    assert "older answer" not in rendered
+    assert "additional_tools" not in rendered
+    assert prepared[0]["tools"]
+
+
+@pytest.mark.asyncio
 async def test_local_route_skips_all_cognee_recall_when_disabled(
     codex_app, monkeypatch, tmp_path
 ):
