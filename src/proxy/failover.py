@@ -240,67 +240,15 @@ class FailoverBreaker:
         # (provider_base_url, model) pairs this breaker has caused to be loaded.
         # Held so closing can hand them back — see note_claim/drain_claims.
         self._claims: set[tuple[str, str]] = set()
-        # Set once, by the first request this process serves. See _confirm_ownership.
-        self._ownership_confirmed = False
-        self._publish(claim_only_if_unowned=True)
+        self._publish()
 
-    def _owner_is_alive(self) -> bool:
-        """Does the state file already belong to a DIFFERENT live process?
-
-        Anything unreadable, unparseable, pid-less, dead, or already ours counts
-        as unowned — the same fail-open policy as the reader. The only answer
-        that stops a write is a pid that is not us and is still running.
-        """
-        try:
-            data = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
-        if not isinstance(data, dict):
-            return False
-        pid = data.get("pid")
-        if not isinstance(pid, int) or pid == os.getpid():
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True  # alive, just not ours to signal
-        except OSError:
-            return False
-        return True
-
-    def _publish(self, claim_only_if_unowned: bool = False) -> None:
+    def _publish(self) -> None:
         """Write breaker state where other local-GPU consumers can read it.
 
         Best-effort: a router that cannot write this file must still route. The
         reader (llm-jury) treats a missing/unreadable file as "not failing over",
         which is the same default a fresh router has.
-
-        ``claim_only_if_unowned`` is set on the one call that happens before this
-        process has done anything: construction. Constructing a breaker is not a
-        transition, and a process that merely imports the router is not
-        necessarily going to serve traffic — a second instance launched against
-        an already-bound port builds its breakers, fails to bind, and exits.
-        Without this guard that doomed instance stamps ``failover_active: false``
-        and its own pid over a LIVE router's state on the way down, and llm-jury
-        then reads "GPU free" while the real router is mid-failover holding a
-        qwen tier. That is the exact co-residency this file exists to prevent,
-        and the reader's pid-liveness check cannot catch it: the clobbering pid
-        is genuinely alive at the moment it writes.
-
-        Transitions publish unconditionally, and are safe to: reaching one means
-        this process handled a request, which means it owns the port.
-
-        Skipping the initial write costs nothing that matters. It exists to clear
-        a stale flag left by a router that died while OPEN, and such a flag names
-        a DEAD pid, which reads as unowned here and as inactive in llm-jury.
         """
-        if claim_only_if_unowned and self._owner_is_alive():
-            logger.debug(
-                "failover state already owned by a live process — not claiming it"
-            )
-            return
         try:
             active = _ACTIVE_BREAKERS.setdefault(self._state_path, {})
             if self.open:
@@ -323,38 +271,9 @@ class FailoverBreaker:
         except OSError:
             pass
 
-    def _confirm_ownership(self) -> None:
-        """Serving a request proves this process holds the port — take the file.
-
-        Construction deliberately declines to claim a file a live process owns
-        (see _publish), and that is right: a router that cannot bind must never
-        overwrite the one that did. But a restart hands the port over while the
-        outgoing process is still shutting down, so the incoming one builds its
-        breakers, sees an owner that is still alive, and defers — leaving the
-        file naming a pid that is seconds from death.
-
-        Nothing is broken in that window (both readers treat a dead pid as
-        inactive), but the file then stays stale until the next transition, and
-        transitions are rare by design: on a healthy host there may not be one
-        for days.
-
-        The first served request settles it, and it is the earliest available
-        proof. Only one process can hold the port, so reaching here at all means
-        this is that process. A server-startup hook would not do: uvicorn runs
-        lifespan startup BEFORE it binds, so it fires in a doomed instance too.
-
-        Once only. This sits on the hot path, and re-publishing per request would
-        turn a coordination file into a write amplifier for nothing.
-        """
-        if self._ownership_confirmed:
-            return
-        self._ownership_confirmed = True
-        self._publish()
-
     def allow_upstream(self) -> bool:
         """Should this request attempt the real API? Always yes while CLOSED;
         while OPEN, yes once per probe interval (half-open)."""
-        self._confirm_ownership()
         if not self.open:
             return True
         now = self._now()
