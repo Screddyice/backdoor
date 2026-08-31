@@ -519,6 +519,37 @@ def test_construction_claims_state_abandoned_by_a_dead_router():
     assert claimed["pid"] == os.getpid()
 
 
+def test_the_first_served_request_claims_the_file_from_a_stale_owner():
+    """A restart defers at construction, then takes the file when it serves.
+
+    launchd hands the port over while the outgoing router is still shutting
+    down, so the incoming one sees a live owner and declines to claim. Waiting
+    for a transition to correct that could take days on a healthy host.
+    """
+    state_path = _STATE_DIR / f"state-{next(_state_seq)}.json"
+    with _live_stranger() as owner_pid:
+        _write_state(state_path, active=False, pid=owner_pid)
+        br, _ = make(Clock(), state_path=state_path)
+        assert json.loads(state_path.read_text(encoding="utf-8"))["pid"] == owner_pid
+        br.allow_upstream()  # the first request this process serves
+        claimed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert claimed["pid"] == os.getpid()
+    assert claimed["failover_active"] is False
+
+
+def test_ownership_is_confirmed_once_not_per_request():
+    """allow_upstream is the hot path; it must not become a write amplifier."""
+    state_path = _STATE_DIR / f"state-{next(_state_seq)}.json"
+    br, _ = make(Clock(), state_path=state_path)
+    br.allow_upstream()
+    with _live_stranger() as owner_pid:
+        _write_state(state_path, active=False, pid=owner_pid)
+        for _ in range(5):
+            br.allow_upstream()
+        untouched = json.loads(state_path.read_text(encoding="utf-8"))
+    assert untouched["pid"] == owner_pid
+
+
 def test_a_transition_publishes_even_over_a_live_owner():
     """Only construction defers. Reaching a transition means we own the port."""
     state_path = _STATE_DIR / f"state-{next(_state_seq)}.json"
