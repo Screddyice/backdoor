@@ -106,6 +106,30 @@ class Settings(BaseSettings):
     failover_keep_tools: str = "local"
     failover_tool_result_chars: int = 2000
 
+    # Offline context virtualization. The feature ships disabled and only the
+    # breaker-confirmed Claude Messages failover path may enable it. Healthy
+    # cloud traffic and deliberate `/model qwen` sessions keep their existing
+    # routing behavior.
+    context_virtualization: bool = False
+    context_store_path: str = "~/.backdoor/context/transcripts.sqlite3"
+    context_store_max_bytes: int = 1_073_741_824
+    context_inactive_days: int = 30
+    context_target_input_tokens: int = 18_000
+    context_hard_input_tokens: int = 22_000
+    context_retrieval_tokens: int = 5_000
+    context_internal_result_tokens: int = 2_000
+    context_tokenizer_executable: str = "/opt/homebrew/bin/llama-tokenize"
+    context_tokenizer_model_path: str = ""
+    context_archive_queue_size: int = 32
+    context_archive_timeout_seconds: float = 0.5
+    context_assembly_timeout_seconds: float = 2.5
+    context_response_cache_seconds: int = 600
+    failover_max_output_tokens: int = 1_024
+    failover_read_only: bool = True
+    failover_first_text_seconds: float = 30.0
+    failover_total_seconds: float = 60.0
+    failover_recovery_successes: int = 2
+
     # Durable-memory recall injected into LOCAL model prompts, read from the
     # offline mirror at ~/.mem0-local/cache.db. See src/proxy/memory.py.
     #

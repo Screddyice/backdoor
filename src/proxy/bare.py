@@ -75,6 +75,12 @@ MCP_PREFIX = "mcp__"
 # The special keep-list token meaning "everything that is not an MCP tool".
 LOCAL_TOKEN = "local"
 
+# A context-limited model may inspect the Mac during a confirmed outage, but it
+# must not mutate files, execute commands, deploy, or reach remote tools. Match
+# exact harness tool names so a prompt cannot smuggle a capability back through
+# a lookalike name.
+READ_ONLY_OUTAGE_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+
 # Per-tool-result character budget. Generous enough to keep a short command's
 # output intact, small enough that one `Read` of a big file cannot dominate.
 DEFAULT_TOOL_RESULT_CHARS = 2000
@@ -139,6 +145,16 @@ def parse_keep(raw: str | Iterable[str] | None) -> tuple[str, ...]:
         parts = [str(p).strip() for p in raw]
     kept = tuple(p for p in parts if p)
     return kept or ()
+
+
+def apply_outage_tool_policy(req: MessagesRequest) -> MessagesRequest:
+    """Return an outage-only request with inspection tools and no mutation."""
+    out = req.model_copy(deep=True)
+    allowed = set(READ_ONLY_OUTAGE_TOOLS)
+    out.tools = [tool for tool in (out.tools or []) if tool.name in allowed] or None
+    if not out.tools:
+        out.tool_choice = None
+    return out
 
 
 def _truncate(text: str, limit: int) -> str:
