@@ -687,6 +687,14 @@ configuration and does not touch launchd, socket ownership, the forward proxy, o
 behavior. Candidate canaries and the rollback audit must pass before a separate production
 activation decision. The companion status-line work reserves `BACKDOOR ON` for live
 Anthropic-to-Qwen outage failover.
+
+Candidate verification on 2026-08-31 passed the repository suite with 541 tests passing and one
+skip. `uv run python scripts/context-candidate-canary.py` reduced a measured 507,138-token
+synthetic transcript to 391 provider-input tokens, preserved one cached local answer through
+recovery, required both recovery probes, and returned continuity for an injected SQLite fault.
+The canary used synthetic providers and intercepted Ollama administration calls. It changed only
+its temporary SQLite and breaker-state files, with no changes to the protected Claude, Codex, or
+LaunchAgent files. This evidence does not activate the feature or claim a live Qwen generation.
 See
 [`docs/superpowers/specs/2026-08-31-offline-context-virtualization-design.md`](docs/superpowers/specs/2026-08-31-offline-context-virtualization-design.md).
 

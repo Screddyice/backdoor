@@ -4,8 +4,8 @@ Claude Code compaction exposed a backend-specific failure in the MLX action
 model: its summary request generated only an inline thinking block, which the
 proxy stripped to an empty response.  The stock Qwen3.8 GGUF path did not have
 that failure.  These tests pin the replacement to Ollama's llama.cpp engine,
-keep the action-tuned MLX model reachable by its explicit alias, and retain the
-28K escalation guard used by long-running local sessions.
+keep the action-tuned MLX model reachable by its explicit alias, and enforce the
+22K breaker-failover input ceiling while deliberate local routes retain 27K.
 """
 
 from pathlib import Path
@@ -36,7 +36,7 @@ def test_action_tuned_mlx_model_remains_an_explicit_rollback() -> None:
 
 def test_normal_failover_uses_the_obliterated_gguf() -> None:
     assert Settings().failover_profile == PROFILE
-    assert FAILOVER_LADDER[0] == (27_000, PROFILE)
+    assert FAILOVER_LADDER[0] == (22_000, PROFILE)
 
 
 def test_profile_uses_local_ollama_without_thinking_stripping() -> None:
