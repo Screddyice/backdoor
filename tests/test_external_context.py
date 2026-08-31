@@ -1,18 +1,22 @@
 """Large fetched documents are externalized before they can fill Qwen's window."""
 
+import asyncio
 import json
 
+import httpx
 import pytest
 
 from src.proxy.config import Settings
 from src.proxy.external_context import (
     CONTEXT_OPEN,
+    ExternalDocument,
     RECALL_OPEN,
     compact_large_tool_results,
     compact_codex_tool_outputs,
     prepare_codex_external_context,
     prepare_external_context,
     recall_codex_external_context,
+    remember_document,
     safe_to_remember,
 )
 from src.proxy.models import Message, MessagesRequest
@@ -319,6 +323,54 @@ async def test_cognee_failure_never_costs_qwen_the_turn(monkeypatch):
     assert out == req
 
 
+async def test_concurrent_identical_documents_are_written_to_cognee_once(
+    monkeypatch,
+):
+    calls = 0
+    first_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            first_started.set()
+            await release.wait()
+            return httpx.Response(
+                200, request=httpx.Request("POST", "http://cognee.test/remember")
+            )
+
+    monkeypatch.setattr("src.proxy.external_context.httpx.AsyncClient", Client)
+    document = ExternalDocument(
+        text="Public report about launch pricing.",
+        source="https://example.com/report",
+        digest="concurrent-digest",
+    )
+    settings = Settings(cognee_base_url="http://cognee.test")
+
+    first = asyncio.create_task(remember_document(document, settings))
+    await first_started.wait()
+    second = asyncio.create_task(remember_document(document, settings))
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if calls > 1:
+            break
+    release.set()
+    results = await asyncio.gather(first, second)
+
+    assert calls == 1
+    assert results == [True, False]
+
+
 async def test_non_qwen_provider_is_not_changed(monkeypatch):
     async def should_not_run(*_args):
         raise AssertionError("Cognee external context ran for a cloud model")
@@ -357,6 +409,46 @@ def test_codex_function_output_becomes_the_same_bounded_capsule():
     assert "Launch pricing is $49" in out["input"][-1]["output"]
     assert len(out["input"][-1]["output"]) < 5_000
     assert payload["input"][-1]["output"] == page
+
+
+def test_codex_compaction_skips_tool_outputs_before_the_active_turn():
+    old_output = "old history " * 10_000
+    active_output = "active result " * 1_000
+    payload = {
+        "input": [
+            {"type": "message", "role": "user", "content": "old task"},
+            {
+                "type": "function_call",
+                "call_id": "old-call",
+                "name": "exec",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "old-call",
+                "output": old_output,
+            },
+            {"type": "message", "role": "user", "content": "active task"},
+            {
+                "type": "function_call",
+                "call_id": "active-call",
+                "name": "exec",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "active-call",
+                "output": active_output,
+            },
+        ]
+    }
+
+    compacted, _ = compact_codex_tool_outputs(
+        payload, threshold_chars=1_000, char_budget=500
+    )
+
+    assert compacted["input"][2]["output"] == old_output
+    assert CONTEXT_OPEN in compacted["input"][5]["output"]
 
 
 def test_codex_shell_output_is_compacted_but_never_queued_for_cognee():

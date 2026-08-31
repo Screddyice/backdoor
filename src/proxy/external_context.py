@@ -56,6 +56,7 @@ _PUBLIC_FETCH_INPUT_KEYS = {"prompt", "url"}
 
 _MAX_REMEMBERED_HASHES = 2_048
 _remembered_hashes: OrderedDict[str, None] = OrderedDict()
+_remember_inflight: dict[str, asyncio.Task[bool]] = {}
 
 
 @dataclass(frozen=True)
@@ -407,15 +408,7 @@ def _codex_paired_call_inputs(payload: dict[str, Any]) -> dict[int, dict[str, An
     items = payload.get("input")
     if not isinstance(items, list):
         return found
-    latest_user = next(
-        (
-            index
-            for index in range(len(items) - 1, -1, -1)
-            if isinstance(items[index], dict) and items[index].get("role") == "user"
-        ),
-        None,
-    )
-    start = 0 if latest_user is None else latest_user + 1
+    start = _codex_active_start(items)
     pending: dict[str, dict[str, Any] | None] = {}
     for index, item in enumerate(items[start:], start=start):
         if not isinstance(item, dict):
@@ -440,6 +433,18 @@ def _codex_paired_call_inputs(payload: dict[str, Any]) -> dict[int, dict[str, An
     return found
 
 
+def _codex_active_start(items: list[Any]) -> int:
+    latest_user = next(
+        (
+            index
+            for index in range(len(items) - 1, -1, -1)
+            if isinstance(items[index], dict) and items[index].get("role") == "user"
+        ),
+        None,
+    )
+    return 0 if latest_user is None else latest_user + 1
+
+
 def compact_codex_tool_outputs(
     payload: dict[str, Any],
     *,
@@ -456,7 +461,8 @@ def compact_codex_tool_outputs(
     query = _codex_last_user_text(out)
     inputs = _codex_paired_call_inputs(out)
     documents: list[ExternalDocument] = []
-    for index, item in enumerate(items):
+    start = _codex_active_start(items)
+    for index, item in enumerate(items[start:], start=start):
         if not isinstance(item, dict) or item.get("type") != "function_call_output":
             continue
         text = _flatten_result(item.get("output"))
@@ -526,6 +532,26 @@ async def remember_document(document: ExternalDocument, settings: Any) -> bool:
         or not _source_safe_to_remember(document.source)
     ):
         return False
+    task = _remember_inflight.get(document.digest)
+    owner = task is None
+    if task is None:
+        task = asyncio.create_task(_write_document_to_cognee(document, settings))
+        _remember_inflight[document.digest] = task
+
+        def clear_inflight(completed: asyncio.Task[bool]) -> None:
+            if _remember_inflight.get(document.digest) is completed:
+                _remember_inflight.pop(document.digest, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(clear_inflight)
+    stored = await asyncio.shield(task)
+    return stored if owner else False
+
+
+async def _write_document_to_cognee(
+    document: ExternalDocument, settings: Any
+) -> bool:
     file_base, file_key = _load_cognee_credentials()
     base = str(getattr(settings, "cognee_base_url", "") or file_base).strip().rstrip("/")
     key = str(getattr(settings, "cognee_api_key", "") or file_key).strip()

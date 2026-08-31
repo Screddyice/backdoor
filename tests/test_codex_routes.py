@@ -52,6 +52,21 @@ class CloseTrackingFailingStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class ControlledFailingStream(httpx.AsyncByteStream):
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        await self.release.wait()
+        raise httpx.ReadError("older stream failed")
+        yield b""  # pragma: no cover
+
+    async def aclose(self):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_codex_models_probe_is_relayed_for_cli_and_desktop_doctor(
     codex_app, monkeypatch
@@ -250,6 +265,7 @@ async def codex_app(monkeypatch, tmp_path):
     monkeypatch.setattr(codex_routes, "_local_inflight", 0)
     monkeypatch.setattr(codex_routes, "_deferred_claims", set())
     monkeypatch.setattr(codex_routes, "_local_state_lock", asyncio.Lock())
+    monkeypatch.setattr(codex_routes, "_cloud_success_sequence", 0)
 
     async def no_external_recall(_payload, _settings):
         return []
@@ -595,6 +611,57 @@ async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
             {"source": "codex-failover", "ttl_seconds": 600},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_older_cloud_stream_failure_cannot_override_a_newer_success(
+    codex_app, monkeypatch
+):
+    app, settings, breaker = codex_app
+    settings.codex_failover_threshold = 1
+    breaker.threshold = 1
+    older_stream = ControlledFailingStream()
+    calls = 0
+
+    def cloud(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                stream=older_stream,
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            stream=BytesStream(SSE),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        older = asyncio.create_task(
+            client.post("/backend-api/codex/responses", content=FIXTURE.read_bytes())
+        )
+        await older_stream.started.wait()
+        newer = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+        older_stream.release.set()
+        with pytest.raises((httpx.ReadError, ExceptionGroup)):
+            await older
+
+    assert newer.status_code == 200
+    assert breaker.open is False
 
 
 @pytest.mark.asyncio
@@ -1184,6 +1251,39 @@ async def test_local_route_skips_all_cognee_recall_when_disabled(
         0.0,
     )
     await response.body_iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exact_runtime_mismatch_releases_the_reserved_local_slot(
+    codex_app, monkeypatch, tmp_path
+):
+    _, settings, _ = codex_app
+    breaker = one_shot_breaker(tmp_path)
+    assert breaker.record_failure("HTTP 503") is True
+
+    async def resolve(_profile):
+        return "local-qwen35-fast"
+
+    async def forbidden(*_args):
+        raise AssertionError("runtime mismatch must stop before local preparation")
+
+    monkeypatch.setattr(codex_routes.mlx_admin, "resolve_profile", resolve)
+    monkeypatch.setattr(codex_routes, "prepare_codex_external_context", forbidden)
+    monkeypatch.setattr(codex_routes, "recall_codex_external_context", forbidden)
+    monkeypatch.setattr(codex_routes, "recall_context", forbidden)
+
+    with pytest.raises(Exception) as caught:
+        await codex_routes._serve_local(
+            json.loads(FIXTURE.read_text(encoding="utf-8")),
+            settings,
+            breaker,
+            "runtime-mismatch-test",
+            0.0,
+        )
+
+    assert getattr(caught.value, "status_code", None) == 503
+    assert codex_routes._local_inflight == 0
+    assert breaker.drain_claims() == set()
 
 
 @pytest.mark.asyncio

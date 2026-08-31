@@ -52,6 +52,7 @@ _codex_breaker: FailoverBreaker | None = None
 _local_inflight = 0
 _deferred_claims: set[tuple[str, str]] = set()
 _local_state_lock = asyncio.Lock()
+_cloud_success_sequence = 0
 
 
 def _new_chatgpt_client(settings: Settings) -> httpx.AsyncClient:
@@ -228,7 +229,9 @@ def _ollama_openai_base(settings: Settings) -> str:
 
 
 async def _cloud_body(
-    response: httpx.Response, breaker: FailoverBreaker
+    response: httpx.Response,
+    breaker: FailoverBreaker,
+    success_sequence: int,
 ) -> AsyncIterator[bytes]:
     try:
         async for chunk in response.aiter_raw():
@@ -239,7 +242,12 @@ async def _cloud_body(
             response.num_bytes_downloaded,
             type(exc).__name__,
         )
-        breaker.record_failure(type(exc).__name__)
+        if success_sequence == _cloud_success_sequence:
+            breaker.record_failure(type(exc).__name__)
+        else:
+            logger.info(
+                "Ignoring an older Codex stream failure after a newer cloud success"
+            )
         raise
     else:
         # Reachability is NOT credited here — `codex_route` already did that the
@@ -298,14 +306,18 @@ def _relay_passthrough(response: httpx.Response) -> StreamingResponse:
     )
 
 
-def _relay_cloud(response: httpx.Response, breaker: FailoverBreaker) -> StreamingResponse:
+def _relay_cloud(
+    response: httpx.Response,
+    breaker: FailoverBreaker,
+    success_sequence: int,
+) -> StreamingResponse:
     headers = {
         key: value
         for key, value in response.headers.items()
         if key.lower() not in _SKIP_RESPONSE_HEADERS
     }
     return _ManagedStreamingResponse(
-        _cloud_body(response, breaker),
+        _cloud_body(response, breaker, success_sequence),
         status_code=response.status_code,
         headers=headers,
         background=BackgroundTask(response.aclose),
@@ -530,6 +542,7 @@ async def codex_responses(
     request: Request,
     settings: Settings = Depends(get_settings),
 ):
+    global _cloud_success_sequence
     started = time.monotonic()
     correlation_id = uuid.uuid4().hex[:12]
     body = await _read_bounded_body(request, settings.codex_max_request_bytes)
@@ -596,7 +609,8 @@ async def codex_responses(
     # a status line is proof that it can. What the body is still needed for is
     # the tier release — see `_cloud_body`.
     breaker.record_success()
-    return _relay_cloud(response, breaker)
+    _cloud_success_sequence += 1
+    return _relay_cloud(response, breaker, _cloud_success_sequence)
 
 
 _CODEX_CATCHALL_METHODS = [
