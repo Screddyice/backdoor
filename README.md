@@ -651,6 +651,24 @@ Stripping reuses the `failover_*` keep-list and truncation budget, so both paths
 
 Observed 2026-08-12: a `qwen` session sent **143,490 tokens at the 27B's 32K window, 87 times over ~17 hours**, failing and retrying every 5–10 minutes and loading 23GB of a 36GB host on every attempt. The window was configured correctly. There was simply no route from "too big for this tier" to "use the wider one".
 
+#### Planned: local transcript virtualization for outage failover
+
+The wide tier still has a finite window. During the 2026-08-31 internet outage, Backdoor selected
+`local-failover-256k` for stripped Claude requests estimated at about 262,569 and 506,590 tokens.
+The model accepted neither session, and Claude kept retrying until the cloud returned. The final
+ladder entry currently accepts every estimated size, including the 10,000,000-token test fixture,
+without proving that the selected model can answer.
+
+The approved design stores the exact transcript locally, builds an 18K-token working set with a
+22K hard ceiling, retrieves older segments from an in-process SQLite FTS5 index, and removes
+mutation tools during breaker-confirmed outages. It requires no Claude or Codex configuration
+change and does not touch launchd, socket ownership, the forward proxy, or restart behavior. The
+feature remains unimplemented and disabled until the isolated canaries and rollback gates pass.
+The companion status-line change also reserves `BACKDOOR ON` for live Anthropic-to-Qwen outage
+failover; a normally routed Opus session will no longer display that badge.
+See
+[`docs/superpowers/specs/2026-08-31-offline-context-virtualization-design.md`](docs/superpowers/specs/2026-08-31-offline-context-virtualization-design.md).
+
 Tiers now declare the largest post-strip session they will take:
 
 ```
