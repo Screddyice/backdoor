@@ -598,6 +598,63 @@ async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_local_failover_returns_json(
+    codex_app, monkeypatch, tmp_path
+):
+    app, settings, _ = codex_app
+    monkeypatch.setattr(codex_routes, "_codex_breaker", one_shot_breaker(tmp_path))
+    monkeypatch.setattr(
+        compute_lease, "claim_exclusive_model", lambda *_args, **_kwargs: None
+    )
+    cloud_body = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    cloud_body["stream"] = False
+    local_requests = []
+
+    def cloud(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "offline"})
+
+    def local(request: httpx.Request) -> httpx.Response:
+        local_requests.append(request)
+        return httpx.Response(
+            200,
+            stream=BytesStream(b'{"id":"resp_json","status":"completed"}'),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def no_recall(_query, _settings):
+        return []
+
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses", json=cloud_body
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"id": "resp_json", "status": "completed"}
+    assert json.loads(local_requests[0].content)["stream"] is False
+    assert local_requests[0].headers["accept"] == "application/json"
+    assert codex_routes._local_inflight == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [400, 401, 403])
 async def test_auth_and_request_errors_never_activate_local_failover(
     codex_app, monkeypatch, tmp_path, status

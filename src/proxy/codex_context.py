@@ -443,10 +443,22 @@ def build_local_payload(
         )
     if not tools:
         tool_choice = None
+    requested_output = payload.get(
+        "max_output_tokens", settings.codex_reply_reserve_tokens
+    )
+    if (
+        isinstance(requested_output, bool)
+        or not isinstance(requested_output, int)
+        or requested_output <= 0
+    ):
+        raise CodexRequestError("Codex max_output_tokens must be a positive integer")
     local: dict[str, Any] = {
         "model": settings.codex_local_model,
         "input": input_items,
-        "stream": bool(payload.get("stream", True)),
+        "stream": bool(payload.get("stream", False)),
+        "max_output_tokens": min(
+            requested_output, settings.codex_reply_reserve_tokens
+        ),
         "parallel_tool_calls": bool(payload.get("parallel_tool_calls", False)),
     }
     if tools:

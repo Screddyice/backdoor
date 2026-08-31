@@ -209,13 +209,14 @@ async def codex_models(
 
 async def _send_local(payload: dict, settings: Settings) -> httpx.Response:
     client = _get_ollama_client()
+    accept = "text/event-stream" if payload.get("stream") else "application/json"
     local_request = client.build_request(
         "POST",
         settings.codex_local_responses_url,
         json=payload,
         headers={
             "content-type": "application/json",
-            "accept": "text/event-stream",
+            "accept": accept,
         },
     )
     return await client.send(local_request, stream=True)
@@ -472,6 +473,25 @@ async def _serve_local(
             budget.dropped_tools,
             round((time.monotonic() - started) * 1000),
         )
+        if not local_payload["stream"]:
+            body = await _read_bounded_response(
+                response, settings.codex_max_request_bytes
+            )
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() not in _DECODED_SKIP_RESPONSE_HEADERS
+                and key.lower() != "content-type"
+            }
+            status = response.status_code
+            response = None
+            await _release_local_slot(breaker)
+            return Response(
+                content=body,
+                status_code=status,
+                headers=headers,
+                media_type="application/json",
+            )
         headers = {
             key: value
             for key, value in response.headers.items()

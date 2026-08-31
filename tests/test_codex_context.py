@@ -95,6 +95,45 @@ def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
     )
 
 
+def test_build_local_payload_defaults_to_json_and_reserves_the_reply_budget():
+    cloud = load_request()
+    cloud.pop("stream")
+
+    local, _ = build_local_payload(cloud, [], Settings())
+
+    assert local["stream"] is False
+    assert local["max_output_tokens"] == 4_000
+
+
+def test_build_local_payload_preserves_a_valid_output_limit():
+    cloud = load_request()
+    cloud["max_output_tokens"] = 1_234
+
+    local, _ = build_local_payload(cloud, [], Settings())
+
+    assert local["max_output_tokens"] == 1_234
+
+
+@pytest.mark.parametrize("value", ["4000", 0])
+def test_build_local_payload_rejects_an_invalid_output_limit(value):
+    cloud = load_request()
+    cloud["max_output_tokens"] = value
+
+    with pytest.raises(CodexRequestError) as caught:
+        build_local_payload(cloud, [], Settings())
+
+    assert caught.value.status_code == 400
+
+
+def test_build_local_payload_caps_output_at_the_reserved_budget():
+    cloud = load_request()
+    cloud["max_output_tokens"] = 4_001
+
+    local, _ = build_local_payload(cloud, [], Settings())
+
+    assert local["max_output_tokens"] == 4_000
+
+
 def test_build_local_payload_drops_cloud_only_items_after_active_user():
     cloud = load_request()
     cloud["input"].extend(
