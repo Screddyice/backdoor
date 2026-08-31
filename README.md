@@ -1179,6 +1179,11 @@ public OAuth and MCP paths to its loopback port, then add the public `/mcp` URL 
 connector. Verification requires OAuth completion, nine tools in `tools/list`, one successful
 `*_status` call per product, and connector persistence after a Claude reload.
 
+The unit loads [`deploy/products-mcp-runtime.env`](deploy/products-mcp-runtime.env) after the shared
+credential files. Keep the products bind and OAuth settings in that final file. An earlier shared
+Hermes environment file also defines port 8000 and the Hermes issuer, and systemd gives the last
+environment file precedence.
+
 ---
 
 <div align="center">
