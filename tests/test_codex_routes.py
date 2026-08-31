@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from src.proxy import codex_routes, compute_lease
+from src.proxy import codex_routes, compute_lease, routes
 from src.proxy.app import create_app
 from src.proxy.config import Settings, get_settings
 from src.proxy.failover import FailoverBreaker
@@ -40,6 +40,18 @@ class FailingStream(httpx.AsyncByteStream):
         return None
 
 
+class CloseTrackingFailingStream(httpx.AsyncByteStream):
+    def __init__(self):
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b'{"partial":'
+        raise httpx.ReadError("stream failed")
+
+    async def aclose(self):
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_codex_models_probe_is_relayed_for_cli_and_desktop_doctor(
     codex_app, monkeypatch
@@ -63,13 +75,116 @@ async def test_codex_models_probe_is_relayed_for_cli_and_desktop_doctor(
         transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
     ) as client:
         response = await client.get(
-            "/backend-api/codex/models",
+            "/backend-api/codex/models?source=doctor",
             headers={"authorization": "Bearer auth-marker"},
         )
 
     assert response.status_code == 401
-    assert seen[0].url == httpx.URL("https://chatgpt.test/backend-api/codex/models")
+    assert seen[0].url == httpx.URL(
+        "https://chatgpt.test/backend-api/codex/models?source=doctor"
+    )
     assert seen[0].headers["authorization"] == "Bearer auth-marker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/backend-api/codex/future-endpoint?source=client"),
+        ("GET", "/backend-api/codex/responses"),
+    ],
+)
+async def test_unknown_codex_paths_never_reach_the_anthropic_catchall(
+    codex_app, monkeypatch, method, path
+):
+    app, settings, _ = codex_app
+    settings.router_mode = "hybrid"
+    anthropic_calls = []
+
+    def anthropic(request: httpx.Request) -> httpx.Response:
+        anthropic_calls.append(request)
+        return httpx.Response(
+            418,
+            stream=BytesStream(b"wrong upstream"),
+            headers={"content-type": "text/plain"},
+        )
+
+    upstream = httpx.AsyncClient(
+        base_url=settings.anthropic_upstream,
+        transport=httpx.MockTransport(anthropic),
+    )
+    monkeypatch.setattr(routes, "_upstream_client", upstream)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+        ) as client:
+            response = await client.request(
+                method,
+                path,
+                headers={"authorization": "Bearer chatgpt-marker"},
+            )
+    finally:
+        await upstream.aclose()
+
+    assert response.status_code in {404, 405}
+    assert anthropic_calls == []
+
+
+@pytest.mark.asyncio
+async def test_codex_models_closes_a_response_when_buffering_fails(
+    codex_app, monkeypatch
+):
+    app, settings, _ = codex_app
+    stream = CloseTrackingFailingStream()
+
+    def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=stream,
+            headers={"content-type": "application/json"},
+        )
+
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(upstream),
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.get("/backend-api/codex/models")
+
+    assert response.status_code == 502
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_codex_models_rejects_an_oversized_buffered_response(
+    codex_app, monkeypatch
+):
+    app, settings, _ = codex_app
+    settings.codex_max_request_bytes = 64
+
+    def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 65)
+
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(upstream),
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.get("/backend-api/codex/models")
+
+    assert response.status_code == 502
 
 
 @pytest.mark.asyncio
@@ -177,7 +292,7 @@ async def test_online_codex_request_relays_original_body_headers_and_sse(
         transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
     ) as client:
         response = await client.post(
-            "/backend-api/codex/responses",
+            "/backend-api/codex/responses?source=client",
             content=body,
             headers={
                 "content-type": "application/json",
@@ -193,7 +308,9 @@ async def test_online_codex_request_relays_original_body_headers_and_sse(
     assert response.content == SSE
     assert response.headers["x-request-id"] == "req-test"
     assert len(seen) == 1
-    assert seen[0].url == httpx.URL("https://chatgpt.test/backend-api/codex/responses")
+    assert seen[0].url == httpx.URL(
+        "https://chatgpt.test/backend-api/codex/responses?source=client"
+    )
     assert seen[0].content == body
     assert seen[0].headers["authorization"] == "Bearer auth-marker"
     assert seen[0].headers["chatgpt-account-id"] == "account-marker"

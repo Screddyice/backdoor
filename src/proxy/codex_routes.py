@@ -124,11 +124,17 @@ async def _send_cloud(
     upstream = _get_chatgpt_client(settings)
     upstream_request = upstream.build_request(
         request.method,
-        path,
+        _codex_upstream_path(request, path),
         content=body,
         headers=headers,
     )
     return await upstream.send(upstream_request, stream=True)
+
+
+def _codex_upstream_path(request: Request, path: str) -> str:
+    if request.url.query:
+        return f"{path}?{request.url.query}"
+    return path
 
 
 async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
@@ -147,6 +153,25 @@ async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+async def _read_bounded_response(
+    response: httpx.Response, max_bytes: int
+) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(
+                    status_code=502,
+                    detail="ChatGPT Codex response exceeds the size limit",
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        await response.aclose()
 
 
 def _decode_local_payload(body: bytes, request: Request, settings: Settings) -> dict:
@@ -168,14 +193,15 @@ async def codex_models(
     """Relay the provider probe used by Codex CLI and Desktop diagnostics."""
     try:
         response = await _send_cloud(request, b"", settings, path="models")
-        body = await response.aread()
+        body = await _read_bounded_response(
+            response, settings.codex_max_request_bytes
+        )
         headers = {
             key: value
             for key, value in response.headers.items()
             if key.lower() not in _DECODED_SKIP_RESPONSE_HEADERS
         }
         status = response.status_code
-        await response.aclose()
         return Response(content=body, status_code=status, headers=headers)
     except httpx.TransportError as exc:
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
@@ -472,11 +498,8 @@ async def codex_compact(
 ):
     """Relay Codex cloud compaction without involving the inference breaker."""
     body = await _read_bounded_body(request, settings.codex_max_request_bytes)
-    path = "responses/compact"
-    if request.url.query:
-        path = f"{path}?{request.url.query}"
     try:
-        response = await _send_cloud(request, body, settings, path=path)
+        response = await _send_cloud(request, body, settings, path="responses/compact")
     except httpx.TransportError as exc:
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
     return _relay_passthrough(response)
@@ -511,13 +534,14 @@ async def codex_responses(
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
 
     if failover_enabled and response.status_code in _failover_statuses(settings):
-        decoded = await response.aread()
+        decoded = await _read_bounded_response(
+            response, settings.codex_max_request_bytes
+        )
         headers = {
             key: value
             for key, value in response.headers.items()
             if key.lower() not in _DECODED_SKIP_RESPONSE_HEADERS
         }
-        await response.aclose()
         if breaker.record_failure(f"HTTP {response.status_code}"):
             payload = _decode_local_payload(body, request, settings)
             return await _serve_local(payload, settings, breaker, correlation_id, started)
@@ -553,3 +577,26 @@ async def codex_responses(
     # the tier release — see `_cloud_body`.
     breaker.record_success()
     return _relay_cloud(response, breaker)
+
+
+_CODEX_CATCHALL_METHODS = [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "HEAD",
+    "TRACE",
+    "CONNECT",
+]
+
+
+@codex_router.api_route("", methods=_CODEX_CATCHALL_METHODS, include_in_schema=False)
+@codex_router.api_route(
+    "/{unsupported_path:path}",
+    methods=_CODEX_CATCHALL_METHODS,
+    include_in_schema=False,
+)
+async def reject_unsupported_codex_route(unsupported_path: str = ""):
+    raise HTTPException(status_code=404, detail="Unsupported ChatGPT Codex route")
