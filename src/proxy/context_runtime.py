@@ -151,6 +151,23 @@ class ContextRuntime:
                 self._complete_inflight[request_hash] = task
         return await asyncio.shield(task)
 
+    async def cached_complete(self, request_hash: str) -> dict[str, Any] | None:
+        cached = await self._read_cache(request_hash, "complete")
+        response = cached.get("response") if cached is not None else None
+        return response if isinstance(response, dict) else None
+
+    async def cached_stream(self, request_hash: str) -> tuple[str, ...] | None:
+        async with self._stream_lock:
+            completed = self._completed_streams.get(request_hash)
+            if completed is not None and completed[0] > self._now():
+                return completed[1]
+            self._completed_streams.pop(request_hash, None)
+        cached = await self._read_cache(request_hash, "stream")
+        events = cached.get("events") if cached is not None else None
+        if not isinstance(events, list) or not all(isinstance(event, str) for event in events):
+            return None
+        return tuple(events)
+
     async def _produce_complete(
         self,
         request_hash: str,
@@ -181,6 +198,7 @@ class ContextRuntime:
         self,
         request_hash: str,
         factory: Callable[[], AsyncIterator[str]],
+        cache_predicate: Callable[[tuple[str, ...]], bool] | None = None,
     ) -> AsyncIterator[str]:
         cached = await self._read_cache(request_hash, "stream")
         if cached is not None and isinstance(cached.get("events"), list):
@@ -206,7 +224,12 @@ class ContextRuntime:
                     shared = _SharedStream()
                     self._streams[request_hash] = shared
                     shared.task = asyncio.create_task(
-                        self._pump_stream(request_hash, shared, factory)
+                        self._pump_stream(
+                            request_hash,
+                            shared,
+                            factory,
+                            cache_predicate,
+                        )
                     )
                 shared.subscribers.add(queue)
                 snapshot = tuple(shared.events)
@@ -233,9 +256,11 @@ class ContextRuntime:
         request_hash: str,
         shared: _SharedStream,
         factory: Callable[[], AsyncIterator[str]],
+        cache_predicate: Callable[[tuple[str, ...]], bool] | None,
     ) -> None:
         terminal = False
         error: BaseException | None = None
+        cacheable = False
         try:
             async for event in factory():
                 if not isinstance(event, str):
@@ -245,7 +270,11 @@ class ContextRuntime:
                     shared.events.append(event)
                     for subscriber in tuple(shared.subscribers):
                         subscriber.put_nowait(event)
-            if terminal:
+            completed_events = tuple(shared.events)
+            cacheable = terminal and (
+                cache_predicate is None or cache_predicate(completed_events)
+            )
+            if cacheable:
                 try:
                     await self._write_cache(
                         request_hash,
@@ -258,7 +287,7 @@ class ContextRuntime:
             error = exc
         finally:
             async with self._stream_lock:
-                if terminal and error is None:
+                if cacheable and error is None:
                     self._completed_streams[request_hash] = (
                         self._now() + self.cache_seconds,
                         tuple(shared.events),

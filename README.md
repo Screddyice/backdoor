@@ -597,7 +597,7 @@ answer in 3.6s on qwen3.5:27b, ending in a real tool call
 
 That is what lets the default tier be a 27B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 27B in place, and you rebuild the original failure on a much larger model.
 
-**Built-in tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob`, `Grep`, `WebSearch`, and `WebFetch` are Claude Code tools rather than MCP integrations, so bare mode keeps them. A deliberate local Qwen session can search or fetch when the Mac has internet access, and Bash can call public HTTP APIs with `curl`. If a network call fails, Qwen continues with local tools. True breaker failover gets an explicit offline prompt because the breaker opens only after the connectivity probe confirms that the host cannot reach the internet.
+**Built-in tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob`, `Grep`, `WebSearch`, and `WebFetch` are Claude Code tools rather than MCP integrations, so the legacy bare path keeps them. A deliberate local Qwen session can search or fetch when the Mac has internet access, and Bash can call public HTTP APIs with `curl`. The context virtualization candidate narrows breaker-confirmed outages to `Read`, `Glob`, and `Grep`.
 
 Every `mcp__*` tool is dropped from bare requests. Those schemas supplied most of the measured ~286K-token tool payload, and remote MCP integrations cannot help during true offline failover. Keep a specific MCP tool only through the existing allowlist when its schema cost and availability justify it.
 
@@ -651,7 +651,7 @@ Stripping reuses the `failover_*` keep-list and truncation budget, so both paths
 
 Observed 2026-08-12: a `qwen` session sent **143,490 tokens at the 27B's 32K window, 87 times over ~17 hours**, failing and retrying every 5–10 minutes and loading 23GB of a 36GB host on every attempt. The window was configured correctly. There was simply no route from "too big for this tier" to "use the wider one".
 
-#### Planned: local transcript virtualization for outage failover
+#### Candidate: local transcript virtualization for outage failover
 
 The wide tier still has a finite window. During the 2026-08-31 internet outage, Backdoor selected
 `local-failover-256k` for stripped Claude requests estimated at about 262,569 and 506,590 tokens.
@@ -659,13 +659,28 @@ The model accepted neither session, and Claude kept retrying until the cloud ret
 ladder entry currently accepts every estimated size, including the 10,000,000-token test fixture,
 without proving that the selected model can answer.
 
-The approved design stores the exact transcript locally, builds an 18K-token working set with a
-22K hard ceiling, retrieves older segments from an in-process SQLite FTS5 index, and removes
-mutation tools during breaker-confirmed outages. It requires no Claude or Codex configuration
-change and does not touch launchd, socket ownership, the forward proxy, or restart behavior. The
-feature remains unimplemented and disabled until the isolated canaries and rollback gates pass.
-The companion status-line change also reserves `BACKDOOR ON` for live Anthropic-to-Qwen outage
-failover; a normally routed Opus session will no longer display that badge.
+The candidate stores the exact transcript at
+`~/.backdoor/context/transcripts.sqlite3`, using SQLite WAL and FTS5. It selects an 18K-token
+working set, enforces a 22K input ceiling, and caps outage replies at 1,024 tokens. It uses the
+local `llama-tokenize` executable with the configured Qwen GGUF for the final count. If the
+tokenizer cannot load, the UTF-8 byte count supplies a conservative bound without a download.
+
+Breaker-confirmed outages keep `Read`, `Glob`, and `Grep`. Backdoor removes mutation tools and
+remote MCP tools before Qwen sees the request. It gives Qwen 30 seconds to produce text and 60
+seconds to finish. An oversized prompt, local timeout, tokenizer fault, or SQLite fault returns a
+continuity response without asking an impossible model call to run. Identical retries share one
+generation, and Backdoor caches completed responses for ten minutes so connectivity recovery
+cannot replace a finished local answer with a different cloud answer.
+
+Healthy cloud responses retain their raw body and headers. Backdoor queues archival after the
+response finishes, and a full queue or archive fault cannot block the cloud response. The breaker
+requires two authenticated upstream successes before it closes and releases Qwen.
+
+`CONTEXT_VIRTUALIZATION=false` remains the default. The candidate changes no Claude or Codex
+configuration and does not touch launchd, socket ownership, the forward proxy, or restart
+behavior. Candidate canaries and the rollback audit must pass before a separate production
+activation decision. The companion status-line work reserves `BACKDOOR ON` for live
+Anthropic-to-Qwen outage failover.
 See
 [`docs/superpowers/specs/2026-08-31-offline-context-virtualization-design.md`](docs/superpowers/specs/2026-08-31-offline-context-virtualization-design.md).
 
@@ -821,13 +836,13 @@ Two guards now, because either alone leaves a hole:
 
 Both go through Ollama's **native** API. `keep_alive` in a `/v1/chat/completions` body is silently ignored (verified against Ollama 0.32.13) and the model lands on the global default, so the clamp has to be a separate `/api/generate` call. With no `prompt` that call neither generates nor prefills — it returns `done_reason: "load"`, or `"unload"` for `keep_alive: 0`, and only touches the residency timer.
 
-Closing the breaker does not mean the tier is idle. The breaker closes on the first upstream success, and that success is a newer request than the failover streams still running. A local tier prefilling a 386K-token session emits nothing for minutes, so a stream dispatched during the outage is often still open when the outage ends.
+Closing the breaker does not mean the tier is idle. The breaker closes after two authenticated upstream successes, and those newer requests can arrive while failover streams still run. A local tier prefilling a large session may remain silent for minutes, so a stream dispatched during the outage can remain open when the outage ends.
 
 On 2026-08-26 a failover stream opened at 23:10:34. The breaker closed at 23:14:17 and released `qwen3.5:4b-256k` inside the same 62ms window, while that stream was still generating. It produced nothing after that and died on the 600-second read timeout at 23:20:38.
 
 Backdoor now counts the failover responses that are still generating and holds the unload until the last one finishes. If a fresh outage re-opens the breaker while an unload waits, it drops the unload: that tier is claimed again, and releasing it would evict a model the new outage is already serving from.
 
-Recovery is not instant. While OPEN the breaker probes upstream once per `failover_probe_seconds` (60s), so it cannot notice Anthropic is back until it is allowed to try. Release lands within about a minute of real recovery, against the nine minutes above.
+Recovery requires two consecutive authenticated responses. A failed probe resets the recovery count. While OPEN the breaker probes upstream once per `failover_probe_seconds` (60s), so the second confirmation can take two probe intervals.
 
 `PROVIDER_KEEP_ALIVE` is set on `local-failover-256k` and `local-failover-128k` only. Do not set it on a tier reachable through `MODEL_ROUTES`: a deliberate `/model qwen` session that thinks for longer than the clamp would evict its own 17 GB model and reload it next turn, which is slower and more memory churn than leaving it resident. The same rule is why only breaker-diverted requests are claimed at all — the user asked for that tier, so it is not ours to evict.
 
@@ -843,7 +858,7 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 |---|---|---|---|---|---|
 | `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Removed 2026-08-25 to free disk. Modelfile kept; see below |
 | `qwen3.5:27b-bare` | 27.8B | 17.4 GB | 23 GB | yes | Predecessor, removed 2026-08-16 |
-| `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
+| `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Finite escape hatch for a deliberate local route |
 | `deepseek-r1:14b` | 14.8B | 9.0 GB | 20 GB | **no** | Rejected. Larger footprint than the 27B and cannot call tools |
 
 **3.8 costs 6 GB less resident than the 3.5 tag it replaces**, which is not the direction anyone predicted: 3.8 carries an *extra* vision projector layer, and the estimate written down before measuring was 24 GB. The guess missed by 7 GB. Measure, do not compute.

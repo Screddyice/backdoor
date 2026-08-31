@@ -184,9 +184,8 @@ class Settings(BaseSettings):
     # of a 36GB host on each attempt. The window was configured correctly; there
     # was simply no route from "too big for this tier" to "use the wider one".
     #
-    # Set this to the same bound the tier carries in FAILOVER_LADDER so a
-    # deliberate route and a failover size the tier identically. Over it, the
-    # request escalates through that ladder instead of failing.
+    # Set this to the bound for the named tier. Over it, a deliberate route uses
+    # the finite ROUTE_LADDER. Breaker failover has its own stricter ladder.
     route_max_input_tokens: int = 0
 
     # Optional runtime identity for profiles whose server lifecycle must be
@@ -297,22 +296,43 @@ MODEL_ROUTES: dict[str, str] = {
 # the context instead of the model, so the common case is now a small prompt on
 # a much stronger model.
 #
-# The 4B 256K tier is kept as the escape hatch. Bare mode bounds the system
-# prompt and tool traffic but NOT the conversation, and a long enough transcript
-# still overflows the 27B's 32K window — at which point a weaker model that
-# retains the session beats a stronger one that truncates it.
+# Failover never selects a tier whose declared input limit the request exceeds.
+# Context virtualization reduces long transcripts before this selector runs;
+# without it, an impossible prompt gets a continuity response instead of a
+# model call that cannot complete.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (27_000, "local-qwen38-obliterated"),   # 27K in + 4K out + template reserve
-    (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
+    (22_000, "local-qwen38-obliterated"),
 ]
 
 
-def pick_failover_profile(est_input_tokens: int) -> str:
-    """Choose the failover profile whose window fits this session's size."""
-    for bound, profile in FAILOVER_LADDER:
+# Deliberate local routes retain the existing wide 4B escape hatch, with a
+# finite bound below its 262,144-token context window. This is separate from
+# breaker failover so a chosen `/model qwen` session keeps its established
+# behavior while the outage path always targets the stronger 32K tier.
+ROUTE_LADDER: list[tuple[float, str]] = [
+    (27_000, "local-qwen38-obliterated"),
+    (240_000, "local-failover-256k"),
+]
+
+
+def _pick_profile(
+    ladder: list[tuple[float, str]],
+    est_input_tokens: int,
+) -> str | None:
+    for bound, profile in ladder:
         if est_input_tokens <= bound:
             return profile
-    return FAILOVER_LADDER[-1][1]
+    return None
+
+
+def pick_failover_profile(est_input_tokens: int) -> str | None:
+    """Choose the failover profile whose window fits this session's size."""
+    return _pick_profile(FAILOVER_LADDER, est_input_tokens)
+
+
+def pick_route_profile(est_input_tokens: int) -> str | None:
+    """Choose a finite profile for a deliberate local-model route."""
+    return _pick_profile(ROUTE_LADDER, est_input_tokens)
 
 
 @lru_cache(maxsize=8)

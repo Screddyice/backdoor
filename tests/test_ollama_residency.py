@@ -166,7 +166,9 @@ def test_close_leaves_claims_for_the_caller():
     assert br.open
     br.note_claim(OLLAMA, "qwen3.5:4b-256k")
 
-    br.record_success()
+    assert br.record_success() is False
+    assert br.open
+    assert br.record_success() is True
     assert not br.open
     assert br.drain_claims() == {(OLLAMA, "qwen3.5:4b-256k")}
 
@@ -271,9 +273,8 @@ async def _post(app, body: dict) -> httpx.Response:
 
 
 def _huge_request() -> dict:
-    # Post-strip size must clear the ladder's 28K bound so this lands on the
-    # 256k tier — the expensive one the incident was about. A user message is
-    # the right lever: make_bare truncates tool results, never the transcript.
+    # Post-strip size clears the finite 22K outage bound. A user message is the
+    # right lever: make_bare truncates tool results, never the transcript.
     return {
         "model": "claude-opus-5",
         "messages": [{"role": "user", "content": "reconstruct this session. " * 30_000}],
@@ -281,7 +282,9 @@ def _huge_request() -> dict:
 
 
 @pytest.mark.asyncio
-async def test_outage_claims_and_clamps_then_recovery_unloads(monkeypatch, fake_http):
+async def test_oversized_outage_returns_continuity_without_admin_calls(
+    monkeypatch, fake_http
+):
     # 2, not 1: `_upstream_send` absorbs a single transport failure by retrying
     # once, which is the point of that retry — one blip must not claim the GPU.
     # An outage fails both attempts, and only then does the breaker hear about it.
@@ -298,28 +301,63 @@ async def test_outage_claims_and_clamps_then_recovery_unloads(monkeypatch, fake_
         router_mode="hybrid", failover_to_local=True, failover_threshold=1
     )
     try:
-        # 1) Outage: served locally by the 256k tier, which must be clamped.
-        assert (await _post(app, _huge_request())).status_code == 200
-
-        clamps = [b for _, b in fake_http.calls if b["keep_alive"] == "45s"]
-        assert clamps, f"tier was never clamped; admin calls: {fake_http.calls}"
-        assert clamps[-1]["model"] == "qwen3.5:4b-256k"
+        response = await _post(app, _huge_request())
+        assert response.status_code == 200
+        assert "local inference could not finish" in response.text
+        assert fake_http.calls == []
         assert routes._breaker.open
+    finally:
+        app.dependency_overrides.clear()
+        routes._upstream_client = None
+        routes._breaker = None
 
-        # 2) Recovery: upstream answers, breaker closes, tier must be released.
+
+@pytest.mark.asyncio
+async def test_bounded_outage_claims_then_two_successes_unload(monkeypatch, fake_http):
+    routes._upstream_client = _flaky_upstream([2])
+    routes._breaker = FailoverBreaker(
+        threshold=1,
+        probe_interval=0,
+        recovery_successes=2,
+        online_fn=lambda: False,
+    )
+    monkeypatch.setattr(routes, "_get_profile_client", lambda profile, settings: Recorder())
+
+    async def preserve_profile(profile):
+        return profile
+
+    monkeypatch.setattr(routes.mlx_admin, "resolve_profile", preserve_profile)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="hybrid", failover_to_local=True, failover_threshold=1
+    )
+    request = {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "continue the saved session"}],
+    }
+    try:
+        assert (await _post(app, request)).status_code == 200
+        assert routes._breaker.open
+        assert fake_http.calls == []
+
+        # One authenticated response leaves the breaker and its tier claim open.
         assert (await _post(app, {"model": "claude-opus-5",
                                   "messages": [{"role": "user", "content": "hi"}]})).status_code == 200
+        assert routes._breaker.open
+        assert fake_http.calls == []
+
+        # The second consecutive response closes the breaker and releases Qwen.
+        assert (await _post(app, {"model": "claude-opus-5",
+                                  "messages": [{"role": "user", "content": "again"}]})).status_code == 200
         assert not routes._breaker.open
-
         unloads = [b for _, b in fake_http.calls if b["keep_alive"] == 0]
-        assert unloads, f"tier never released on close; admin calls: {fake_http.calls}"
-        assert unloads[-1]["model"] == "qwen3.5:4b-256k"
+        assert unloads == [{"model": "qwen3.8:27b-obliterated", "keep_alive": 0}]
 
-        # 3) Idempotent: a later success must not re-unload a tier a FRESH
-        #    outage could by then have re-claimed.
+        # A later success cannot re-unload a tier a fresh outage may claim.
         before = len(fake_http.calls)
         await _post(app, {"model": "claude-opus-5",
-                          "messages": [{"role": "user", "content": "again"}]})
+                          "messages": [{"role": "user", "content": "later"}]})
         assert len(fake_http.calls) == before
     finally:
         app.dependency_overrides.clear()
@@ -354,8 +392,8 @@ async def test_deliberate_model_route_is_never_claimed(monkeypatch, fake_http):
 # --------------------------------------------------------------------------
 # Releasing must wait for responses that are still generating
 # --------------------------------------------------------------------------
-# The breaker closes on the first upstream SUCCESS, and that success is a newer,
-# different request than the failover streams still running. A local tier
+# The breaker closes after two authenticated upstream successes. Those newer
+# requests can arrive while failover streams still run. A local tier
 # prefilling a large session emits nothing for minutes, so a stream dispatched
 # during the outage is routinely still open when the outage ends — and the close
 # was unloading the model out from under it.
@@ -397,6 +435,7 @@ async def test_close_defers_release_while_a_failover_stream_is_open(
 
     routes._failover_stream_started()  # a response is mid-generation on that tier
     br.record_success()
+    br.record_success()
     await routes._release_claims(br, Settings(router_mode="hybrid"))
 
     assert _unloads(fake_http) == [], "unloaded a tier a live stream was using"
@@ -414,6 +453,7 @@ async def test_last_stream_out_releases_the_deferred_tier(quiet_inflight, fake_h
 
     routes._failover_stream_started()
     routes._failover_stream_started()  # two sessions failed over onto one tier
+    br.record_success()
     br.record_success()
     await routes._release_claims(br, settings)
 
@@ -443,6 +483,7 @@ async def test_a_fresh_outage_keeps_the_tier_resident(quiet_inflight, fake_http)
     settings = Settings(router_mode="hybrid")
 
     routes._failover_stream_started()
+    br.record_success()
     br.record_success()
     await routes._release_claims(br, settings)
 

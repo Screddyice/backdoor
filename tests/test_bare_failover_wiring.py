@@ -135,16 +135,17 @@ async def test_the_users_actual_question_survives(offline_app):
 
 
 async def test_bare_mode_can_be_disabled(offline_app, monkeypatch):
-    """An escape hatch that does not work is not an escape hatch. If bare mode
-    ever strips something load-bearing, `failover_bare=false` has to restore the
-    old behavior without a code change."""
+    """Disabling compaction cannot authorize an impossible provider prompt."""
     app, recorder = offline_app
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="hybrid", failover_to_local=True, failover_threshold=1,
         failover_bare=False, qwen_cognee=False,
     )
-    await _post(app, _harness_request())
-    assert "official CLI" in json.dumps(recorder.payload)
+    response = await _post(app, _harness_request())
+
+    assert response.status_code == 200
+    assert "local inference could not finish" in response.text
+    assert recorder.payload is None
 
 
 async def test_stripped_size_picks_the_tier(offline_app):
@@ -161,7 +162,7 @@ async def test_stripped_size_picks_the_tier(offline_app):
     bare = make_bare(req)
     stripped = count_messages(bare.messages, bare.system, bare.tools)
 
-    assert pick_failover_profile(raw) == "local-failover-256k"       # the 4B
+    assert pick_failover_profile(raw) is None
     assert pick_failover_profile(stripped) == "local-qwen38-obliterated"
 
 

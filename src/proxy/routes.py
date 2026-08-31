@@ -4,18 +4,30 @@ import asyncio
 import json
 import logging
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-from starlette.background import BackgroundTask
+from starlette.background import BackgroundTask, BackgroundTasks
 
 from .config import (
-    MODEL_ROUTES, Settings, get_settings, load_profile_settings, pick_failover_profile,
+    MODEL_ROUTES, Settings, get_settings, load_profile_settings,
+    pick_failover_profile, pick_route_profile,
     resolve_model_route,
 )
-from .bare import OFFLINE_SYSTEM, make_bare, parse_keep
+from .bare import (
+    OFFLINE_SYSTEM,
+    apply_outage_tool_policy,
+    make_bare,
+    parse_keep,
+)
+from .context_runtime import ContextRuntime, normalized_request_hash
+from .context_store import ContextStore
+from .context_tokenizer import QwenTokenGate
+from .context_window import assemble_working_set
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
 from . import mlx_admin, ollama_admin
@@ -31,6 +43,13 @@ from .optimizations import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+CONTINUITY_TEXT = (
+    "Backdoor kept this session, but local inference could not finish within "
+    "the outage deadline. The cloud session can resume when connectivity "
+    "returns. No computer changes were attempted."
+)
+TRUNCATED_OUTAGE_TEXT = "\n\n[Response truncated during the outage deadline.]"
 
 _client: ProviderClient | None = None
 
@@ -52,6 +71,45 @@ def get_provider_client() -> ProviderClient:
 
 _profile_clients: dict[str, ProviderClient] = {}
 _upstream_client: httpx.AsyncClient | None = None
+_context_runtimes: dict[str, ContextRuntime] = {}
+
+
+@dataclass(frozen=True)
+class PreparedFailover:
+    request: MessagesRequest
+    lineage_id: str
+    payload: dict
+    request_hash: str
+    input_tokens: int
+    count_source: str
+    profile: str
+
+
+def _get_context_runtime(settings: Settings) -> ContextRuntime:
+    path = str(Path(settings.context_store_path).expanduser())
+    runtime = _context_runtimes.get(path)
+    if runtime is None:
+        store = ContextStore(
+            path,
+            max_bytes=settings.context_store_max_bytes,
+            inactive_days=settings.context_inactive_days,
+            busy_timeout_ms=max(1, int(settings.context_archive_timeout_seconds * 1000)),
+        )
+        runtime = ContextRuntime(
+            store,
+            archive_queue_size=settings.context_archive_queue_size,
+            cache_seconds=settings.context_response_cache_seconds,
+        )
+        _context_runtimes[path] = runtime
+    return runtime
+
+
+def _get_token_gate(settings: Settings) -> QwenTokenGate:
+    return QwenTokenGate(
+        settings.context_tokenizer_executable,
+        settings.context_tokenizer_model_path,
+        timeout_seconds=settings.context_tokenizer_timeout_seconds,
+    )
 
 
 def _get_profile_client(profile: str, psettings: Settings) -> ProviderClient:
@@ -200,6 +258,26 @@ def _relay_upstream(uresp: httpx.Response, settings: Settings) -> StreamingRespo
     )
 
 
+async def _archive_cloud_after_response(
+    runtime: ContextRuntime,
+    request: MessagesRequest,
+) -> None:
+    runtime.archive_cloud(request)
+
+
+def _schedule_cloud_archive(
+    response: Response,
+    runtime: ContextRuntime,
+    request: MessagesRequest,
+) -> None:
+    """Queue transcript archival after the cloud response finishes relaying."""
+    archive = BackgroundTask(_archive_cloud_after_response, runtime, request)
+    if response.background is None:
+        response.background = archive
+        return
+    response.background = BackgroundTasks([response.background, archive])
+
+
 async def _guarded_passthrough(request: Request, body: bytes, settings: Settings):
     """Forward a request byte-faithfully to the real Anthropic API and stream
     the response back untouched (auth headers, SSE framing and all), catching
@@ -254,6 +332,7 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
             threshold=settings.failover_threshold,
             window=settings.failover_window_seconds,
             probe_interval=settings.failover_probe_seconds,
+            recovery_successes=settings.failover_recovery_successes,
         )
     return _breaker
 
@@ -272,8 +351,8 @@ async def _release_claims(br: FailoverBreaker, settings: Settings) -> None:
     outage releases LATER than a quiet one. That is why this exists.
 
     But "the breaker closed" is not the same as "nothing is using the tier". The
-    breaker closes on the first upstream SUCCESS, and that success is a
-    different, newer request than the failover streams still running — a local
+    breaker closes after two authenticated upstream successes. Those newer
+    requests can arrive while failover streams still run. A local
     tier prefilling a large session emits nothing for minutes, so a stream
     dispatched during the outage is routinely still open when the outage ends.
     Unloading underneath it evicts the model that stream is mid-generation on.
@@ -387,9 +466,7 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         # Below the threshold: relay the error verbatim so the client's own
         # retry/backoff logic still runs (a lone 429 is normal backpressure).
         return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
-    was_open = br.open
-    br.record_success()
-    if was_open:
+    if br.record_success():
         # The breaker just closed, so every tier it caused to be loaded is now
         # dead weight — unless a failover response is still generating from one.
         await _release_claims(br, settings)
@@ -403,6 +480,10 @@ def _model_from_body(body: bytes) -> str:
         return ""
 
 
+def _is_claude_model(model: str) -> bool:
+    return model.strip().lower().startswith("claude")
+
+
 def _mock_response(req: MessagesRequest, text: str) -> MessagesResponse:
     return MessagesResponse(
         id=f"msg_{uuid.uuid4().hex}",
@@ -410,6 +491,337 @@ def _mock_response(req: MessagesRequest, text: str) -> MessagesResponse:
         content=[{"type": "text", "text": text}],
         stop_reason="end_turn",
         usage=Usage(input_tokens=10, output_tokens=len(text.split())),
+    )
+
+
+def _continuity_response(req: MessagesRequest, reason: str) -> dict:
+    """Return a valid local response without exposing internal failure detail."""
+    response = _mock_response(req, CONTINUITY_TEXT).model_dump(mode="json")
+    response["usage"]["input_tokens"] = count_messages(
+        req.messages,
+        req.system,
+        req.tools,
+    )
+    logger.warning("serving outage continuity response (%s)", reason)
+    return response
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+async def _response_as_sse(response: dict) -> AsyncIterator[str]:
+    """Encode one completed Anthropic response as a valid SSE conversation."""
+    usage = response.get("usage") or {}
+    yield _sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            **response,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": 0,
+            },
+        },
+    })
+    yield _sse_event("ping", {"type": "ping"})
+    for index, block in enumerate(response.get("content") or []):
+        if block.get("type") != "text":
+            continue
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""},
+        })
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": block.get("text", "")},
+        })
+        yield _sse_event("content_block_stop", {
+            "type": "content_block_stop",
+            "index": index,
+        })
+    yield _sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": response.get("stop_reason") or "end_turn",
+            "stop_sequence": response.get("stop_sequence"),
+        },
+        "usage": {"output_tokens": usage.get("output_tokens", 0)},
+    })
+    yield _sse_event("message_stop", {"type": "message_stop"})
+
+
+def _event_data(event: str) -> dict:
+    for line in event.splitlines():
+        if line.startswith("data:"):
+            try:
+                value = json.loads(line[5:].strip())
+                return value if isinstance(value, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+
+def _visible_local_event(event: str) -> bool:
+    data = _event_data(event)
+    if data.get("type") == "content_block_start":
+        return (data.get("content_block") or {}).get("type") == "tool_use"
+    if data.get("type") != "content_block_delta":
+        return False
+    delta = data.get("delta") or {}
+    return delta.get("type") == "text_delta" and bool(delta.get("text"))
+
+
+async def _virtualized_local_stream(
+    client: ProviderClient,
+    payload: dict,
+    msg_id: str,
+    req: MessagesRequest,
+    input_tokens: int,
+    provider: str,
+    strip_inline_thinking: bool,
+    first_text_seconds: float,
+    total_seconds: float,
+) -> AsyncIterator[str]:
+    """Hold SSE framing until useful content and enforce both outage deadlines."""
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    state: dict = {"strip_inline_thinking": strip_inline_thinking}
+    buffered = list(start_stream_events(state, msg_id, req, input_tokens))
+    visible = False
+    terminal = False
+    pending: asyncio.Task | None = None
+    iterator = client.stream(payload).__aiter__()
+
+    async def continuity(reason: str) -> AsyncIterator[str]:
+        response = _continuity_response(req, reason)
+        async for event in _response_as_sse(response):
+            yield event
+
+    def terminal_events() -> list[str]:
+        return stream_openai_to_anthropic(
+            {
+                "choices": [{
+                    "delta": {"content": TRUNCATED_OUTAGE_TEXT},
+                    "finish_reason": "length",
+                }],
+                "usage": {"completion_tokens": state.get("output_tokens", 0)},
+            },
+            state,
+            msg_id,
+            req,
+            input_tokens,
+        )
+
+    try:
+        while not terminal:
+            elapsed = loop.time() - started_at
+            deadline = total_seconds if visible else first_text_seconds
+            remaining = deadline - elapsed
+            if remaining <= 0:
+                if visible:
+                    for event in terminal_events():
+                        yield event
+                else:
+                    async for event in continuity("first_text_timeout"):
+                        yield event
+                return
+
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            wait_for = min(15.0, remaining) if visible else remaining
+            try:
+                chunk = await asyncio.wait_for(
+                    asyncio.shield(pending),
+                    timeout=wait_for,
+                )
+            except asyncio.TimeoutError:
+                if visible and loop.time() - started_at < total_seconds:
+                    yield _sse_event("ping", {"type": "ping"})
+                    continue
+                if visible:
+                    for event in terminal_events():
+                        yield event
+                else:
+                    async for event in continuity("first_text_timeout"):
+                        yield event
+                return
+            except StopAsyncIteration:
+                pending = None
+                if visible:
+                    for event in terminal_events():
+                        yield event
+                else:
+                    async for event in continuity("provider_empty"):
+                        yield event
+                return
+
+            pending = None
+            events = stream_openai_to_anthropic(
+                chunk,
+                state,
+                msg_id,
+                req,
+                input_tokens,
+            )
+            terminal = any(_event_data(event).get("type") == "message_stop" for event in events)
+            first_visible = not visible and any(_visible_local_event(event) for event in events)
+            if first_visible:
+                visible = True
+                for event in buffered:
+                    yield event
+                buffered.clear()
+            if visible:
+                for event in events:
+                    yield event
+            else:
+                buffered.extend(events)
+        logger.info("← %s [stream] done in_tokens=%s", provider, input_tokens)
+    except ProviderError as exc:
+        logger.warning("virtualized provider stream failed (%s)", exc.status_code)
+        if visible:
+            for event in terminal_events():
+                yield event
+        else:
+            async for event in continuity("provider_error"):
+                yield event
+    except Exception as exc:
+        logger.warning("virtualized provider stream failed (%s)", type(exc).__name__)
+        if visible:
+            for event in terminal_events():
+                yield event
+        else:
+            async for event in continuity("provider_error"):
+                yield event
+    finally:
+        if pending is not None:
+            pending.cancel()
+        closer = getattr(iterator, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:
+                pass
+
+
+def _continuity_http(req: MessagesRequest, reason: str):
+    response = _continuity_response(req, reason)
+    if not req.stream:
+        return response
+    return StreamingResponse(
+        _response_as_sse(response),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _iter_cached_events(events: tuple[str, ...]) -> AsyncIterator[str]:
+    for event in events:
+        yield event
+
+
+async def _prepare_virtualized_failover(
+    req: MessagesRequest,
+    router_settings: Settings,
+    runtime: ContextRuntime,
+) -> PreparedFailover | None:
+    """Archive, select, and prove one breaker-confirmed local request."""
+    lineage = await asyncio.wait_for(
+        asyncio.to_thread(runtime.store.archive_request, req),
+        timeout=router_settings.context_archive_timeout_seconds,
+    )
+    profile_settings = load_profile_settings(router_settings.failover_profile)
+    if not router_settings.qwen_cognee:
+        profile_settings.qwen_cognee = False
+    if not router_settings.memory_inject:
+        profile_settings.memory_inject = False
+
+    prepared = await prepare_external_context(req, profile_settings)
+    stripped = make_bare(
+        prepared,
+        keep=parse_keep(router_settings.failover_keep_tools),
+        system=OFFLINE_SYSTEM,
+        tool_result_chars=router_settings.failover_tool_result_chars,
+    )
+    if router_settings.failover_read_only:
+        stripped = apply_outage_tool_policy(stripped)
+    stripped.max_tokens = min(
+        stripped.max_tokens,
+        router_settings.failover_max_output_tokens,
+    )
+
+    def estimated_count(candidate: MessagesRequest) -> int:
+        return count_messages(candidate.messages, candidate.system, candidate.tools)
+
+    assembled = await asyncio.wait_for(
+        asyncio.to_thread(
+            assemble_working_set,
+            stripped,
+            runtime.store,
+            lineage,
+            router_settings.context_target_input_tokens,
+            router_settings.context_hard_input_tokens,
+            estimated_count,
+            router_settings.context_retrieval_tokens,
+        ),
+        timeout=router_settings.context_assembly_timeout_seconds,
+    )
+    if assembled.request is None:
+        logger.warning("context assembly refused local prompt (%s)", assembled.reason)
+        return None
+
+    profile = pick_failover_profile(assembled.selected_tokens)
+    if profile is None:
+        logger.warning(
+            "context assembly produced no fitting profile (in≈%s)",
+            assembled.selected_tokens,
+        )
+        return None
+    if profile != router_settings.failover_profile:
+        profile_settings = load_profile_settings(profile)
+        if not router_settings.memory_inject:
+            profile_settings.memory_inject = False
+
+    payload = build_nim_payload(assembled.request, profile_settings)
+    payload["max_tokens"] = min(
+        int(payload.get("max_tokens") or router_settings.failover_max_output_tokens),
+        router_settings.failover_max_output_tokens,
+    )
+    gate = _get_token_gate(router_settings)
+    fits, counted = await asyncio.wait_for(
+        asyncio.to_thread(
+            gate.fits,
+            payload,
+            router_settings.context_hard_input_tokens,
+        ),
+        timeout=router_settings.context_tokenizer_timeout_seconds + 1.0,
+    )
+    logger.info(
+        "context selected lineage=%s in=%s source=%s retrieved=%s",
+        lineage.lineage_id[:12],
+        counted.value,
+        counted.source,
+        len(assembled.retrieved_hashes),
+    )
+    if not fits:
+        logger.warning(
+            "token gate refused local prompt (%s via %s)",
+            counted.value,
+            counted.source,
+        )
+        return None
+    return PreparedFailover(
+        request=assembled.request,
+        lineage_id=lineage.lineage_id,
+        payload=payload,
+        request_hash=normalized_request_hash(req),
+        input_tokens=counted.value,
+        count_source=counted.source,
+        profile=profile,
     )
 
 
@@ -447,7 +859,12 @@ async def create_message(
     settings: Settings = Depends(get_settings),
 ):
     body = await request.body()
+    router_settings = settings
     client: ProviderClient | None = None
+    context_runtime: ContextRuntime | None = None
+    original_req: MessagesRequest | None = None
+    original_request_hash: str | None = None
+    prepared_failover: PreparedFailover | None = None
     # Set only when the failover path successfully stripped the harness; it then
     # replaces the parsed request below so the stripped version is what is sent.
     bare_req: MessagesRequest | None = None
@@ -459,8 +876,38 @@ async def create_message(
     # router may clamp and later evict on its own — see ollama_admin.
     failed_over = False
 
+    model = _model_from_body(body)
+    context_candidate = (
+        settings.router_mode == "hybrid"
+        and settings.context_virtualization
+        and _is_claude_model(model)
+        and resolve_model_route(model) is None
+    )
+    if context_candidate:
+        original_req = MessagesRequest.model_validate_json(body)
+        original_request_hash = normalized_request_hash(original_req)
+        try:
+            context_runtime = _get_context_runtime(settings)
+            if original_req.stream:
+                cached_events = await context_runtime.cached_stream(original_request_hash)
+                if cached_events is not None:
+                    return StreamingResponse(
+                        _iter_cached_events(cached_events),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
+            else:
+                cached_response = await context_runtime.cached_complete(original_request_hash)
+                if cached_response is not None:
+                    return cached_response
+        except Exception as exc:
+            logger.warning(
+                "context runtime unavailable before routing (%s)",
+                type(exc).__name__,
+            )
+            context_runtime = None
+
     if settings.router_mode == "hybrid":
-        model = _model_from_body(body)
         profile = resolve_model_route(model)
         if profile is None:
             if not settings.failover_to_local:
@@ -472,6 +919,12 @@ async def create_message(
             relay = await _try_upstream(request, body, settings)
             if relay is not None:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
+                if (
+                    context_runtime is not None
+                    and original_req is not None
+                    and relay.status_code < 400
+                ):
+                    _schedule_cloud_archive(relay, context_runtime, original_req)
                 return relay
             # Failed over. Strip the harness FIRST, then size the tier: what the
             # local model has to prefill is the STRIPPED request, so that is what
@@ -481,36 +934,66 @@ async def create_message(
             failed_over = True
             profile = settings.failover_profile
             est = raw_est = None
-            try:
-                fr = MessagesRequest.model_validate_json(body)
-                raw_est = count_messages(fr.messages, fr.system, fr.tools)
-                context_settings = load_profile_settings(profile)
-                # The router-level QWEN_COGNEE=0 escape hatch must survive the
-                # profile load, including true offline failover.
-                if not settings.qwen_cognee:
-                    context_settings.qwen_cognee = False
-                prepared_req = await prepare_external_context(fr, context_settings)
-                fr = prepared_req
-                if settings.failover_bare:
-                    stripped = make_bare(
-                        fr,
-                        keep=parse_keep(settings.failover_keep_tools),
-                        system=OFFLINE_SYSTEM,
-                        tool_result_chars=settings.failover_tool_result_chars,
+            if settings.context_virtualization:
+                if context_runtime is None or original_req is None:
+                    return _continuity_http(
+                        original_req or MessagesRequest.model_validate_json(body),
+                        "context_runtime_unavailable",
                     )
-                    bare_req = stripped  # only on success: make_bare is pure
-                    fr = stripped
-                est = count_messages(fr.messages, fr.system, fr.tools)
-                profile = pick_failover_profile(est)
-            except Exception:
-                # Never let stripping break the failover itself — an unstripped
-                # answer beats no answer. The floor profile still serves it.
-                logger.exception("bare-mode/sizing failed; falling back to %s", profile)
+                try:
+                    raw_est = count_messages(
+                        original_req.messages,
+                        original_req.system,
+                        original_req.tools,
+                    )
+                    prepared_failover = await _prepare_virtualized_failover(
+                        original_req,
+                        settings,
+                        context_runtime,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "context virtualization failed closed (%s)",
+                        type(exc).__name__,
+                    )
+                    prepared_failover = None
+                if prepared_failover is None:
+                    return _continuity_http(original_req, "context_preparation_failed")
+                bare_req = prepared_failover.request
+                profile = prepared_failover.profile
+                est = prepared_failover.input_tokens
+            else:
+                try:
+                    fr = MessagesRequest.model_validate_json(body)
+                    raw_est = count_messages(fr.messages, fr.system, fr.tools)
+                    context_settings = load_profile_settings(profile)
+                    # The router-level QWEN_COGNEE=0 escape hatch must survive the
+                    # profile load, including true offline failover.
+                    if not settings.qwen_cognee:
+                        context_settings.qwen_cognee = False
+                    prepared_req = await prepare_external_context(fr, context_settings)
+                    fr = prepared_req
+                    if settings.failover_bare:
+                        stripped = make_bare(
+                            fr,
+                            keep=parse_keep(settings.failover_keep_tools),
+                            system=OFFLINE_SYSTEM,
+                            tool_result_chars=settings.failover_tool_result_chars,
+                        )
+                        bare_req = stripped  # only on success: make_bare is pure
+                        fr = stripped
+                    est = count_messages(fr.messages, fr.system, fr.tools)
+                    profile = pick_failover_profile(est)
+                except Exception:
+                    logger.exception("bare-mode/sizing failed; falling back to %s", profile)
             logger.warning(
                 "⇢ FAILOVER [%s → %s in≈%s (raw %s)] %s (%s)",
                 model or "?", profile, est, raw_est, request.url.path,
                 get_breaker(settings).reason,
             )
+            if profile is None:
+                continuity_req = bare_req or prepared_req or MessagesRequest.model_validate_json(body)
+                return _continuity_http(continuity_req, "no_profile_fits")
         settings = load_profile_settings(profile)
 
         # An explicit `/model <name>` hit MODEL_ROUTES and so skipped the
@@ -539,7 +1022,7 @@ async def create_message(
                 # window; MODEL_ROUTES is static and would keep sending it there
                 # forever. Escalate instead of failing.
                 if settings.route_max_input_tokens and est > settings.route_max_input_tokens:
-                    escalated = pick_failover_profile(est)
+                    escalated = pick_route_profile(est)
                     if escalated != profile:
                         logger.warning(
                             "⇢ ROUTE ESCALATE [%s → %s] in≈%s over %s",
@@ -576,7 +1059,11 @@ async def create_message(
     if client is None:
         client = get_provider_client()
 
-    est_in = count_messages(req.messages, req.system, req.tools)
+    est_in = (
+        prepared_failover.input_tokens
+        if prepared_failover is not None
+        else count_messages(req.messages, req.system, req.tools)
+    )
 
     # Last-resort tier guard, deliberately placed AFTER every routing branch so
     # no path can skip it. The hybrid branch above already sizes MODEL_ROUTES
@@ -594,7 +1081,7 @@ async def create_message(
     # firing on top of the hybrid branch's.
     if settings.route_max_input_tokens and est_in > settings.route_max_input_tokens:
         try:
-            escalated = pick_failover_profile(est_in)
+            escalated = pick_route_profile(est_in)
             esettings = load_profile_settings(escalated)
             if esettings.provider_model != settings.provider_model:
                 logger.warning(
@@ -624,7 +1111,15 @@ async def create_message(
             settings = load_profile_settings(served_by)
             client = _get_profile_client(served_by, settings)
 
-    payload = build_nim_payload(req, settings)
+    if prepared_failover is not None:
+        payload = dict(prepared_failover.payload)
+        payload["model"] = settings.provider_model
+        payload["max_tokens"] = min(
+            int(payload.get("max_tokens") or router_settings.failover_max_output_tokens),
+            router_settings.failover_max_output_tokens,
+        )
+    else:
+        payload = build_nim_payload(req, settings)
     msg_id = f"msg_{uuid.uuid4().hex}"
     last_user = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
     preview = (last_user if isinstance(last_user, str) else str(last_user))[:80]
@@ -648,6 +1143,38 @@ async def create_message(
             )
 
     if req.stream:
+        if prepared_failover is not None and context_runtime is not None:
+            def stream_factory() -> AsyncIterator[str]:
+                return _virtualized_local_stream(
+                    client,
+                    payload,
+                    msg_id,
+                    req,
+                    prepared_failover.input_tokens,
+                    provider,
+                    settings.provider_strip_inline_thinking,
+                    router_settings.failover_first_text_seconds,
+                    router_settings.failover_total_seconds,
+                )
+
+            def cache_success(events: tuple[str, ...]) -> bool:
+                body = "".join(events)
+                return (
+                    CONTINUITY_TEXT not in body
+                    and TRUNCATED_OUTAGE_TEXT.strip() not in body
+                )
+
+            body = context_runtime.stream_once(
+                prepared_failover.request_hash,
+                stream_factory,
+                cache_predicate=cache_success,
+            )
+            body = _tracked_failover_stream(body, router_settings)
+            return StreamingResponse(
+                body,
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
         input_tokens = est_in
         body = _stream(client, payload, msg_id, req, input_tokens, provider,
                        settings.provider_strip_inline_thinking)
@@ -661,6 +1188,31 @@ async def create_message(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    if prepared_failover is not None and context_runtime is not None:
+        async def complete_local() -> dict:
+            resp = await asyncio.wait_for(
+                client.complete(payload),
+                timeout=router_settings.failover_first_text_seconds,
+            )
+            return nim_response_to_anthropic(
+                resp,
+                req,
+                msg_id,
+                settings.provider_strip_inline_thinking,
+            )
+
+        try:
+            return await context_runtime.run_once(
+                prepared_failover.request_hash,
+                complete_local,
+            )
+        except Exception as exc:
+            logger.warning(
+                "virtualized local completion failed (%s)",
+                type(exc).__name__,
+            )
+            return _continuity_http(req, "local_completion_failed")
 
     try:
         resp = await client.complete(payload)

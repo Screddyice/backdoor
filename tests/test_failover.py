@@ -37,6 +37,7 @@ def make(clock, **kw):
         threshold=kw.pop("threshold", 3),
         window=kw.pop("window", 120.0),
         probe_interval=kw.pop("probe_interval", 60.0),
+        recovery_successes=kw.pop("recovery_successes", 2),
         now_fn=clock,
         notify_fn=lambda title, msg: notes.append(msg),
         # Offline by default: these exercise breaker mechanics, and the breaker
@@ -98,7 +99,9 @@ def test_probe_success_closes_and_notifies():
     for _ in range(3):
         br.record_failure("ConnectError")
     assert br.open
-    br.record_success()
+    assert br.record_success() is False
+    assert br.open
+    assert br.record_success() is True
     assert not br.open
     assert br.allow_upstream() is True
     assert len(notes) == 2                              # opened + recovered
@@ -112,6 +115,18 @@ def test_failure_while_open_keeps_serving_locally():
     clock.t += 61
     assert br.allow_upstream() is True                  # probe
     assert br.record_failure("ConnectError") is True    # probe failed → stay local
+    assert br.open
+
+
+def test_failed_second_recovery_probe_resets_progress():
+    clock = Clock()
+    br, _ = make(clock, recovery_successes=2)
+    for _ in range(3):
+        br.record_failure("ConnectError")
+
+    assert br.record_success() is False
+    assert br.record_failure("still offline") is True
+    assert br.record_success() is False
     assert br.open
 
 
@@ -436,6 +451,7 @@ def test_state_file_publishes_open_then_close():
     assert published["failover_active"] is True
     assert published["reason"] == "ConnectError"
     br.record_success()
+    br.record_success()
     assert _state(br)["failover_active"] is False
 
 
@@ -458,35 +474,46 @@ def test_unwritable_state_path_does_not_break_the_breaker():
 
 
 # ── Failover ladder (size → local tier) ──────────────────────────────────────
-from src.proxy.config import pick_failover_profile, FAILOVER_LADDER
+from src.proxy.config import (
+    FAILOVER_LADDER,
+    ROUTE_LADDER,
+    pick_failover_profile,
+    pick_route_profile,
+)
 
 
 def test_ladder_normal_session_gets_the_strong_tool_capable_tier():
     """The common case after bare-mode stripping: a small prompt, so the
     strongest local model rather than the widest-window one."""
     assert pick_failover_profile(0) == "local-qwen38-obliterated"
-    assert pick_failover_profile(27_000) == "local-qwen38-obliterated"
-    assert pick_failover_profile(27_001) == "local-failover-256k"
+    assert pick_failover_profile(22_000) == "local-qwen38-obliterated"
+    assert pick_failover_profile(22_001) is None
 
 
-def test_ladder_oversize_session_falls_back_to_the_wide_4b():
-    """Bare mode bounds the harness but not the conversation. A transcript that
-    still overflows the 27B's 32K window must keep its context on the 256K 4B —
-    a weaker model that remembers the session beats a stronger one that
-    truncates it."""
-    assert pick_failover_profile(28_001) == "local-failover-256k"
-    assert pick_failover_profile(10_000_000) == "local-failover-256k"
+def test_failover_ladder_never_claims_an_impossible_fit():
+    assert pick_failover_profile(263_000) is None
+    assert pick_failover_profile(507_000) is None
+    assert pick_failover_profile(1_000_000) is None
+    assert pick_failover_profile(10_000_000) is None
+
+
+def test_explicit_route_ladder_keeps_existing_wide_tier_with_a_finite_limit():
+    assert pick_route_profile(27_000) == "local-qwen38-obliterated"
+    assert pick_route_profile(27_001) == "local-failover-256k"
+    assert pick_route_profile(240_000) == "local-failover-256k"
+    assert pick_route_profile(240_001) is None
 
 
 def test_ladder_tiers_have_profile_files():
     """A ladder entry naming a profile that does not exist fails only at the
     moment of an outage, which is the worst possible time to discover it."""
     import os
-    for _, profile in FAILOVER_LADDER:
+    for _, profile in [*FAILOVER_LADDER, *ROUTE_LADDER]:
         assert os.path.exists(f"profiles/{profile}.env"), profile
 
 
 def test_ladder_bounds_are_monotonic():
-    bounds = [b for b, _ in FAILOVER_LADDER]
-    assert bounds == sorted(bounds)
-    assert bounds[-1] == float("inf")
+    for ladder in (FAILOVER_LADDER, ROUTE_LADDER):
+        bounds = [bound for bound, _ in ladder]
+        assert bounds == sorted(bounds)
+        assert all(bound != float("inf") for bound in bounds)

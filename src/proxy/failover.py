@@ -209,6 +209,7 @@ class FailoverBreaker:
         threshold: int = 1,
         window: float = 120.0,
         probe_interval: float = 60.0,
+        recovery_successes: int = 2,
         now_fn: Callable[[], float] = time.monotonic,
         notify_fn: Callable[[str, str], None] = _notify,
         online_fn: Callable[[], bool] = internet_reachable,
@@ -217,6 +218,7 @@ class FailoverBreaker:
         self.threshold = threshold
         self.window = window
         self.probe_interval = probe_interval
+        self.recovery_successes = max(1, recovery_successes)
         self._now = now_fn
         self._notify = notify_fn
         self._online = online_fn
@@ -226,6 +228,7 @@ class FailoverBreaker:
         self._failures = 0
         self._first_failure_at = 0.0
         self._last_probe_at = 0.0
+        self._recovery_streak = 0
         # (provider_base_url, model) pairs this breaker has caused to be loaded.
         # Held so closing can hand them back — see note_claim/drain_claims.
         self._claims: set[tuple[str, str]] = set()
@@ -268,6 +271,7 @@ class FailoverBreaker:
         caller should serve THIS request locally (breaker open, including the
         request whose failure just opened it)."""
         now = self._now()
+        self._recovery_streak = 0
         if self._failures == 0 or (now - self._first_failure_at) > self.window:
             self._failures = 1
             self._first_failure_at = now
@@ -326,8 +330,8 @@ class FailoverBreaker:
         claims, self._claims = self._claims, set()
         return claims
 
-    def record_success(self) -> None:
-        """Any non-trigger upstream response: reset, and close if OPEN.
+    def record_success(self) -> bool:
+        """Record one authenticated success and report a completed recovery.
 
         Closing leaves the claimed local tiers still resident — the caller must
         drain_claims() and unload them. This is the moment that matters for
@@ -335,12 +339,25 @@ class FailoverBreaker:
         needed, and waiting for Ollama's idle timer instead left ~9.7 GB wired
         for ~9 minutes past it on 2026-08-24.
         """
-        was_open = self.open
-        if was_open:
-            logger.warning("failover CLOSED — Anthropic reachable again")
-            self._notify("Backdoor failover", "Anthropic recovered — back to cloud")
+        self._failures = 0
+        if not self.open:
+            self.reason = ""
+            self._recovery_streak = 0
+            return False
+
+        self._recovery_streak += 1
+        if self._recovery_streak < self.recovery_successes:
+            logger.info(
+                "Anthropic recovery probe %d/%d succeeded; keeping failover open",
+                self._recovery_streak,
+                self.recovery_successes,
+            )
+            return False
+
+        logger.warning("failover CLOSED — Anthropic reachable again")
+        self._notify("Backdoor failover", "Anthropic recovered — back to cloud")
         self.open = False
         self.reason = ""
-        self._failures = 0
-        if was_open:
-            self._publish()
+        self._recovery_streak = 0
+        self._publish()
+        return True
