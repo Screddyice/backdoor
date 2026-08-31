@@ -1,8 +1,8 @@
 # Offline Context Virtualization for Backdoor Failover
 
-**Status:** Approved in chat for specification review  
-**Date:** 2026-08-31  
-**Scope:** Claude Messages API outage failover in Backdoor and its Claude status indicator  
+**Status:** Approved in chat for specification review
+**Date:** 2026-08-31
+**Scope:** Claude Messages API outage failover in Backdoor and its Claude status indicator
 **Source branch:** `design/offline-context-virtualization`
 
 ## Summary
