@@ -166,9 +166,10 @@ class Settings(BaseSettings):
         return self
 
     # Large pages and attachments fetched by any client are reduced before a
-    # local Qwen sees them, then stored in and recalled from Cognee. Local
-    # ranking always runs; QWEN_COGNEE=0 disables only network memory for true
-    # offline use. Every Cognee call is bounded and fail-open.
+    # local Qwen sees them. Only approved unauthenticated public fetches may be
+    # stored in and recalled from Cognee. Local ranking always runs;
+    # QWEN_COGNEE=0 disables network memory for true offline use. Every Cognee
+    # call is bounded and fail-open.
     qwen_cognee: bool = True
     external_context_threshold_chars: int = 12000
     external_context_char_budget: int = 6000

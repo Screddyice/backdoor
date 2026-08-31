@@ -11,17 +11,14 @@ Shape: a classic circuit breaker.
           the threshold are relayed verbatim so the client's own retry logic
           still runs.
   OPEN    reached after `threshold` consecutive failures inside `window`
-          seconds AND a connectivity probe confirming this host is offline.
-          Passthrough-bound /v1/messages requests are served by the failover
-          profile. One request per `probe_interval` is allowed to try upstream
+          seconds. Anthropic also requires a connectivity probe confirming this
+          host is offline; other breakers may opt into service-level failover.
+          One request per `probe_interval` is allowed to try upstream
           (half-open); a success closes the breaker.
 
-**Opening the breaker means exactly one thing: this machine is offline.** That
-narrowness is deliberate and load-bearing, because failing over is not free —
-it loads a qwen tier (up to ~13 GB) into the same Ollama server the llm-jury
-council needs, on a host where the council already wants ~23 GB of a 36 GB
-budget. Two local-GPU consumers at once is how this Mac gets taken down, so the
-router may only claim the GPU when it is the *only* way a session survives.
+Anthropic opens its breaker only when this machine is offline. Codex may open
+its independent breaker for configured service failures, but both publish the
+same local-GPU ownership state before loading Qwen.
 
 Two consequences follow, and both are why triggers are as tight as they are:
 
