@@ -1116,6 +1116,12 @@ Claude and Codex also write a process-scoped lease under `~/.backdoor/compute-le
 
 Writing is best-effort. A router that cannot publish state still routes, and LLM-Jury treats missing or unreadable state as inactive. Ollama residency remains the final backstop after a lease expires.
 
+**The file belongs to whoever is serving, and a newcomer cannot take it from a live owner.** Transitions publish unconditionally, because reaching one means this process handled a request and therefore owns the port. The one publish that happens before the process has done anything — construction — writes only when the file is missing, unparseable, pid-less, ours, or owned by a pid that is no longer running.
+
+That asymmetry is load-bearing. Launching a second router against an already-bound port builds its breakers, fails to bind, and exits, and an unconditional publish on construction let that doomed process stamp `failover_active: false` and its own pid over a live router in the middle of a failover. llm-jury would then read "GPU free" while a qwen tier was resident — the exact co-residency the file exists to prevent. Its pid-liveness check cannot catch this one, because the clobbering pid is genuinely alive at the moment it writes.
+
+Deferring the initial write costs nothing. It exists to clear a flag left behind by a router that died while OPEN, and such a flag names a dead pid: unowned here, and inactive to llm-jury.
+
 | Setting | Default | Effect |
 |---|---|---|
 | `failover_to_local` | `true` | Master switch for hybrid-mode failover |
