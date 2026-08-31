@@ -382,9 +382,9 @@ Leave `model_context_window` and `model_auto_compact_token_limit` unset. Codex u
 
 ### What happens to a running thread
 
-While ChatGPT inference works, Backdoor relays the original request, OAuth headers, response status, and SSE bytes. Backdoor sends cloud traffic without parsing it or applying Qwen's 32K check. ChatGPT enforces the selected cloud model's input limit. Codex compaction requests also stay on the ChatGPT relay. Codex sends account, plugin, and other hosted traffic to ChatGPT because Backdoor replaces the inference provider alone.
+While ChatGPT inference works, Backdoor relays the original request, query string, OAuth headers, response status, and response bytes. Backdoor sends cloud traffic without parsing it or applying Qwen's 32K check. ChatGPT enforces the selected cloud model's input limit. Codex compaction requests also stay on the ChatGPT relay. Codex sends account, plugin, and other hosted traffic to ChatGPT because Backdoor replaces the inference provider alone.
 
-The relay accepts request bodies up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must send a larger encoded request.
+The custom provider accepts `GET /models`, `POST /responses`, and `POST /responses/compact`. Backdoor returns `404` for other `/backend-api/codex/**` paths before the Anthropic catch-all can receive ChatGPT credentials. The relay accepts request bodies and buffered provider responses up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must cross that encoded boundary.
 
 After three eligible failures inside 120 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
 
@@ -395,6 +395,10 @@ The visible Codex thread does not change. Qwen receives a fresh internal request
 - local Code Mode tools converted from Codex's Responses Lite namespace format.
 
 It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Cognee can provide continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads agent recall through `POST /api/v1/recall`. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_COGNEE=0` to suppress every Cognee read and write on the local path.
+
+Backdoor treats an omitted `stream` field as `false`, matching the Responses API, and returns non-streaming local replies as `application/json`. Streaming requests keep SSE. The local request carries `max_output_tokens`; omitted or larger values use the 4,000-token reply reserve, while smaller positive limits remain unchanged.
+
+Approved public-source writes use one in-flight Cognee operation per document digest. The durable-source filter rejects private keys, bearer and vendor tokens, AWS access keys, JWTs, cookies, password assignments, and credentialed database URLs before the write starts.
 
 Cognee authentication resolves from the running process, `~/.cognee/.env`, then the existing `~/.cognee-plugin/api_key.json` cache when its server URL matches. The key is not copied into the Backdoor LaunchAgent.
 

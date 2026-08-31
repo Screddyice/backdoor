@@ -132,6 +132,20 @@ def test_secret_shaped_documents_are_never_sent_to_cognee():
     assert safe_to_remember("A public report about product launch pricing.")
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "AWS key: AKIAABCDEFGHIJKLMNOP",
+        "token=eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.c2lnbmF0dXJl",
+        "password=example-password-value",
+        "Cookie: session=example-cookie-value",
+        "DATABASE_URL=postgresql://user:example-password@db.example/app",
+    ],
+)
+def test_common_secret_shapes_are_never_sent_to_cognee(text):
+    assert not safe_to_remember(text)
+
+
 def test_secret_shaped_message_source_url_is_never_sent_to_cognee():
     request = _request("Public report. " * 1_000)
     request.messages[1].content[0]["input"]["url"] = (

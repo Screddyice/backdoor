@@ -50,6 +50,15 @@ _SECRET_PATTERNS = (
     re.compile(r"\bAuthorization\s*:\s*Bearer\s+\S+", re.I),
     re.compile(r"\b(?:api[_-]?key|access[_-]?token|client[_-]?secret)\s*[=:]\s*\S+", re.I),
     re.compile(r"\b(?:sk|ghp|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{16,}\b", re.I),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\b(?:password|passwd|pwd)\s*[=:]\s*[^\s,;]{8,}", re.I),
+    re.compile(r"\b(?:set-cookie|cookie)\s*:\s*[^\s=;,]+=[^\s;,]+", re.I),
+    re.compile(
+        r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://"
+        r"[^\s/:@]+:[^\s/@]+@",
+        re.I,
+    ),
 )
 _PUBLIC_FETCH_TOOL_NAMES = {"web_fetch", "webfetch"}
 _PUBLIC_FETCH_INPUT_KEYS = {"prompt", "url"}
