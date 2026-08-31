@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -91,11 +92,12 @@ def main() -> None:
 
     host = _host_from_env()
     require_host_allowlist(host)
-    build_server().run(
-        transport="streamable-http",
-        host=host,
-        port=_port_from_env(),
-        transport_security=_transport_security(),
+    asyncio.run(
+        build_server().run_streamable_http_async(
+            host=host,
+            port=_port_from_env(),
+            transport_security=_transport_security(),
+        )
     )
 
 

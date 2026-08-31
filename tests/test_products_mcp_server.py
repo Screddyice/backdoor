@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+import src.products_mcp.server as products_server
+from src.hermes_mcp.http_server import TransportSecuritySettings
 from src.products_mcp.server import build_server
 
 
@@ -65,3 +67,28 @@ async def test_status_and_call_tools_return_product_scoped_results(monkeypatch, 
         "tool": "account_list",
         "arguments": {"limit": 2},
     }
+
+
+def test_main_passes_configured_bind_to_explicit_http_runner(monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_MCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("HERMES_MCP_PORT", "8010")
+    monkeypatch.setenv(
+        "HERMES_MCP_ALLOWED_HOSTS",
+        "screddy-products.5-161-126-205.sslip.io:443",
+    )
+    captured = {}
+
+    class FakeServer:
+        def run(self, **kwargs):
+            raise AssertionError("main() used the generic runner")
+
+        async def run_streamable_http_async(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(products_server, "build_server", lambda: FakeServer())
+
+    products_server.main()
+
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8010
+    assert isinstance(captured["transport_security"], TransportSecuritySettings)
