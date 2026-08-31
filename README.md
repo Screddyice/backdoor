@@ -1172,10 +1172,12 @@ HyperCrawl uses its tenant REST token, HyperScale uses its organization API key,
 uses its internal key plus explicit user ID. Credentials stay in their existing protected
 environment files. The Claude connector receives only the public MCP URL.
 
-Install [`deploy/products-mcp-http.service`](deploy/products-mcp-http.service) as a user service,
-route the public OAuth and MCP paths to its loopback port, then add the public `/mcp` URL as a
-Claude custom connector. Verification requires OAuth completion, nine tools in `tools/list`, one
-successful `*_status` call per product, and connector persistence after a Claude reload.
+Deploy this branch in `~/backdoor-products-mcp`, then install
+[`deploy/products-mcp-http.service`](deploy/products-mcp-http.service) as a user service. The
+separate checkout keeps connector updates from changing the live router or Hermes bridge. Route the
+public OAuth and MCP paths to its loopback port, then add the public `/mcp` URL as a Claude custom
+connector. Verification requires OAuth completion, nine tools in `tools/list`, one successful
+`*_status` call per product, and connector persistence after a Claude reload.
 
 ---
 
