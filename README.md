@@ -289,15 +289,16 @@ Token counts only pick a local-model failover profile, so an estimate costs prec
 threshold and nothing else. Override the cache location with `TIKTOKEN_CACHE_DIR`.
 
 A restart still severs requests already in flight. Those sessions recover on their next retry, or
-at once with Esc and resend.
+at once with Esc and resend. Claude and Codex agents must not restart this service: the router is
+their repair path, so a failed restart can strand both clients. Machine-level pre-tool hooks block
+live launchd, deploy-checkout, dependency, and process mutations while leaving read-only health
+checks available.
 
 **The router is serving code you did not just edit**
-The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), in detached HEAD, not from your dev clone. Editing the dev clone changes nothing until you deploy:
-
-```
-cd ~/projects/Screddyice/backdoor-service && git fetch origin && git checkout <sha>
-launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
-```
+The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), in detached HEAD,
+not from your dev clone. Editing the dev clone changes nothing until a human performs a live
+deployment from an independent Terminal session. Agents may inspect the checkout and prepare a
+tested commit, but the live checkout and launchd job are user-operated control-plane state.
 
 A dev-clone process started by hand on the same port hides this completely, because it answers
 first and serves current code. Kill it and the stale service takes over, which reads as a sudden
@@ -517,11 +518,11 @@ must copy that `SoftResourceLimits` block, switch `ProgramArguments` to
 `PORT` environment keys shown in the example. The startup-safe launcher creates bounded logging
 before uvicorn imports the application. Replace every `/Users/you` placeholder before installing
 the file. `kickstart` does not reload a changed plist. Boot out the loaded definition, bootstrap
-the file, then confirm the applied limit:
+the file. Applying a changed launch agent is a live control-plane operation. Do it only from an
+independent Terminal session with direct-cloud rescue access and a rollback copy already in place.
+After the user-operated change, inspect the applied limit with:
 
 ```bash
-launchctl bootout --wait gui/$(id -u)/com.screddy.backdoor-router
-launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.screddy.backdoor-router.plist"
 launchctl print gui/$(id -u)/com.screddy.backdoor-router | grep -A3 resource-limits
 ```
 
@@ -567,14 +568,19 @@ ln -s ../backdoor/.env .env                                 # gitignored, loaded
 ln -s ../../backdoor/profiles/modal-qwen.env profiles/      # gitignored profile, if you use it
 ```
 
-Detached rather than a checked-out branch, so `git checkout main` still works in the dev tree. Symlink the config instead of copying it, so the two never drift apart. Then point the service at `backdoor-service` and deploy on purpose:
+Detached rather than a checked-out branch, so `git checkout main` still works in the dev tree.
+Symlink the config instead of copying it, so the two never drift apart. Keep deployment separate
+from source work: an agent can prepare and verify the candidate commit, but only the user changes
+the detached live checkout or restarts the launchd job. Agents can inspect live state with:
 
 ```bash
-git -C ../backdoor-service fetch origin main
-git -C ../backdoor-service checkout --detach origin/main
-(cd ../backdoor-service && uv sync --frozen)
-launchctl kickstart -k gui/$(id -u)/com.screddy.backdoor-router
+git -C ../backdoor-service status --short --branch
+git -C ../backdoor-service log -1 --oneline
+launchctl print gui/$(id -u)/com.screddy.backdoor-router | head
 ```
+
+The 2026-08-31 incident explains this boundary in
+[`docs/incidents/2026-08-31-router-self-lockout.md`](docs/incidents/2026-08-31-router-self-lockout.md).
 
 The tradeoff is that editing code in your clone no longer deploys. That is the point: a restart
 can no longer pick up half-finished work. The example LaunchAgent writes the rotating router log
