@@ -48,9 +48,11 @@ class RecordingClient:
         self.payloads = []
         self.delay = 0.0
         self.failure: ProviderError | None = None
+        self.complete_responses = []
         self.stream_calls = 0
         self.stream_delay_before = 0.0
         self.stream_delay_after = 0.0
+        self.stream_sequences = []
 
     async def complete(self, payload):
         self.payloads.append(payload)
@@ -58,6 +60,8 @@ class RecordingClient:
             await asyncio.sleep(self.delay)
         if self.failure is not None:
             raise self.failure
+        if self.complete_responses:
+            return self.complete_responses.pop(0)
         return {
             "choices": [{
                 "finish_reason": "stop",
@@ -69,6 +73,10 @@ class RecordingClient:
     async def stream(self, payload):
         self.payloads.append(payload)
         self.stream_calls += 1
+        if self.stream_sequences:
+            for chunk in self.stream_sequences.pop(0):
+                yield chunk
+            return
         if self.stream_delay_before:
             await asyncio.sleep(self.stream_delay_before)
         yield {
@@ -206,6 +214,7 @@ async def test_long_outage_request_reaches_provider_bounded_and_read_only(virtua
         "Read",
         "Glob",
         "Grep",
+        "backdoor_context_search",
     ]
     assert "Which rollback revision did we record?" in json.dumps(payload)
     assert "621d765" in json.dumps(payload)
@@ -379,3 +388,151 @@ async def test_stream_total_deadline_emits_marker_and_terminal_event(virtualized
     terminal = response.text.rstrip().split("\n\n")[-1]
     assert terminal.splitlines()[0] == "event: message_stop"
     assert json.loads(terminal.splitlines()[1][5:].strip()) == {"type": "message_stop"}
+
+
+def internal_search_response(query: str) -> dict:
+    return {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "context-1",
+                    "type": "function",
+                    "function": {
+                        "name": "backdoor_context_search",
+                        "arguments": json.dumps({"query": query}),
+                    },
+                }],
+            },
+        }],
+        "usage": {"prompt_tokens": 180, "completion_tokens": 4},
+    }
+
+
+def text_response(text: str) -> dict:
+    return {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": text, "tool_calls": []},
+        }],
+        "usage": {"prompt_tokens": 220, "completion_tokens": 4},
+    }
+
+
+async def test_internal_search_runs_once_and_never_reaches_claude(virtualized_app):
+    app, recorder, gate, _transport, _settings = virtualized_app
+    recorder.complete_responses = [
+        internal_search_response("rollback revision"),
+        text_response("The rollback revision was 621d765."),
+    ]
+
+    response = await post(app, long_request())
+
+    assert response.status_code == 200
+    assert len(recorder.payloads) == 2
+    assert len(gate.calls) == 2
+    assert "621d765" in response.text
+    assert "backdoor_context_search" not in response.text
+    first_tools = [tool["function"]["name"] for tool in recorder.payloads[0]["tools"]]
+    second_tools = [tool["function"]["name"] for tool in recorder.payloads[1]["tools"]]
+    assert first_tools == ["Read", "Glob", "Grep", "backdoor_context_search"]
+    assert second_tools == ["Read", "Glob", "Grep"]
+
+
+async def test_internal_search_is_skipped_after_twenty_seconds(
+    virtualized_app, monkeypatch
+):
+    app, recorder, _gate, _transport, _settings = virtualized_app
+    recorder.complete_responses = [internal_search_response("rollback revision")]
+    recorder.delay = 0.02
+    monkeypatch.setattr(routes, "INTERNAL_SEARCH_DEADLINE_SECONDS", 0.001)
+
+    response = await post(app, long_request())
+
+    assert response.status_code == 200
+    assert "local inference could not finish" in response.text
+    assert len(recorder.payloads) == 1
+    assert "backdoor_context_search" not in response.text
+
+
+async def test_second_internal_search_is_rejected_without_exposing_tool(virtualized_app):
+    app, recorder, _gate, _transport, _settings = virtualized_app
+    recorder.complete_responses = [
+        internal_search_response("rollback revision"),
+        internal_search_response("try again"),
+    ]
+
+    response = await post(app, long_request())
+
+    assert response.status_code == 200
+    assert "local inference could not finish" in response.text
+    assert len(recorder.payloads) == 2
+    assert "backdoor_context_search" not in response.text
+
+
+async def test_read_tool_call_still_reaches_claude(virtualized_app):
+    app, recorder, _gate, _transport, _settings = virtualized_app
+    recorder.complete_responses = [{
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "read-2",
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "arguments": json.dumps({"file_path": "/tmp/a"}),
+                    },
+                }],
+            },
+        }],
+        "usage": {"prompt_tokens": 180, "completion_tokens": 4},
+    }]
+
+    response = await post(app, long_request())
+
+    assert response.status_code == 200
+    assert '"name":"Read"' in response.text
+    assert "backdoor_context_search" not in response.text
+    assert len(recorder.payloads) == 1
+
+
+async def test_streamed_internal_search_runs_once_without_exposing_tool(virtualized_app):
+    app, recorder, _gate, _transport, _settings = virtualized_app
+    recorder.stream_sequences = [
+        [
+            {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "context-stream-1",
+                            "function": {
+                                "name": "backdoor_context_search",
+                                "arguments": '{"query":"rollback revision"}',
+                            },
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            },
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ],
+        [
+            {"choices": [{"delta": {"content": "621d765"}, "finish_reason": None}]},
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 220, "completion_tokens": 2},
+            },
+        ],
+    ]
+
+    response = await post(app, long_request(stream=True))
+
+    assert response.status_code == 200
+    assert recorder.stream_calls == 2
+    assert "621d765" in response.text
+    assert "backdoor_context_search" not in response.text
+    assert "event: message_stop" in response.text

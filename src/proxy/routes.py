@@ -24,7 +24,14 @@ from .bare import (
     make_bare,
     parse_keep,
 )
-from .context_runtime import ContextRuntime, normalized_request_hash
+from .context_runtime import (
+    ContextRuntime,
+    add_internal_search_tool,
+    build_internal_search_followup,
+    contains_internal_search,
+    normalized_request_hash,
+    parse_internal_search,
+)
 from .context_store import ContextStore
 from .context_tokenizer import QwenTokenGate
 from .context_window import assemble_working_set
@@ -50,6 +57,7 @@ CONTINUITY_TEXT = (
     "returns. No computer changes were attempted."
 )
 TRUNCATED_OUTAGE_TEXT = "\n\n[Response truncated during the outage deadline.]"
+INTERNAL_SEARCH_DEADLINE_SECONDS = 20.0
 
 _client: ProviderClient | None = None
 
@@ -576,6 +584,67 @@ def _visible_local_event(event: str) -> bool:
     return delta.get("type") == "text_delta" and bool(delta.get("text"))
 
 
+def _chunk_has_tool_calls(chunk: dict) -> bool:
+    choices = chunk.get("choices") if isinstance(chunk, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    delta = choices[0].get("delta") or {}
+    return isinstance(delta, dict) and bool(delta.get("tool_calls"))
+
+
+async def _internal_followup_payload(
+    req: MessagesRequest,
+    chunks: list[dict],
+    prepared: PreparedFailover,
+    runtime: ContextRuntime,
+    router_settings: Settings,
+    profile_settings: Settings,
+    started_at: float,
+) -> tuple[MessagesRequest, dict, int]:
+    loop = asyncio.get_running_loop()
+    if loop.time() - started_at >= INTERNAL_SEARCH_DEADLINE_SECONDS:
+        raise TimeoutError("internal context search started after its deadline")
+    search = parse_internal_search(chunks)
+    if search is None:
+        raise ValueError("malformed or mixed internal context search")
+
+    remaining = INTERNAL_SEARCH_DEADLINE_SECONDS - (loop.time() - started_at)
+    followup = await asyncio.wait_for(
+        asyncio.to_thread(
+            build_internal_search_followup,
+            req,
+            search,
+            prepared.lineage_id,
+            runtime.store,
+            lambda text: len(text.encode("utf-8")),
+            result_tokens=router_settings.context_internal_result_tokens,
+        ),
+        timeout=min(router_settings.context_assembly_timeout_seconds, remaining),
+    )
+    followup.stream = req.stream
+    payload = build_nim_payload(followup, profile_settings)
+    payload["max_tokens"] = min(
+        int(payload.get("max_tokens") or router_settings.failover_max_output_tokens),
+        router_settings.failover_max_output_tokens,
+    )
+
+    remaining = INTERNAL_SEARCH_DEADLINE_SECONDS - (loop.time() - started_at)
+    if remaining <= 0:
+        raise TimeoutError("internal context search exceeded its deadline")
+    gate = _get_token_gate(router_settings)
+    fits, counted = await asyncio.wait_for(
+        asyncio.to_thread(
+            gate.fits,
+            payload,
+            router_settings.context_hard_input_tokens,
+        ),
+        timeout=min(router_settings.context_tokenizer_timeout_seconds + 1.0, remaining),
+    )
+    if not fits:
+        raise ValueError("internal context result exceeded the Qwen input limit")
+    return followup, payload, counted.value
+
+
 async def _virtualized_local_stream(
     client: ProviderClient,
     payload: dict,
@@ -586,6 +655,10 @@ async def _virtualized_local_stream(
     strip_inline_thinking: bool,
     first_text_seconds: float,
     total_seconds: float,
+    prepared: PreparedFailover,
+    runtime: ContextRuntime,
+    router_settings: Settings,
+    profile_settings: Settings,
 ) -> AsyncIterator[str]:
     """Hold SSE framing until useful content and enforce both outage deadlines."""
     loop = asyncio.get_running_loop()
@@ -596,6 +669,10 @@ async def _virtualized_local_stream(
     terminal = False
     pending: asyncio.Task | None = None
     iterator = client.stream(payload).__aiter__()
+    active_req = req
+    active_input_tokens = input_tokens
+    search_chunks: list[dict] = []
+    internal_used = False
 
     async def continuity(reason: str) -> AsyncIterator[str]:
         response = _continuity_response(req, reason)
@@ -613,9 +690,36 @@ async def _virtualized_local_stream(
             },
             state,
             msg_id,
-            req,
-            input_tokens,
+            active_req,
+            active_input_tokens,
         )
+
+    async def close_iterator() -> None:
+        closer = getattr(iterator, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:
+                pass
+
+    async def begin_internal_followup(chunks: list[dict]) -> None:
+        nonlocal active_req, active_input_tokens, internal_used, iterator
+        if internal_used:
+            raise ValueError("repeated internal context search")
+        followup, followup_payload, counted = await _internal_followup_payload(
+            active_req,
+            chunks,
+            prepared,
+            runtime,
+            router_settings,
+            profile_settings,
+            started_at,
+        )
+        await close_iterator()
+        active_req = followup
+        active_input_tokens = counted
+        internal_used = True
+        iterator = client.stream(followup_payload).__aiter__()
 
     try:
         while not terminal:
@@ -652,6 +756,10 @@ async def _virtualized_local_stream(
                 return
             except StopAsyncIteration:
                 pending = None
+                if search_chunks and contains_internal_search(search_chunks):
+                    await begin_internal_followup(search_chunks)
+                    search_chunks.clear()
+                    continue
                 if visible:
                     for event in terminal_events():
                         yield event
@@ -661,13 +769,31 @@ async def _virtualized_local_stream(
                 return
 
             pending = None
-            events = stream_openai_to_anthropic(
-                chunk,
-                state,
-                msg_id,
-                req,
-                input_tokens,
-            )
+            if search_chunks or _chunk_has_tool_calls(chunk):
+                search_chunks.append(chunk)
+                choices = chunk.get("choices") if isinstance(chunk, dict) else None
+                choice = choices[0] if isinstance(choices, list) and choices else {}
+                finish = choice.get("finish_reason") if isinstance(choice, dict) else None
+                if finish is None:
+                    continue
+                if contains_internal_search(search_chunks):
+                    await begin_internal_followup(search_chunks)
+                    search_chunks.clear()
+                    continue
+                raw_chunks = list(search_chunks)
+                search_chunks.clear()
+            else:
+                raw_chunks = [chunk]
+
+            events = []
+            for raw_chunk in raw_chunks:
+                events.extend(stream_openai_to_anthropic(
+                    raw_chunk,
+                    state,
+                    msg_id,
+                    active_req,
+                    active_input_tokens,
+                ))
             terminal = any(_event_data(event).get("type") == "message_stop" for event in events)
             first_visible = not visible and any(_visible_local_event(event) for event in events)
             if first_visible:
@@ -680,7 +806,7 @@ async def _virtualized_local_stream(
                     yield event
             else:
                 buffered.extend(events)
-        logger.info("← %s [stream] done in_tokens=%s", provider, input_tokens)
+        logger.info("← %s [stream] done in_tokens=%s", provider, active_input_tokens)
     except ProviderError as exc:
         logger.warning("virtualized provider stream failed (%s)", exc.status_code)
         if visible:
@@ -700,12 +826,7 @@ async def _virtualized_local_stream(
     finally:
         if pending is not None:
             pending.cancel()
-        closer = getattr(iterator, "aclose", None)
-        if closer is not None:
-            try:
-                await closer()
-            except Exception:
-                pass
+        await close_iterator()
 
 
 def _continuity_http(req: MessagesRequest, reason: str):
@@ -786,7 +907,9 @@ async def _prepare_virtualized_failover(
         if not router_settings.memory_inject:
             profile_settings.memory_inject = False
 
-    payload = build_nim_payload(assembled.request, profile_settings)
+    payload = add_internal_search_tool(
+        build_nim_payload(assembled.request, profile_settings)
+    )
     payload["max_tokens"] = min(
         int(payload.get("max_tokens") or router_settings.failover_max_output_tokens),
         router_settings.failover_max_output_tokens,
@@ -1155,6 +1278,10 @@ async def create_message(
                     settings.provider_strip_inline_thinking,
                     router_settings.failover_first_text_seconds,
                     router_settings.failover_total_seconds,
+                    prepared_failover,
+                    context_runtime,
+                    router_settings,
+                    settings,
                 )
 
             def cache_success(events: tuple[str, ...]) -> bool:
@@ -1191,13 +1318,38 @@ async def create_message(
 
     if prepared_failover is not None and context_runtime is not None:
         async def complete_local() -> dict:
+            loop = asyncio.get_running_loop()
+            started_at = loop.time()
             resp = await asyncio.wait_for(
                 client.complete(payload),
                 timeout=router_settings.failover_first_text_seconds,
             )
+            response_req = req
+            if contains_internal_search([resp]):
+                response_req, followup_payload, _ = await _internal_followup_payload(
+                    req,
+                    [resp],
+                    prepared_failover,
+                    context_runtime,
+                    router_settings,
+                    settings,
+                    started_at,
+                )
+                remaining = (
+                    router_settings.failover_first_text_seconds
+                    - (loop.time() - started_at)
+                )
+                if remaining <= 0:
+                    raise TimeoutError("internal context follow-up missed first text")
+                resp = await asyncio.wait_for(
+                    client.complete(followup_payload),
+                    timeout=remaining,
+                )
+                if contains_internal_search([resp]):
+                    raise ValueError("repeated internal context search")
             return nim_response_to_anthropic(
                 resp,
-                req,
+                response_req,
                 msg_id,
                 settings.provider_strip_inline_thinking,
             )

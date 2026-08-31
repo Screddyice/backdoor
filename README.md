@@ -672,6 +672,12 @@ continuity response without asking an impossible model call to run. Identical re
 generation, and Backdoor caches completed responses for ten minutes so connectivity recovery
 cannot replace a finished local answer with a different cloud answer.
 
+Qwen can request one `backdoor_context_search` round if the selected prompt lacks an older detail.
+Backdoor intercepts that tool call, searches only the active lineage, and adds at most six segments
+under a 2,000-token result cap. The tool never reaches Claude Code. Backdoor removes its schema
+before the second provider call, rejects another internal call, and skips the round after 20
+seconds of elapsed outage inference.
+
 Healthy cloud responses retain their raw body and headers. Backdoor queues archival after the
 response finishes, and a full queue or archive fault cannot block the cloud response. The breaker
 requires two authenticated upstream successes before it closes and releases Qwen.
