@@ -1,0 +1,33 @@
+# Account-synced products MCP bridge. Install as the hermes user service.
+#
+# Credentials stay in their existing deployment files. This unit reads those
+# files in place and overrides only public connector settings.
+[Unit]
+Description=Products MCP bridge for Claude mobile and web
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hermes-mcp/http.env
+EnvironmentFile=%h/.hermes/.env
+EnvironmentFile=/root/engagemate/src/deploy/.env.api
+Environment=HERMES_MCP_OAUTH_ISSUER=https://screddy-products.5-161-126-205.sslip.io
+Environment=HERMES_MCP_OAUTH_STATE_PATH=%h/.config/products-mcp/oauth-state.json
+Environment=HERMES_MCP_ALLOWED_HOSTS=screddy-products.5-161-126-205.sslip.io:443
+Environment=HERMES_MCP_HOST=127.0.0.1
+Environment=HERMES_MCP_PORT=8010
+Environment=HYPERSCALE_MCP_URL=https://hyperflow-one--teamnebula-ai.us-central1.hosted.app/mcp
+Environment=ENGAGEMATE_URL=http://127.0.0.1:13100
+WorkingDirectory=%h/backdoor
+ExecStart=%h/backdoor/.venv/bin/python -m src.products_mcp.server
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=append:%h/logs/products-mcp-http.log
+StandardError=append:%h/logs/products-mcp-http.log
+
+[Install]
+WantedBy=default.target
+
