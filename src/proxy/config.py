@@ -120,6 +120,7 @@ class Settings(BaseSettings):
     context_internal_result_tokens: int = 2_000
     context_tokenizer_executable: str = "/opt/homebrew/bin/llama-tokenize"
     context_tokenizer_model_path: str = ""
+    context_tokenizer_timeout_seconds: float = 12.0
     context_archive_queue_size: int = 32
     context_archive_timeout_seconds: float = 0.5
     context_assembly_timeout_seconds: float = 2.5

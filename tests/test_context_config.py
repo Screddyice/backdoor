@@ -21,6 +21,6 @@ def test_context_virtualization_defaults_are_safe():
     assert settings.context_archive_queue_size == 32
     assert settings.context_archive_timeout_seconds == 0.5
     assert settings.context_assembly_timeout_seconds == 2.5
+    assert settings.context_tokenizer_timeout_seconds == 12.0
     assert settings.context_response_cache_seconds == 600
     assert settings.failover_recovery_successes == 2
-

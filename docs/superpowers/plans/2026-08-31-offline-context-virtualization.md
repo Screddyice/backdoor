@@ -86,6 +86,7 @@ context_tokenizer_model_path: str = ""
 context_archive_queue_size: int = 32
 context_archive_timeout_seconds: float = 0.5
 context_assembly_timeout_seconds: float = 2.5
+context_tokenizer_timeout_seconds: float = 12.0
 context_response_cache_seconds: int = 600
 failover_recovery_successes: int = 2
 ```
@@ -458,7 +459,7 @@ subprocess.run(
     input=rendered,
     text=True,
     capture_output=True,
-    timeout=2.0,
+    timeout=12.0,
     check=True,
 )
 ```
