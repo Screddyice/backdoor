@@ -140,11 +140,11 @@ def test_claims_are_recorded_and_drained_once():
     br = make_breaker()
     br.note_claim(OLLAMA, "qwen3.5:4b-256k")
     br.note_claim(OLLAMA, "qwen3.5:4b-256k")   # same tier, many sessions
-    br.note_claim(OLLAMA, "qwen3.5:9b-64k")  # an outage can span two tiers
+    br.note_claim(OLLAMA, "qwen3.5:4b-128k")  # an outage can span two tiers
 
     assert br.drain_claims() == {
         (OLLAMA, "qwen3.5:4b-256k"),
-        (OLLAMA, "qwen3.5:9b-64k"),
+        (OLLAMA, "qwen3.5:4b-128k"),
     }
     # Drained exactly once: a second close must not re-unload a tier that a
     # FRESH outage may already have re-claimed.

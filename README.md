@@ -424,6 +424,34 @@ Set `CODEX_FAILOVER_TO_LOCAL=false` to disable Qwen fallback without removing th
 
 ## Offline failover (hybrid mode)
 
+### Keep Codex Desktop active while offline
+
+Codex Desktop can confuse a failed ChatGPT token lookup with an explicit logout. When that happens, the app switches to its login screen and pauses the local task stream before Backdoor receives an inference request. The offline-auth compatibility patch keeps a saved identity active when the token lookup is temporarily unavailable. A real logout still clears the underlying Codex identity.
+
+Install it against the signed application bundle:
+
+```bash
+uv run python local/patch-codex-desktop-offline.py
+```
+
+The installer validates the `com.openai.codex` bundle, requires one known renderer expression, and creates a verified backup for the installed version and build. It patches a staged copy without moving ASAR offsets, ad-hoc signs and verifies that copy, then swaps the complete bundle into place. A process lock serializes installs. If Codex updates during activation, the installer verifies the competing bundle before choosing whether to restore or preserve it for recovery. Restart Codex Desktop after installation. OpenAI application updates replace the patch, so rerun the installer after each update until the upstream app distinguishes offline token errors from logout.
+
+| Option | Default | Use |
+| --- | --- | --- |
+| `--app` | `/Applications/ChatGPT.app` | Patch or restore a different Codex Desktop bundle. |
+| `--backup-root` | `~/Library/Application Support/Backdoor/Codex Desktop Backups` | Store full-bundle and ASAR backups elsewhere. |
+| `--restore` | Off | Restore the verified original bundle for the installed version and build. |
+
+Changing the bundle replaces OpenAI's publisher signature with an ad-hoc signature. Structural signature verification still passes, but macOS no longer sees OpenAI's original designated requirement or TeamIdentifier. After restarting, confirm that Codex Desktop launches, stays signed in, and can read its existing tasks before testing an outage. If launch, login, or Keychain access fails, restore the signed bundle:
+
+```bash
+uv run python local/patch-codex-desktop-offline.py --restore
+```
+
+The installer retains one full rollback bundle per Codex version and build. Remove older backups by hand only after the current build passes the restart and offline canaries.
+
+The patch keeps the Desktop task stream alive. Backdoor still decides whether an inference request uses ChatGPT or local Qwen. Online Qwen requests can opt into the specific MCP tools they need; internet-dependent MCP servers remain unavailable during a genuine network outage.
+
 In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
 
 > **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
@@ -633,7 +661,19 @@ answer in 3.6s on qwen3.5:27b, ending in a real tool call
 
 That is what lets the default tier be a 27B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 27B in place, and you rebuild the original failure on a much larger model.
 
-**Local tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob` and `Grep` touch nothing but this disk, so they keep working while the host is offline, and keeping them means the failover model can carry on doing work instead of only talking about it. Every `mcp__*` tool is a remote integration and is dead for exactly as long as the breaker is open. That split also happens to be where the weight is: the ~286K tokens of definitions came from MCP servers, not from the dozen local tools, so dropping them removes nearly all of the cost and nearly none of the offline capability.
+**Built-in tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob`, `Grep`, `WebSearch`, and `WebFetch` are Claude Code tools rather than MCP integrations, so bare mode keeps them. A deliberate local Qwen session can search or fetch when the Mac has internet access, and Bash can call public HTTP APIs with `curl`. If a network call fails, Qwen continues with local tools. True breaker failover gets an explicit offline prompt because the breaker opens only after the connectivity probe confirms that the host cannot reach the internet.
+
+Every `mcp__*` tool is dropped from bare requests. Those schemas supplied most of the measured ~286K-token tool payload, and remote MCP integrations cannot help during true offline failover. Keep a specific MCP tool only through the existing allowlist when its schema cost and availability justify it.
+
+The standalone wrapper attaches MCP servers per request instead of loading the whole inventory:
+
+```bash
+qwen mcp list
+qwen mcp screddy-hermes -p "check the requested conversation"
+qwen mcp composio-tmn,atlassian
+```
+
+`qwen mcp NAME` validates each name against `~/.claude.json`, runs the same certificate-verifying internet probe as the hybrid router, and writes a private session config under `~/.cache/backdoor/`. Only the named servers start, alongside the compact Cognee memory shim when Cognee is enabled. If the Mac is offline, Qwen skips the requested MCP connection and keeps working with local tools. `QWEN_MCP_ASSUME_ONLINE=1` bypasses the probe on a network that blocks its public endpoints while allowing the selected MCP.
 
 Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai` and cannot work offline, but local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
 
@@ -643,6 +683,8 @@ Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai
 
 Failover is not the only way into a local tier. A session can ask for one by name with `/model qwen`, and that request takes a different branch. It matches `MODEL_ROUTES`, returns a profile immediately, and skips the failover block underneath. Only the failover block stripped.
 
+The deliberate route receives an online-capable lean prompt. It tells Qwen to use `WebSearch`, `WebFetch`, or `Bash` with `curl` when current information matters, then continue offline if the call fails. This keeps inference local while letting the agent use the network that is already available to Claude Code's built-in tools.
+
 So `/model qwen` handed the 27B a full harness session against a 32K window, which is the pairing the section above warns about. That window is small on purpose. Bare mode is what makes it generous.
 
 Profiles whose window assumes bare mode now say so:
@@ -651,16 +693,19 @@ Profiles whose window assumes bare mode now say so:
 ROUTE_BARE=true
 ```
 
-Set it only on those. The 64K tiers stay untouched, and one of them has to: `qwen-9b` backs the `fusion-qwen` subagent, which needs its system prompt and its tools to do anything at all. Stripping every named route would break that quietly.
+Set it only on profiles whose windows assume a stripped prompt. The 64K
+`qwen-fast` route retains its system prompt and tools.
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
 | `qwen` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | 32K | yes |
 | `qwen38-obliterated` | `local-qwen38-obliterated` | the same tier, named directly | 32K | yes |
 | `qwen38-action` | `local-qwen38-action` | action-tuned MLX rollback | 64K | yes |
-| `qwen-stock` | `local-failover-heavy` | `qwen3.5:9b-64k` | 64K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
-| `qwen-9b` | `local-qwen-9b` | `qwen3.5:9b-64k` | 64K | no |
+
+The `qwen-9b` and `qwen-stock` routes were removed with the local Qwen 3.5 9B
+artifacts. The terminal `fusion-qwen` agent now uses `qwen-fast` for its local
+orchestration step; the verifier council keeps its separate models.
 
 Stripping reuses the `failover_*` keep-list and truncation budget, so both paths build the same request shape. A route that stripped differently from failover would be a second behaviour to keep in sync for no gain.
 
@@ -693,7 +738,6 @@ Claude Code does not recognise the model name `qwen`, so it falls back to assumi
 The wrapper now states the real window before launching:
 
 ```
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-failover-heavy
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=32000   # local-qwen38-obliterated
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=64000   # local-qwen35, local-fast
 ```
@@ -763,7 +807,6 @@ The wrapper warms its tier at launch so the first turn skips the cold load, then
 | Profile | `keep_alive` |
 |---|---|
 | `local-qwen38-obliterated` | **10m** |
-| `local-failover-heavy` | **10m** |
 | `local-qwen38-action` | n/a, not an Ollama tag |
 | every other profile | 30m |
 
@@ -844,7 +887,6 @@ On a 36GB M5 Max at `OLLAMA_NUM_PARALLEL=2`, flash attention on, `q8_0` KV cache
 
 | Tier | Params | On disk | Resident | Tools | Notes |
 |---|---|---|---|---|---|
-| `qwen3.5:9b-64k` | 9B | 6.6 GB | ~10-12 GB | yes | Default heavy tier since 2026-08-25 |
 | `qwen3.8:27b-bare` | 27B | 17.7 GB | **17 GB** | yes | Removed 2026-08-25 to free disk. Modelfile kept; see below |
 | `qwen3.5:27b-bare` | 27.8B | 17.4 GB | 23 GB | yes | Predecessor, removed 2026-08-16 |
 | `qwen3.5:4b-256k` | 4B | 3.4 GB | ~13 GB | yes | Escape hatch for a transcript that overflows 32K |
@@ -883,19 +925,20 @@ The 27B GGUF and the 27B MLX server cannot share memory safely. Before the route
 
 Qwen3.8-27B Action-Abliterated comes from `ajsai47/qwen38-action-abliterated-research`: a pinned Qwen3.8-27B checkpoint trained on action contracts, then put through a bounded refusal-direction ablation. Its model card records a 92.5% HarmBench direct-request attack-success rate, and StrongREJECT assistance on forbidden prompts at 87.22% against the base model's 10.54%. Capability held flat, with 62.50% on a frozen 280-item MMLU-Pro sample, matching upstream.
 
-From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. `qwen38-action` still names this checkpoint directly. `qwen-stock` routes to the 9B when you want a model whose refusal behaviour is intact.
+From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. `qwen38-action` still names this checkpoint directly.
 
 Read the model card before you lean on it. Reduced refusal is not permission, and it says so itself: the card puts unsupervised execution with destructive, financial, credential, or otherwise high-impact tools out of scope, and this wiring puts the model on exactly those paths. Failover fires with nobody watching, and `local-worker` gets dispatched with Bash and Write. Scoped tool permissions and reading what an unattended agent actually did are the controls now, because the model is no longer one of them.
 
 #### It is the one tier nothing loads lazily
 
-Every other local tier is an Ollama tag that loads on first request and gets evicted on a timer. This one is a launchd job holding about 19GB, up or absent, with nothing in between. Pointing failover at a tier that cannot start itself would break the fallback in the one situation it exists for, so `src/proxy/mlx_admin.py` probes `127.0.0.1:8080/health`, runs `launchctl kickstart` when it finds nothing, and waits up to 90 seconds for the weights to load. When the server will not come up, the request goes to `local-failover-heavy` and the log says so:
+Every other local tier is an Ollama tag that loads on first request and gets evicted on a timer. This one is a launchd job holding about 19GB, up or absent, with nothing in between. Pointing failover at a tier that cannot start itself would break the fallback in the one situation it exists for, so `src/proxy/mlx_admin.py` probes `127.0.0.1:8080/health`, runs `launchctl kickstart` when it finds nothing, and waits up to 90 seconds for the weights to load. When the server will not come up, the request goes to `local-fast`:
 
 ```
-⇢ MLX FALLBACK [local-qwen38-action → local-failover-heavy] /v1/messages
+⇢ MLX FALLBACK [local-qwen38-action → local-fast] /v1/messages
 ```
 
-That fallback is why `local-failover-heavy` still exists. Deleting it because `qwen` points elsewhere now would leave an offline host with no answer at all.
+The 4B fast tier loads through Ollama on demand and leaves enough memory
+headroom for recovery after an MLX startup failure.
 
 Ollama cannot evict this server either, so `qwen38 stop` before an `llmjury solve` run rather than letting a 19GB server and a 21GB council fight over a 36GB host.
 
@@ -1008,32 +1051,14 @@ Build from the **registry** tag, never from a local one. `modelfiles/build.sh` a
 
 Bare Modelfiles therefore live in `modelfiles/bare/`, which a bare `./build.sh` cannot glob. Check any new tag with `ollama show --system <tag>`, which must return nothing.
 
-#### The base tags were poisoned, which made that check lie
+#### Protect upstream base tags
 
-`build.sh` derives its tag from the filename with the first `-` turned into `:`, so `qwen3.5-9b.Modelfile` built **`qwen3.5:9b`** — the exact name `ollama pull` uses for the pristine base. It overwrote the registry pull with a prompt-baked copy, and from then on every `FROM qwen3.5:9b` in this directory inherited 43K tokens.
-
-That is the same inheritance bug described above, but far harder to see: the Modelfile you read has no `SYSTEM` line anywhere in it, and neither does the one it inherits from. Only the tag does.
-
-Found 2026-08-16 with `ollama show --system qwen3.5:9b` returning 186,647 bytes where it should return 0. `qwen3.5:4b` was poisoned the same way. Both are fixed, and the repair is cheap because only the manifest differs:
-
-```
-ollama pull qwen3.5:9b     # 4 seconds — the model blob was already on disk
-```
-
-`build.sh` now refuses any tag with no suffix after the colon, so it cannot happen again. If you want a persona build of a base model, give it a variant name (`qwen3.5:9b-fable`), which is the convention `llama3.1:8b-fable` and `gemma3:12b-fable` already follow.
+`build.sh` derives its tag from the filename with the first `-` turned into `:`.
+A file without a variant suffix can overwrite the matching upstream registry
+tag with a prompt-baked manifest. The build script rejects those filenames.
+Give persona builds a suffixed tag such as `*-fable`.
 
 **`SYSTEM ""` does not undo it.** Rebuilding `FROM` a poisoned base with an empty `SYSTEM` still reports 186,647 bytes. The base itself has to be re-pulled.
-
-#### `qwen3.5:9b-64k` is built bare
-
-Listed in `build.sh`'s `BARE_TAGS`. The baked prompt only applies when a request sends no system message, and both consumers of this tag (`/model qwen-9b`, the `fusion-qwen` subagent) always send one, so it bought them nothing. The one thing it could have served, bare `ollama run`, was unusable on a 9B:
-
-| | prompt tokens | wall clock |
-|---|---|---|
-| With baked prompt | 43,092 | 8+ min, then `500` |
-| Built bare | 12 | 2.4 s |
-
-The 4B tiers keep theirs, since bare usage there completes.
 
 ### When `ollama pull` will not finish
 
@@ -1176,8 +1201,10 @@ static bearer-token path for clients that can set an `Authorization` header. Set
 client registration, authorization-code flow with PKCE, one-owner password consent, one-hour
 access tokens, and rotating 30-day refresh tokens. Registered clients and tokens survive service
 restarts in a mode-600 state file. The login password and deployment identifiers remain outside
-the repository. Successful password submissions use an HTTP 303 redirect so embedded browsers
-follow the Claude callback with GET instead of replaying the login form POST.
+the repository. Successful password submissions use an HTTP 303 redirect to a same-origin
+`/login/complete` GET. That GET loads a no-store approval page with a **Continue to Claude**
+link. Loading a real page before the external callback keeps Chrome and Comet from treating the
+callback as part of the password POST redirect chain and replaying the consumed login state.
 
 **Environment.** Set at deploy time, never committed:
 
@@ -1193,10 +1220,10 @@ follow the Claude callback with GET instead of replaying the login form POST.
 | `HERMES_MCP_PORT` | No | Port the bridge binds. Defaults to `8000`. A non-integer or out-of-range value is refused at boot rather than surfacing later as a bind failure |
 | `HERMES_MCP_ALLOWED_HOSTS` | No | Comma-separated, whitespace-tolerant extra `Host` values for the streamable-HTTP transport's DNS-rebinding allowlist, e.g. `bridge.example.com:443`. Unset or empty leaves today's behavior unchanged — the SDK's own loopback-only default applies (`127.0.0.1:*`, `localhost:*`, `[::1]:*`). Set it and those loopback defaults stay, with the configured hosts added on top; DNS-rebinding protection stays on, the allowlist only widens. Needed when the bridge runs behind a tunnel that forwards a public hostname in the `Host` header — without it such a request is rejected with **421 before auth even runs**. Required, not optional, whenever `HERMES_MCP_HOST` is non-loopback |
 
-For OAuth mode, proxy these paths to the same bridge process: `/mcp`, `/login`, `/authorize`,
-`/token`, `/register`, and `/.well-known/oauth-*`. Claude's custom connector needs only the public
-`https://.../mcp` URL; leave its advanced client credential fields empty so Claude uses dynamic
-registration.
+For OAuth mode, proxy these paths to the same bridge process: `/mcp`, `/login`,
+`/login/complete`, `/authorize`, `/token`, `/register`, and `/.well-known/oauth-*`. Claude's
+custom connector needs only the public `https://.../mcp` URL; leave its advanced client
+credential fields empty so Claude uses dynamic registration.
 
 ---
 

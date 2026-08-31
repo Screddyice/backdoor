@@ -15,7 +15,7 @@ from .config import (
     MODEL_ROUTES, Settings, get_settings, load_profile_settings, pick_failover_profile,
     resolve_model_route,
 )
-from .bare import make_bare, parse_keep
+from .bare import OFFLINE_SYSTEM, make_bare, parse_keep
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
 from . import compute_lease, mlx_admin, ollama_admin
@@ -495,6 +495,7 @@ async def create_message(
                     stripped = make_bare(
                         fr,
                         keep=parse_keep(settings.failover_keep_tools),
+                        system=OFFLINE_SYSTEM,
                         tool_result_chars=settings.failover_tool_result_chars,
                     )
                     bare_req = stripped  # only on success: make_bare is pure

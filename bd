@@ -72,8 +72,7 @@ _qwen_client_context_tokens() {
   active="$(cat "$ACTIVE_FILE" 2>/dev/null || true)"
   case "$active" in
     local-qwen38-obliterated|local-qwen38-action) echo 32000 ;;
-    local-failover-heavy) echo 32000 ;;
-    local-qwen35|local-fast|local-qwen-9b) echo 64000 ;;
+    local-qwen35|local-fast) echo 64000 ;;
     local-failover-128k) echo 128000 ;;
     local-failover-256k) echo 256000 ;;
     *) echo 32000 ;;

@@ -5,7 +5,7 @@ model**, completely offline. No internet needed once the models are downloaded.
 
 ```
 Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
-   (UI +              (translates              (serves the         (Qwen3.5 9B,
+   (UI +              (translates              (serves the         (Qwen3.8 27B
     harness)           Anthropic<->OpenAI)      open weights)        on-device)
 ```
 
@@ -15,26 +15,17 @@ Claude Code plugin — the only thing that changes is the model underneath.
 ## One command
 
 ```bash
-qwen            # FULL harness (default). Qwen3.5 9B @ 64K ctx, MCP OFF, with
-                # claude-harness + claude-mem + ralph-loop hooks ACTIVE.
-                # (Fixed 2026-06-15: was 9b-256k, which loaded ~22GB and pinned
-                # the Mac. 64K + MCP-off loads ~12GB and stays responsive.)
-qwen lean       # Minimal (~945-tok) prompt on the 9B. Fastest; harness
-                # slash-commands on demand, no auto hooks.
-qwen fast       # Lean mode on the same Qwen3.5 4B @ 64K (snappiest local brain).
-                # (qwen coder / qwen2.5-coder removed 2026-07-04.)
+qwen            # Lean default on Qwen3.8 27B OBLITERATED at 32K.
+qwen lean       # Same 27B lean route, stated explicitly.
+qwen fast       # Lean mode on Qwen3.5 4B @ 64K (snappiest local brain).
+qwen full       # Full harness on Qwen3.5 4B @ 64K.
 ```
 
 (`claude-local` is a symlink alias for `qwen` if you prefer the longer name.)
 
-**Why Qwen3.5 9B @ 64K (MCP off):** Qwen3.5 is 256K-native (no rope penalty)
-with native tool-calling (no content-JSON fallback) — which makes the FULL
-harness viable. The full-harness prompt is ~30-50K tokens, so it needs real
-context but NOT the 256K we ran before: at 256K the 9B's KV cache was ~16GB, the
-model loaded ~22GB on the 36GB M5 Max, and it thrashed — every request crawled.
-The fix (2026-06-15) is the same 9B at **64K** (~12GB loaded, comfortable) with
-**MCP off** so the prompt stays inside the window. The 9B is the sweet spot on
-36GB: Qwen3.5 jumps 9b → 27b, and a dense 27b is too heavy here.
+The lean prompt makes the 27B practical inside its 32K window. The 4B keeps the
+full-harness and long-context escape paths responsive. MCP servers attach per
+request so their schemas do not consume the default context.
 
 `qwen` makes sure the Ollama daemon is up, confirms the model is pulled,
 points backdoor at the offline profile, and launches Claude Code. Anything after
@@ -44,7 +35,7 @@ the first word is passed straight to `claude` (e.g. `qwen fast --resume`).
 
 A second proxy instance runs permanently on **:8083** in `ROUTER_MODE=hybrid`
 (LaunchAgent `com.screddy.backdoor-router`, KeepAlive). It routes by requested
-model name: `qwen` / `qwen-fast` / `qwen-9b` → the matching local profile;
+model name: `qwen` / `qwen-fast` → the matching local profile;
 **every other model and endpoint passes through byte-faithfully to
 api.anthropic.com** (auth headers, SSE, compression untouched).
 
@@ -52,7 +43,7 @@ api.anthropic.com** (auth headers, SSE, compression untouched).
 shells (health-guarded: if the router is down, new shells fall back to direct
 Anthropic). So in any normal terminal Claude Code session:
 
-    /model qwen        # switch this session to the local Qwen3.5
+    /model qwen        # switch this session to the local Qwen3.8 27B
     claude --model qwen -p "..."   # one-shot
 
 **Cloud→local failover (2026-07-04):** if the real Anthropic API stops working
@@ -70,16 +61,11 @@ context instead of being truncated to fit the 4B:
 
 | session input | tier | model | ~load @NUM_PARALLEL=4 |
 |---|---|---|---|
-| ≤ 52K | `local-qwen35` | qwen3.5:4b-64k | ~7GB |
-| ≤ 115K | `local-failover-128k` | qwen3.5:9b-128k | ~12GB |
-| > 115K | `local-failover-256k` | qwen3.5:9b-256k | ~16GB |
+| ≤ 27K | `local-qwen38-obliterated` | qwen3.8:27b-obliterated | ~17GB |
+| > 27K | `local-failover-256k` | qwen3.5:4b-256k | ~13GB |
 
-The 9B tiers deliberately break the "harness = 4B" rule: during an outage a
-big session kept ALIVE on a 9B beats one truncated to a 4B. They're safe on
-36GB because `q8_0` KV + flash attention keep the KV small (the old 256K
-"thrash" was f16 KV / the 142K MCP prompt, not this config), and Ollama
-evicts idle models to make room. Cost: a 9B cold-prefilling a 100K+ session
-takes minutes — slow but alive. Tune via env: `FAILOVER_TO_LOCAL=0`
+The router strips the harness before sizing. Most sessions fit the stronger
+27B; the 4B 256K tag retains transcripts that outgrow its 32K window. Tune via env: `FAILOVER_TO_LOCAL=0`
 disables; `FAILOVER_THRESHOLD` / `FAILOVER_PROBE_SECONDS` adjust; ladder
 bounds live in `FAILOVER_LADDER` (config.py). Code: `src/proxy/failover.py`
 + routes + profiles `local-failover-{128k,256k}.env`.
@@ -177,34 +163,10 @@ bd stop                 # stop the proxy
 |-----------------|---------------------|------------------------------------------|
 | `local-qwen35`  | qwen3.5:4b-64k      | 3.4GB weights. Tools+thinking. **Default.** |
 | `local-fast`    | qwen3.5:4b-64k      | Same model; lean profile used by `qwen fast`. |
-| `local-qwen-9b` | qwen3.5:9b-64k      | Stronger brain for subagents (`qwen-9b` route); the `fusion` agent runs on it. ~10-12GB. |
 | `modal-qwen`    | (Modal cloud)       | Pre-existing cloud backend. Online only. |
 
-The `qwen-9b` route (→ `local-qwen-9b`) is a stronger local brain for
-*subagents* that need more reasoning than the 4B — notably the **`fusion`
-agent** (`~/.claude/agents/fusion.md`), which runs on `qwen-9b` to frame a
-verifiable coding task and derive an oracle, then drives the llm-jury council
-(`llmjury solve --backend ollama --frontier …`) to return a COUNCIL-VERIFIED
-answer, escalating only the hard minority to a frontier model. The
-full-harness default stays the 4B (`qwen`) per the "harness = 4B" rule; the 9B
-is subagent-only. When the fusion agent then runs the council
-(phi4+gemma3+llama), Ollama evicts idle models to fit and reloads the 9B when
-the agent resumes.
-
-`qwen3.5:9b-64k` is a local tag built from `modelfiles/qwen3.5-9b-64k.Modelfile`
-(`FROM qwen3.5:9b` + `PARAMETER num_ctx 65536` — enough for the ~30-50K harness
-prompt + conversation, while KV stays ~5GB so the model loads ~12GB). Rebuild
-after re-pulling:
-
-```bash
-ollama pull qwen3.5:9b
-ollama create qwen3.5:9b-64k -f ~/backdoor/modelfiles/qwen3.5-9b-64k.Modelfile
-```
-
-Bigger-context variants (`qwen3.5:9b-128k` / `-256k`) also exist for when you
-want MCP on (the schemas don't fit 64K) — point `PROVIDER_MODEL` at one and
-expect a heavier load. **Do not** make `-256k` the default again: at 256K the KV
-cache is ~16GB and the model pinned the 36GB Mac (this was the slowness bug).
+The terminal `fusion-qwen` agent uses `qwen-fast` to frame verifiable tasks,
+then runs the same separate verifier council as the cloud-framed Fusion agent.
 
 The num_ctx is baked into the model (not `OLLAMA_CONTEXT_LENGTH`) so the global
 32768 default stays modest for models without a baked num_ctx.
@@ -267,7 +229,7 @@ All in `src/proxy/`, committed to the Screddyice/backdoor repo:
 6. **`client.py` — upstream read timeout 120s → 600s.** 120s killed any
    prefill over 2 minutes (this was the actual source of the kill/retry loop).
 
-## MCP defaults: OFF in every mode
+## MCP servers attach per request
 
 MCP tool schemas are huge — **~142K tokens** for this machine's global
 `~/.claude.json` set, and even the curated stack overflows the 64K window. That
@@ -275,9 +237,20 @@ giant schema prefill was half of why full mode crawled, so **MCP is OFF by
 default in all modes** (`--strict-mcp-config --mcp-config ~/backdoor/empty-mcp.json`),
 which also keeps full mode truly offline.
 
-Opt in with `QWEN_MCP=1` — but switch `PROVIDER_MODEL` to a bigger-context tag
-first (`qwen3.5:9b-256k`), since the schemas don't fit 64K. `QWEN_MCP_SERVERS=a,b,c`
-picks which servers to load (no default — set it to the servers you want).
+Keep the default session lean, then attach only the server needed for a request:
+
+```bash
+qwen mcp list
+qwen mcp screddy-hermes -p "check the requested conversation"
+qwen mcp composio-tmn,atlassian
+```
+
+The wrapper validates names against `~/.claude.json` and enables the selected
+servers only when its certificate-verifying internet probe succeeds. The
+compact Cognee memory shim stays attached when Cognee is enabled. Missing
+names fail before Qwen starts. An offline Mac skips the MCP connection and
+continues with local tools. The environment form remains available for scripts:
+`QWEN_MCP=1 QWEN_MCP_SERVERS=a,b qwen`.
 
 ## Full harness is the default (lean is the speed escape hatch)
 
@@ -329,7 +302,7 @@ to keep the prompt at ~50K tokens. Config: `hook-mode.settings.json`.
 - `QWEN_LEAN=1 qwen` / `qwen lean` — minimal prompt, no auto hooks.
 - `QWEN_FULL=1 qwen` — force full mode (e.g. `QWEN_FULL=1 qwen fast`).
 - `QWEN_MCP=0 qwen`  — drop global MCP servers (true-offline full mode).
-- `QWEN_MCP=1 qwen lean` — force MCP on in lean/fast modes.
+- `qwen mcp NAME lean` — attach one named MCP server in lean mode.
 
 ## Performance reality (local Qwen3.5, full harness)
 
