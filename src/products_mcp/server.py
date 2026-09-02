@@ -21,7 +21,7 @@ def build_server(*, gateway: ProductGateway | None = None) -> MCPServer:
     oauth_settings = OAuthSettings.from_env()
     provider = SingleUserOAuthProvider(oauth_settings)
     server = MCPServer(
-        "team-nebula-products",
+        "product-tools",
         auth_server_provider=provider,
         auth=AuthSettings(
             issuer_url=oauth_settings.issuer,

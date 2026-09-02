@@ -1,4 +1,4 @@
-"""Contract tests for the Team Nebula Products upstream gateway."""
+"""Contract tests for the account-synced product gateway."""
 
 from __future__ import annotations
 
