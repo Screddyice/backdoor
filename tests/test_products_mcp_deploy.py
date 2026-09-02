@@ -16,3 +16,8 @@ def test_products_runtime_overrides_load_after_shared_credential_files() -> None
     runtime = (ROOT / "deploy/products-mcp-runtime.env").read_text()
     assert "HERMES_MCP_PORT=8010" in runtime
     assert "HERMES_MCP_HOST=127.0.0.1" in runtime
+    assert (
+        "HERMES_MCP_ALLOWED_HOSTS="
+        "screddy-products.5-161-126-205.sslip.io,"
+        "screddy-products.5-161-126-205.sslip.io:443"
+    ) in runtime
