@@ -1166,6 +1166,10 @@ Claude desktop, web, and mobile. Each product has three namespaced tools: `*_sta
 call tool accepts only an advertised operation, so a caller cannot turn the bridge into an open
 HTTP proxy.
 
+The connector uses the neutral name **Product Tools** because the products have separate
+ownership: HyperCrawl and HyperScale belong to Team Nebula, while EngageMate belongs to Shawn
+Reddy Consulting (SRC) in the Screddyice GitHub organization.
+
 The bridge reuses `src/hermes_mcp/oauth.py` for dynamic client registration, PKCE, one-hour access
 tokens, and rotating refresh tokens. It keeps product authorization separate behind the bridge:
 HyperCrawl uses its tenant REST token, HyperScale uses its organization API key, and EngageMate
