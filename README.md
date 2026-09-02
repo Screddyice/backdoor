@@ -472,6 +472,10 @@ Measured on 2026-09-02, the breaker was open from 22:28:14 to 23:45:51 — 77 mi
 
 A background ticker now re-runs the connectivity probe every `failover_probe_seconds` while the breaker is open, and closes it the moment this host is online again — releasing the local tiers exactly as an upstream success would. It is the negation of the condition that opened the breaker: opening means "this host is offline", so recovery is "that stopped being true". If Anthropic itself is still down, the next real request fails, the probe finds the host online, and the error is relayed — the documented behaviour for an upstream outage on a working link. The ticker does nothing at all while the breaker is closed, and starts only when `failover_to_local` is on.
 
+The ticker watches **both** breakers this router owns — the Claude one and the Codex one — each released through its own tier path.
+
+**It can only close a breaker that required an offline host to open.** `codex_failover_require_offline` is `false`, so the Codex breaker opens on consecutive service failures alone and can be open while this host's connectivity is perfect. A connectivity probe says nothing about whether that service is back, so closing on one would reopen on the very next request, every interval, forever — throwing a real request at a known-dead service each cycle. `maybe_recover` refuses for a service-level breaker, which leaves it the half-open path: the only route back that actually reaches the service. That path still needs a rider, so the Codex breaker keeps the starvation this change removes from the Claude one; closing it properly means probing Codex itself, which is a larger change than this.
+
 ### A stream that dies after the headers
 
 The guard above stops at the headers. Once Anthropic answers `200` and Backdoor starts relaying the body, that response is committed: your client is already reading it, and no local model can take over a turn halfway through.
