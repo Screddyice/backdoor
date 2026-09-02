@@ -1182,7 +1182,8 @@ connector. Verification requires OAuth completion, nine tools in `tools/list`, o
 The unit loads [`deploy/products-mcp-runtime.env`](deploy/products-mcp-runtime.env) after the shared
 credential files. Keep the products bind and OAuth settings in that final file. An earlier shared
 Hermes environment file also defines port 8000 and the Hermes issuer, and systemd gives the last
-environment file precedence.
+environment file precedence. Keep both the bare public hostname and its `:443` form in
+`HERMES_MCP_ALLOWED_HOSTS`; Caddy may forward either Host form after TLS termination.
 
 ---
 
