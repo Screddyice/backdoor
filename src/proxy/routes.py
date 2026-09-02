@@ -258,6 +258,40 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
     return _breaker
 
 
+async def failover_recovery_loop(settings: Settings, sleep=asyncio.sleep) -> None:
+    """Close an open breaker once this host is back online, without a rider.
+
+    The breaker's own half-open path needs a `/v1/messages` passthrough to carry
+    it, and an outage is exactly what stops those arriving: sessions served by a
+    local tier generate far less traffic, and a user who walks away from a
+    degraded session generates none. On 2026-09-02 that left the breaker open for
+    77 minutes on a network that had recovered — every routed session silently on
+    qwen — until unrelated traffic finally closed it. This loop is the ticker
+    that outage cannot switch off.
+
+    Cheap by construction: it does nothing at all while the breaker is closed,
+    which is essentially always. The probe itself is blocking socket work, so it
+    goes to a worker thread rather than stalling the event loop the router is
+    serving requests on.
+    """
+    br = get_breaker(settings)
+    interval = max(1.0, settings.failover_probe_seconds)
+    while True:
+        await sleep(interval)
+        if not br.open:
+            continue
+        try:
+            closed = await asyncio.to_thread(br.maybe_recover)
+        except Exception:  # a failed probe must never kill the ticker
+            logger.exception("failover recovery probe failed")
+            continue
+        if closed:
+            try:
+                await _release_claims(br, settings)
+            except Exception:
+                logger.exception("failover recovery could not release tiers")
+
+
 # Failover responses still being generated, and the tiers whose release is
 # waiting on them. See _release_claims for why the two cannot be independent.
 _failover_inflight: int = 0

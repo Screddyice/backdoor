@@ -1,14 +1,15 @@
 """FastAPI application factory."""
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
 from .config import get_settings
 from .client import ProviderClient
 from .logging_config import configure_logging as _configure_logging
-from .routes import router, set_provider_client
+from .routes import failover_recovery_loop, router, set_provider_client
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,14 @@ async def lifespan(app: FastAPI):
 
     client = ProviderClient(settings)
     set_provider_client(client)
+
+    # Ticker that closes a stuck-open failover breaker. It exists because the
+    # breaker's half-open path needs a real request to ride on, and an outage is
+    # what stops those arriving — see routes.failover_recovery_loop. Only
+    # meaningful when failover can happen at all.
+    recovery = None
+    if settings.failover_to_local:
+        recovery = asyncio.create_task(failover_recovery_loop(settings))
 
     # Start Telegram bot if configured
     tg_app = None
@@ -71,6 +80,11 @@ async def lifespan(app: FastAPI):
             forward = None
 
     yield
+
+    if recovery:
+        recovery.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery
 
     if forward:
         await forward.stop()
