@@ -258,6 +258,67 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
     return _breaker
 
 
+async def failover_recovery_loop(
+    settings: Settings, targets=None, sleep=asyncio.sleep
+) -> None:
+    """Close an open breaker once this host is back online, without a rider.
+
+    The breaker's own half-open path needs an upstream-bound request to carry
+    it, and an outage is exactly what stops those arriving: sessions served by a
+    local tier generate far less traffic, and a user who walks away from a
+    degraded session generates none. On 2026-09-02 that left the breaker open
+    for 77 minutes on a network that had recovered — every routed session
+    silently on qwen — until unrelated traffic finally closed it. This loop is
+    the ticker that outage cannot switch off.
+
+    `targets` is a list of `(breaker, release)` pairs, `release` being an async
+    callable taking the breaker. It defaults to both breakers this router owns:
+    the Claude one here and the Codex one in codex_routes, each with its own
+    tier-release path. Only a breaker that required an offline host to open can
+    actually be closed this way — `maybe_recover` refuses for a service-level
+    breaker — but passing it costs nothing and keeps the wiring honest if that
+    configuration changes.
+
+    Cheap by construction: it does nothing at all while the breakers are closed,
+    which is essentially always. The probe itself is blocking socket work, so it
+    goes to a worker thread rather than stalling the event loop the router is
+    serving requests on.
+    """
+    if targets is None:
+        # Imported here rather than at module scope: codex_routes is a peer that
+        # pulls in the whole Codex relay, and this is the only thing here that
+        # needs it.
+        from .codex_routes import _release_claims as _release_codex_claims
+        from .codex_routes import get_codex_breaker
+
+        targets = [
+            (get_breaker(settings), lambda br: _release_claims(br, settings)),
+            (get_codex_breaker(settings), _release_codex_claims),
+        ]
+
+    # Each breaker rations its own probe by its own interval, so the tick only
+    # has to be fast enough for the shorter of the two.
+    interval = max(
+        1.0,
+        min(settings.failover_probe_seconds, settings.codex_failover_probe_seconds),
+    )
+    while True:
+        await sleep(interval)
+        for breaker, release in targets:
+            if not breaker.open:
+                continue
+            try:
+                closed = await asyncio.to_thread(breaker.maybe_recover)
+            except Exception:  # a failed probe must never kill the ticker
+                logger.exception("failover recovery probe failed")
+                continue
+            if closed:
+                try:
+                    await release(breaker)
+                except Exception:
+                    logger.exception("failover recovery could not release tiers")
+
+
 # Failover responses still being generated, and the tiers whose release is
 # waiting on them. See _release_claims for why the two cannot be independent.
 _failover_inflight: int = 0

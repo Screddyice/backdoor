@@ -238,6 +238,19 @@ logs a warning naming the address, because "no network" and "something is answer
 internet" need different responses from you, and moves on to the next probe rather than giving up —
 interception is per-route, so a hijacked path to `1.1.1.1` does not make a clean `8.8.8.8` unusable.
 
+**A handshake that times out gets a second, patient attempt** (added 2026-09-03). Reading every
+non-verifying outcome as the middlebox lie was the mirror image of the 2026-08-17 hole, and it cost
+a full evening: on a tethered link measuring 744 ms average RTT with 3.1 s spikes, an honest peer
+cannot finish inside the 2 s budget, so the probe reported "offline" three times against a working
+internet and the breaker claimed the GPU each time. Every one of those opens logged `The handshake
+operation timed out`; not one logged a certificate error, which is what tells the two apart.
+
+So a timeout is now treated as *inconclusive* rather than as an answer, and the probe re-dials once
+with `CONNECTIVITY_SLOW_FACTOR` × the budget (8 s by default). A genuinely silent acceptor never
+completes a handshake at any budget, so it still reads as offline; a real peer on a stalling link
+finally gets enough room to answer. A certificate error is a definite answer and is never retried.
+The extra wait is paid only on the timeout path, and only on a request that is already failing.
+
 Still literal IPs, and the hostname is only ever used as SNI and verified — never resolved — so a
 broken resolver still cannot fold itself into the answer.
 
@@ -450,6 +463,14 @@ What each route does now when upstream will not answer:
 | `/{path:path}` | `502` |
 
 Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+
+### Recovery does not wait for traffic
+
+An open breaker used to have exactly one way back: `allow_upstream` hands a real `/v1/messages` passthrough a half-open slot once per `failover_probe_seconds`, and only that request's success closes it. Recovery therefore depended on the traffic an outage takes away — a session being served by a local 4B generates far less of it, and a session you walked away from generates none.
+
+Measured on 2026-09-02, the breaker was open from 22:28:14 to 23:45:51 — 77 minutes 37 seconds, most of them on a network that had already recovered — and it closed at the exact second unrelated test traffic reached it. For that whole window every routed session was quietly answered by qwen instead of the cloud model, which reads as "the API errors never stopped" rather than as a stuck breaker.
+
+A background ticker now re-runs the connectivity probe every `failover_probe_seconds` while the breaker is open, and closes it the moment this host is online again — releasing the local tiers exactly as an upstream success would. It is the negation of the condition that opened the breaker: opening means "this host is offline", so recovery is "that stopped being true". If Anthropic itself is still down, the next real request fails, the probe finds the host online, and the error is relayed — the documented behaviour for an upstream outage on a working link. The ticker does nothing at all while the breaker is closed, and starts only when `failover_to_local` is on.
 
 ### A stream that dies after the headers
 

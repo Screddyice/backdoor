@@ -14,7 +14,10 @@ Shape: a classic circuit breaker.
           seconds AND a connectivity probe confirming this host is offline.
           Passthrough-bound /v1/messages requests are served by the failover
           profile. One request per `probe_interval` is allowed to try upstream
-          (half-open); a success closes the breaker.
+          (half-open); a success closes the breaker. Independently of any
+          traffic, :meth:`FailoverBreaker.maybe_recover` re-runs the connectivity
+          probe on the same interval and closes the breaker once this host is
+          online again — an outage removes the very requests half-open needs.
 
 **Opening the breaker means exactly one thing: this machine is offline.** That
 narrowness is deliberate and load-bearing, because failing over is not free —
@@ -102,6 +105,12 @@ CONNECTIVITY_PROBES = (
 )
 CONNECTIVITY_TIMEOUT = 2.0
 
+# How much more time the second handshake attempt gets after the first one runs
+# out. See internet_reachable: a handshake that times out is the one probe
+# outcome that does not distinguish a lying middlebox from a slow link, and the
+# only thing that tells them apart is giving it more room and looking again.
+CONNECTIVITY_SLOW_FACTOR = 4.0
+
 # Escape hatch back to the old TCP-only probe. Exists because a false "offline"
 # is not a harmless failure here — it claims the GPU and routes a session to a
 # local model while the cloud was fine — so if TLS verification ever misbehaves
@@ -120,18 +129,78 @@ def _tls_context() -> ssl.SSLContext:
     return _tls_ctx
 
 
+# What a single probe attempt concluded. Deliberately three-valued: "connected,
+# then the handshake ran out of time" is NOT the same answer as "nothing is
+# there" or "something answered and could not prove who it is", and folding it
+# into either of those is the bug these constants exist to prevent.
+_ONLINE = True        # a verified peer: this host has a working route out
+_NO_ANSWER = False    # could not connect, or the peer proved it is an impostor
+_INCONCLUSIVE = None  # connected, and then the handshake ran out of time
+
+
+def _probe_once(
+    host: str, port: int, cert_name: str, timeout: float, verify: bool
+):
+    """One connect-and-verify attempt against a single probe address.
+
+    Returns :data:`_ONLINE`, :data:`_NO_ANSWER` or :data:`_INCONCLUSIVE`.
+
+    The split between the two failure verdicts is the whole point. An
+    `ssl.SSLError` is a *definite* answer — the peer spoke TLS and presented
+    something the trust store rejects, which is what a captive portal or an
+    untrusted MITM box does, and no amount of extra time changes it. A
+    `TimeoutError` is not an answer at all: a silent acceptor produces it, and
+    so does an honest peer on a link too slow to finish inside the budget.
+    """
+    try:
+        raw = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return _NO_ANSWER  # Nothing answered. Ordinary offline.
+
+    with raw:
+        if not verify:
+            return _ONLINE
+        # create_connection leaves its timeout on the socket, but the
+        # handshake is the part that hangs against a silent acceptor, so
+        # bound it explicitly rather than relying on that.
+        raw.settimeout(timeout)
+        try:
+            with _tls_context().wrap_socket(raw, server_hostname=cert_name):
+                return _ONLINE
+        except ssl.SSLError as exc:
+            # Answered, and proved it is someone else. Logged loudly because it
+            # is the difference between "no network" and "something is answering
+            # for the entire internet", and only one of those is a thing the
+            # user can fix.
+            logger.warning(
+                "connectivity probe %s:%s answered with a certificate that is "
+                "not %s (%s) — treating as offline; a captive portal or "
+                "transparent middlebox answers exactly this way",
+                host, port, cert_name, exc,
+            )
+            return _NO_ANSWER
+        except OSError as exc:
+            # Connected and then said nothing (TimeoutError), or died partway
+            # through. Ambiguous by construction — see the caller.
+            logger.debug(
+                "connectivity probe %s:%s handshake did not finish in %.1fs (%s)",
+                host, port, timeout, exc,
+            )
+            return _INCONCLUSIVE
+
+
 def internet_reachable(
     probes=CONNECTIVITY_PROBES, timeout: float = CONNECTIVITY_TIMEOUT
 ) -> bool:
-    """Can this host open a TCP connection to a public address?
+    """Can this host reach — and authenticate — a public address?
 
     Deliberately not an HTTP call to Anthropic: by the time this runs we already
     know Anthropic is unreachable. What is still unknown — and what decides
     whether claiming the GPU is justified — is whether anything else is.
 
-    Fails CLOSED (returns True, "we are online") only on a real connection; any
-    error on every probe means offline. Both probes are tried before giving up,
-    so one blackholed resolver does not read as a dead network.
+    Returns True only on a verified peer; every probe failing means offline.
+    Both probes are tried before giving up, so one blackholed resolver does not
+    read as a dead network.
 
     **A completed TCP handshake is not evidence.** It was until 2026-08-17, and
     that was a silent hole: transparent middleboxes — captive portals, some
@@ -143,50 +212,49 @@ def internet_reachable(
     opened, and failover silently did not happen — the one situation the whole
     mechanism exists for.
 
-    So the probe now completes a TLS handshake and verifies the certificate
-    chain and hostname. A box that answers TCP without holding a certificate
-    the system trust store accepts for `one.one.one.one` or `dns.google` cannot
-    fake that. A corporate MITM proxy whose CA is installed on this machine
-    still can, but such a proxy is generally forwarding traffic, so "online" is
-    then the right answer anyway.
+    So the probe completes a TLS handshake and verifies the certificate chain
+    and hostname. A box that answers TCP without holding a certificate the
+    system trust store accepts for `one.one.one.one` or `dns.google` cannot
+    fake that.
+
+    **A handshake timeout is not evidence either**, and treating it as one was
+    its own silent hole — the mirror image of the first, and the reason this
+    function grew a second attempt on 2026-09-03. Until then every non-verifying
+    outcome was read as the middlebox lie, timeouts included. On a congested
+    link that is simply false: a tethered cellular connection measured on
+    2026-09-02 ran 744 ms average RTT with 3.1 s spikes, which a 2.0 s handshake
+    budget cannot survive, and the router opened the breaker three times that
+    evening against a working internet. Every one of those opens logged `The
+    handshake operation timed out`; not one logged a certificate error. A false
+    open is expensive in exactly the way this module warns about — it claims the
+    GPU, silently downgrades live sessions to a local model, and evicts the
+    llm-jury council — so the ambiguous case now gets a second, patient attempt
+    at `CONNECTIVITY_SLOW_FACTOR` × the budget on a fresh connection.
+
+    That keeps both properties. A genuinely silent acceptor never completes a
+    handshake at any budget, so it still reads as offline; a real peer behind a
+    stalling link now gets enough room to answer. The extra wait is paid only on
+    the timeout path, and only on a request that is already failing.
 
     Set BACKDOOR_PROBE_TCP_ONLY=1 to fall back to the pre-2026-08-17 behavior.
     """
     verify = os.environ.get(_TCP_ONLY_ENV, "").strip().lower() not in {"1", "true", "yes"}
+    patient = timeout * CONNECTIVITY_SLOW_FACTOR
 
     for host, port, cert_name in probes:
-        try:
-            raw = socket.create_connection((host, port), timeout=timeout)
-        except OSError:
-            continue  # Nothing answered. Ordinary offline.
-
-        with raw:
-            if not verify:
-                return True
-            # create_connection leaves its timeout on the socket, but the
-            # handshake is the part that hangs against a silent acceptor, so
-            # bound it explicitly rather than relying on that.
-            raw.settimeout(timeout)
-            try:
-                with _tls_context().wrap_socket(raw, server_hostname=cert_name):
-                    return True
-            except OSError as exc:
-                # Connected, then could not prove who it was. Deliberately catches
-                # every OSError rather than ssl.SSLError alone, because the two
-                # middlebox flavours fail differently: one speaks TLS with an
-                # untrusted certificate (SSLError), the other accepts the socket
-                # and says nothing at all (timeout). Both are the same lie.
-                #
-                # Logged loudly because it is the difference between "no network"
-                # and "something is answering for the entire internet", and only
-                # one of those is a thing the user can fix.
+        verdict = _probe_once(host, port, cert_name, timeout, verify)
+        if verdict is _INCONCLUSIVE:
+            verdict = _probe_once(host, port, cert_name, patient, verify)
+            if verdict is _INCONCLUSIVE:
                 logger.warning(
                     "connectivity probe %s:%s accepted a connection but did not "
-                    "prove it is %s (%s) — treating as offline; a captive portal "
-                    "or transparent middlebox answers exactly this way",
-                    host, port, cert_name, exc,
+                    "prove it is %s within %.1fs — treating as offline; a captive "
+                    "portal or transparent middlebox answers exactly this way",
+                    host, port, cert_name, patient,
                 )
-                continue
+                verdict = _NO_ANSWER
+        if verdict is _ONLINE:
+            return True
     return False
 
 
@@ -237,6 +305,11 @@ class FailoverBreaker:
         self._failures = 0
         self._first_failure_at = 0.0
         self._last_probe_at = 0.0
+        # Deliberately separate from _last_probe_at. That one rations half-open
+        # attempts at real upstream traffic; this one rations the standalone
+        # recovery probe. Sharing a single timer would let whichever ran first
+        # starve the other, which is the opposite of the point.
+        self._last_recovery_at = 0.0
         # (provider_base_url, model) pairs this breaker has caused to be loaded.
         # Held so closing can hand them back — see note_claim/drain_claims.
         self._claims: set[tuple[str, str]] = set()
@@ -300,6 +373,7 @@ class FailoverBreaker:
             if not self.require_offline or not self._online():
                 self.open = True
                 self._last_probe_at = now
+                self._last_recovery_at = now
                 logger.warning(
                     "failover OPEN after %d consecutive failures (%s) and no "
                     "usable %s service — serving traffic from the local "
@@ -344,8 +418,8 @@ class FailoverBreaker:
         claims, self._claims = self._claims, set()
         return claims
 
-    def record_success(self) -> None:
-        """Any non-trigger upstream response: reset, and close if OPEN.
+    def _close(self, log_line: str, note: str) -> None:
+        """Return to CLOSED and reset the counters. Idempotent when already closed.
 
         Closing leaves the claimed local tiers still resident — the caller must
         drain_claims() and unload them. This is the moment that matters for
@@ -355,13 +429,75 @@ class FailoverBreaker:
         """
         was_open = self.open
         if was_open:
-            logger.warning("failover CLOSED — %s reachable again", self.upstream_name)
-            self._notify(
-                f"Backdoor {self.source} failover",
-                f"{self.upstream_name} recovered; back to cloud",
-            )
+            logger.warning(log_line)
+            self._notify(f"Backdoor {self.source} failover", note)
         self.open = False
         self.reason = ""
         self._failures = 0
         if was_open:
             self._publish()
+
+    def record_success(self) -> None:
+        """Any non-trigger upstream response: reset, and close if OPEN."""
+        self._close(
+            f"failover CLOSED — {self.upstream_name} reachable again",
+            f"{self.upstream_name} recovered; back to cloud",
+        )
+
+    def maybe_recover(self) -> bool:
+        """Close an OPEN breaker whose outage has ended, with no request to ride on.
+
+        Returns True only when this call closed it, so the caller knows to
+        release the local tiers (see record_success).
+
+        **Why this exists.** Until 2026-09-03 recovery had exactly one path:
+        `allow_upstream` hands a real `/v1/messages` passthrough a half-open slot
+        once per `probe_interval`, and only that request's success closes the
+        breaker. Every other route that talks upstream (`/v1/messages/count_tokens`
+        and friends) deliberately never calls `record_success`, because closing
+        obliges the caller to unload the tiers and only the messages path knows
+        how. So recovery needed a rider, and the outage itself is what removes
+        the riders: sessions being served by a local 4B generate far less traffic,
+        and a user who walks away from a degraded session generates none.
+
+        Measured 2026-09-02: the breaker opened at 22:28:14 and did not close
+        until 23:45:51 — 77 minutes 37 seconds, of which the network was healthy
+        for most — and it closed at the exact second unrelated test traffic
+        arrived. For that whole window every routed session was quietly served by
+        qwen instead of the cloud model.
+
+        **Only for a breaker that requires an offline host to open.** A
+        service-level breaker (`require_offline=False`, which is how the Codex
+        upstream is configured) never consulted the connectivity probe, so the
+        probe cannot disprove its premise; it keeps the half-open path as its
+        only route back, and this returns False for it.
+
+        The probe is the same one that opened the breaker, so the close is the
+        exact negation of the open: the breaker means "this host is offline", and
+        the moment that stops being true the premise is gone. If Anthropic itself
+        is still down, the next real request fails, `record_failure` re-runs the
+        probe, finds the host online, and relays the error — which is the
+        documented behaviour for an upstream outage on a working link.
+        """
+        if not self.open:
+            return False
+        if not self.require_offline:
+            # This breaker opens on service-level failures without ever asking
+            # whether the host is online, so "the host is online" is not the
+            # negation of anything it concluded — the upstream can be down while
+            # the network is perfect. Closing on that would reopen on the next
+            # request, every interval, forever. A service-level breaker can only
+            # be disproved by reaching the service, which is what the half-open
+            # path already does.
+            return False
+        now = self._now()
+        if (now - self._last_recovery_at) < self.probe_interval:
+            return False
+        self._last_recovery_at = now
+        if not self._online():
+            return False
+        self._close(
+            "failover CLOSED — this host is back online (recovery probe)",
+            "Back online — returning to cloud",
+        )
+        return True
