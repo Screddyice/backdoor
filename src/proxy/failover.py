@@ -67,6 +67,11 @@ logger = logging.getLogger(__name__)
 _ACTIVE_BREAKERS: dict[Path, dict[str, str]] = {}
 
 
+# Settings.failover_threshold and FailoverBreaker each carried a bare 1 with a
+# comment asking the other to stay in step. One name, one place to change it.
+DEFAULT_FAILOVER_THRESHOLD = 1
+
+
 def _statuses_from_env() -> set[int]:
     raw = os.environ.get("BACKDOOR_FAILOVER_STATUSES", "").strip()
     if not raw:
@@ -323,10 +328,10 @@ def _notify(title: str, message: str) -> None:
 class FailoverBreaker:
     def __init__(
         self,
-        # Keep in step with Settings.failover_threshold — see the note there for
-        # why 1 rather than 2 (the connectivity probe, not the count, is what
-        # prevents a transient blip from claiming the GPU).
-        threshold: int = 1,
+        # See Settings.failover_threshold for why 1 rather than 2: the
+        # connectivity probe, not the count, is what prevents a transient blip
+        # from claiming the GPU.
+        threshold: int = DEFAULT_FAILOVER_THRESHOLD,
         window: float = 120.0,
         probe_interval: float = 60.0,
         now_fn: Callable[[], float] = time.monotonic,
