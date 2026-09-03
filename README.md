@@ -1432,6 +1432,11 @@ uv run pytest                 # full suite
 uv run pytest tests/<file>    # one file
 ```
 
+Worktrees usually point `.venv` at the main checkout's rather than building their own.
+`.gitignore` carries `.venv` without a trailing slash so those symlinks are ignored too;
+`.venv/` matches directories only, and a symlink shows up as untracked in every
+`git status` the worktree ever runs.
+
 Running a test you **expect** to fail? Suppress the test names. A red run exits 0 and
 gets recorded as a success, and test names are declarative sentences that the memory
 distiller inverts into architectural "rules":

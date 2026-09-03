@@ -1,7 +1,9 @@
 .env
 *.pyc
 __pycache__/
-.venv/
+# No trailing slash: a worktree's .venv is often a symlink to the main
+# checkout's, and `.venv/` matches directories only.
+.venv
 dist/
 *.egg-info/
 proxy.log
