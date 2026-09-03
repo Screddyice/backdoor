@@ -1158,17 +1158,20 @@ For OAuth mode, proxy these paths to the same bridge process: `/mcp`, `/login`,
 custom connector needs only the public `https://.../mcp` URL; leave its advanced client
 credential fields empty so Claude uses dynamic registration.
 
-### Account-synced product connector
+### Account-synced product connectors
 
-`src/products_mcp/` publishes HyperCrawl, HyperScale, and EngageMate through one OAuth MCP for
-Claude desktop, web, and mobile. Each product has three namespaced tools: `*_status`,
-`*_list_tools`, and `*_call`. The list tool returns the upstream operation names and schemas; the
-call tool accepts only an advertised operation, so a caller cannot turn the bridge into an open
-HTTP proxy.
+`src/products_mcp/` runs three OAuth MCP instances for Claude desktop, web, and mobile:
 
-The connector uses the neutral name **Product Tools** because the products have separate
-ownership: HyperCrawl and HyperScale belong to Team Nebula, while EngageMate belongs to Shawn
-Reddy Consulting (SRC) in the Screddyice GitHub organization.
+| Connector | Owner | Public endpoint | Tools |
+| --- | --- | --- | --- |
+| HyperCrawl | Team Nebula | `https://hypercrawl-mcp.5-161-126-205.sslip.io/mcp` | `hypercrawl_status`, `hypercrawl_list_tools`, `hypercrawl_call` |
+| HyperScale | Team Nebula | `https://hyperscale-mcp.5-161-126-205.sslip.io/mcp` | `hyperscale_status`, `hyperscale_list_tools`, `hyperscale_call` |
+| EngageMate | Shawn Reddy Consulting (SRC), Screddyice GitHub organization | `https://engagemate-mcp.5-161-126-205.sslip.io/mcp` | `engagemate_status`, `engagemate_list_tools`, `engagemate_call` |
+
+Set `PRODUCTS_MCP_PRODUCT` to one product for each process. The server refuses a missing or unknown
+value and registers only that product's three tools. The list tool returns upstream operation names
+and schemas. The call tool accepts only an advertised operation, which prevents callers from using
+the bridge as an open HTTP proxy.
 
 The bridge reuses `src/hermes_mcp/oauth.py` for dynamic client registration, PKCE, one-hour access
 tokens, and rotating refresh tokens. It keeps product authorization separate behind the bridge:
@@ -1177,17 +1180,17 @@ uses its internal key plus explicit user ID. Credentials stay in their existing 
 environment files. The Claude connector receives only the public MCP URL.
 
 Deploy this branch in `~/backdoor-products-mcp`, then install
-[`deploy/products-mcp-http.service`](deploy/products-mcp-http.service) as a user service. The
-separate checkout keeps connector updates from changing the live router or Hermes bridge. Route the
-public OAuth and MCP paths to its loopback port, then add the public `/mcp` URL as a Claude custom
-connector. Verification requires OAuth completion, nine tools in `tools/list`, one successful
-`*_status` call per product, and connector persistence after a Claude reload.
+[`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start
+the `hypercrawl`, `hyperscale`, and `engagemate` instances. Each instance loads its matching
+`deploy/products-mcp-<name>.env` file after the shared credential files, so its bind address, port,
+OAuth issuer, state path, and product selection take precedence. The separate checkout keeps
+connector updates from changing the live router or Hermes bridge.
 
-The unit loads [`deploy/products-mcp-runtime.env`](deploy/products-mcp-runtime.env) after the shared
-credential files. Keep the products bind and OAuth settings in that final file. An earlier shared
-Hermes environment file also defines port 8000 and the Hermes issuer, and systemd gives the last
-environment file precedence. Keep both the bare public hostname and its `:443` form in
-`HERMES_MCP_ALLOWED_HOSTS`; Caddy may forward either Host form after TLS termination.
+Merge [`deploy/products-mcp.Caddyfile`](deploy/products-mcp.Caddyfile) into the host Caddyfile and
+add each public `/mcp` URL as a separate Claude custom connector. For each endpoint, complete OAuth,
+confirm three tools in `tools/list`, run the matching read-only `*_status` tool, and reload Claude to
+confirm persistence. Keep both the bare hostname and its `:443` form in each
+`HERMES_MCP_ALLOWED_HOSTS` value because Caddy may forward either form after TLS termination.
 
 ---
 

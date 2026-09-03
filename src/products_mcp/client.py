@@ -28,7 +28,7 @@ class ProductSettings:
     engagemate_user_id: str
 
     @classmethod
-    def from_env(cls) -> "ProductSettings":
+    def from_env(cls, product: ProductName | None = None) -> "ProductSettings":
         values = cls(
             hypercrawl_url=os.environ.get("HYPERCRAWL_URL", "").rstrip("/"),
             hypercrawl_token=os.environ.get("HYPERCRAWL_REST_TOKEN", ""),
@@ -44,6 +44,16 @@ class ProductSettings:
             or os.environ.get("INTERNAL_API_KEY", ""),
             engagemate_user_id=os.environ.get("ENGAGEMATE_USER_ID", ""),
         )
+        required_by_product = {
+            "hypercrawl": {"HYPERCRAWL_URL", "HYPERCRAWL_REST_TOKEN"},
+            "hyperscale": {"HYPERFLOW_API_KEY"},
+            "engagemate": {"INTERNAL_API_KEY", "ENGAGEMATE_USER_ID"},
+        }
+        required = (
+            required_by_product[product]
+            if product is not None
+            else set().union(*required_by_product.values())
+        )
         missing = [
             name
             for name, value in {
@@ -53,7 +63,7 @@ class ProductSettings:
                 "INTERNAL_API_KEY": values.engagemate_key,
                 "ENGAGEMATE_USER_ID": values.engagemate_user_id,
             }.items()
-            if not value
+            if name in required and not value
         ]
         if missing:
             raise ValueError(f"missing product gateway settings: {', '.join(missing)}")

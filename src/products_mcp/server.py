@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import os
+from typing import Any, cast
 
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.mcpserver import MCPServer
@@ -17,11 +18,28 @@ from src.hermes_mcp.oauth import (
 from .client import ProductGateway, ProductName, ProductSettings
 
 
-def build_server(*, gateway: ProductGateway | None = None) -> MCPServer:
+PRODUCT_NAMES = ("hypercrawl", "hyperscale", "engagemate")
+
+
+def _selected_product(product: str | None = None) -> ProductName:
+    selected = (product or os.environ.get("PRODUCTS_MCP_PRODUCT", "")).strip().lower()
+    if not selected:
+        raise ValueError(
+            "PRODUCTS_MCP_PRODUCT must select hypercrawl, hyperscale, or engagemate"
+        )
+    if selected not in PRODUCT_NAMES:
+        raise ValueError(f"unknown product: {selected}")
+    return cast(ProductName, selected)
+
+
+def build_server(
+    *, product: str | None = None, gateway: ProductGateway | None = None
+) -> MCPServer:
+    selected_product = _selected_product(product)
     oauth_settings = OAuthSettings.from_env()
     provider = SingleUserOAuthProvider(oauth_settings)
     server = MCPServer(
-        "product-tools",
+        selected_product,
         auth_server_provider=provider,
         auth=AuthSettings(
             issuer_url=oauth_settings.issuer,
@@ -43,14 +61,11 @@ def build_server(*, gateway: ProductGateway | None = None) -> MCPServer:
     async def oauth_login_complete(request):
         return await provider.handle_login_completion(request)
 
-    active_gateway = gateway or ProductGateway(ProductSettings.from_env())
-    _register_tools(server, active_gateway)
+    active_gateway = gateway or ProductGateway(
+        ProductSettings.from_env(selected_product)
+    )
+    _register_product(server, active_gateway, selected_product)
     return server
-
-
-def _register_tools(server: MCPServer, gateway: ProductGateway) -> None:
-    for product in ("hypercrawl", "hyperscale", "engagemate"):
-        _register_product(server, gateway, product)
 
 
 def _register_product(

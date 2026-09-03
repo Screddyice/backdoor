@@ -63,6 +63,63 @@ def settings() -> ProductSettings:
     )
 
 
+@pytest.mark.parametrize(
+    ("product", "environment"),
+    [
+        (
+            "hypercrawl",
+            {
+                "HYPERCRAWL_URL": "https://crawl.example/v1",
+                "HYPERCRAWL_REST_TOKEN": "hc_test_value",
+            },
+        ),
+        ("hyperscale", {"HYPERFLOW_API_KEY": "hf_test_value"}),
+        (
+            "engagemate",
+            {
+                "ENGAGEMATE_URL": "http://127.0.0.1:13100",
+                "INTERNAL_API_KEY": "engage_test_value",
+                "ENGAGEMATE_USER_ID": "user_test",
+            },
+        ),
+    ],
+)
+def test_selected_product_settings_do_not_require_other_product_credentials(
+    monkeypatch, product, environment
+) -> None:
+    for name in (
+        "HYPERCRAWL_URL",
+        "HYPERCRAWL_REST_TOKEN",
+        "HYPERFLOW_API_KEY",
+        "ENGAGEMATE_URL",
+        "ENGAGEMATE_INTERNAL_API_KEY",
+        "INTERNAL_API_KEY",
+        "ENGAGEMATE_USER_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    loaded = ProductSettings.from_env(product)
+
+    if product == "hypercrawl":
+        assert loaded.hypercrawl_token == "hc_test_value"
+    elif product == "hyperscale":
+        assert loaded.hyperscale_key == "hf_test_value"
+    else:
+        assert loaded.engagemate_key == "engage_test_value"
+
+
+def test_selected_product_settings_reject_missing_required_credential(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HYPERCRAWL_URL", "https://crawl.example/v1")
+    monkeypatch.delenv("HYPERCRAWL_REST_TOKEN", raising=False)
+
+    with pytest.raises(ValueError, match="HYPERCRAWL_REST_TOKEN"):
+        ProductSettings.from_env("hypercrawl")
+
+
 @pytest.mark.asyncio
 async def test_openapi_catalog_and_call_preserve_declared_route_contract() -> None:
     requests: list[httpx.Request] = []

@@ -10,15 +10,21 @@ from src.products_mcp.server import build_server
 
 
 EXPECTED_TOOLS = {
-    "hypercrawl_list_tools",
-    "hypercrawl_call",
-    "hypercrawl_status",
-    "hyperscale_list_tools",
-    "hyperscale_call",
-    "hyperscale_status",
-    "engagemate_list_tools",
-    "engagemate_call",
-    "engagemate_status",
+    "hypercrawl": {
+        "hypercrawl_list_tools",
+        "hypercrawl_call",
+        "hypercrawl_status",
+    },
+    "hyperscale": {
+        "hyperscale_list_tools",
+        "hyperscale_call",
+        "hyperscale_status",
+    },
+    "engagemate": {
+        "engagemate_list_tools",
+        "engagemate_call",
+        "engagemate_status",
+    },
 }
 
 
@@ -31,16 +37,33 @@ class FakeGateway:
 
 
 @pytest.mark.asyncio
-async def test_server_registers_nine_namespaced_gateway_tools(monkeypatch) -> None:
+@pytest.mark.parametrize("product", ["hypercrawl", "hyperscale", "engagemate"])
+async def test_server_registers_only_selected_product_tools(
+    monkeypatch, product
+) -> None:
     monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "https://products.example")
     monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")
     monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "claude.ai,claude.com")
     monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", "/tmp/products-mcp-test-state.json")
 
-    server = build_server(gateway=FakeGateway())
+    server = build_server(product=product, gateway=FakeGateway())
     tools = await server.list_tools()
 
-    assert {tool.name for tool in tools} == EXPECTED_TOOLS
+    assert {tool.name for tool in tools} == EXPECTED_TOOLS[product]
+
+
+def test_server_requires_product_selection(monkeypatch) -> None:
+    monkeypatch.delenv("PRODUCTS_MCP_PRODUCT", raising=False)
+
+    with pytest.raises(ValueError, match="PRODUCTS_MCP_PRODUCT must select"):
+        build_server(gateway=FakeGateway())
+
+
+def test_server_rejects_unknown_product(monkeypatch) -> None:
+    monkeypatch.setenv("PRODUCTS_MCP_PRODUCT", "all-products")
+
+    with pytest.raises(ValueError, match="unknown product"):
+        build_server(gateway=FakeGateway())
 
 
 @pytest.mark.asyncio
@@ -50,10 +73,10 @@ async def test_status_and_call_tools_return_product_scoped_results(monkeypatch, 
     monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "claude.ai,claude.com")
     monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
 
-    server = build_server(gateway=FakeGateway())
+    server = build_server(product="hypercrawl", gateway=FakeGateway())
     status = await server.call_tool("hypercrawl_status", {})
     called = await server.call_tool(
-        "engagemate_call",
+        "hypercrawl_call",
         {"tool_name": "account_list", "arguments": {"limit": 2}},
     )
 
@@ -63,7 +86,7 @@ async def test_status_and_call_tools_return_product_scoped_results(monkeypatch, 
         "toolCount": 1,
     }
     assert called.structured_content == {
-        "product": "engagemate",
+        "product": "hypercrawl",
         "tool": "account_list",
         "arguments": {"limit": 2},
     }
@@ -72,6 +95,7 @@ async def test_status_and_call_tools_return_product_scoped_results(monkeypatch, 
 def test_main_passes_configured_bind_to_explicit_http_runner(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_MCP_HOST", "127.0.0.1")
     monkeypatch.setenv("HERMES_MCP_PORT", "8010")
+    monkeypatch.setenv("PRODUCTS_MCP_PRODUCT", "hypercrawl")
     monkeypatch.setenv(
         "HERMES_MCP_ALLOWED_HOSTS",
         "screddy-products.5-161-126-205.sslip.io:443",
