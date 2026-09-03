@@ -28,7 +28,7 @@ from .external_context import (
 )
 from .cognee_recall import recall_context
 from .config import Settings, get_settings
-from .failover import FailoverBreaker
+from .failover import FailoverBreaker, service_reachable
 from . import compute_lease, mlx_admin, ollama_admin
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,13 @@ def get_codex_breaker(settings: Settings) -> FailoverBreaker:
             source="codex",
             upstream_name="ChatGPT Codex",
             require_offline=settings.codex_failover_require_offline,
+            min_outage=settings.codex_failover_min_outage_seconds,
+            notify_cooldown=settings.codex_failover_notify_cooldown_seconds,
+            # Reachability of the Codex host itself, which is the only thing
+            # this router can ask on its own: it relays the caller's credentials
+            # and holds none, so it cannot make an authenticated Codex request
+            # outside a real one. See maybe_recover for what that limits.
+            service_fn=lambda: service_reachable(settings.codex_chatgpt_upstream),
         )
     return _codex_breaker
 
@@ -749,7 +756,9 @@ async def codex_responses(
             if key.lower() not in _DECODED_SKIP_RESPONSE_HEADERS
         }
         await response.aclose()
-        if breaker.record_failure(f"HTTP {response.status_code}"):
+        if breaker.record_failure(
+            f"HTTP {response.status_code}", transport_error=False
+        ):
             payload = _decode_local_payload(body, request, settings)
             return await _serve_local(payload, settings, breaker, correlation_id, started)
         return Response(content=decoded, status_code=response.status_code, headers=headers)

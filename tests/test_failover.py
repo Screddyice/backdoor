@@ -11,11 +11,14 @@ import ssl
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from src.proxy.failover import (
     FAILOVER_STATUSES,
     FailoverBreaker,
     _statuses_from_env,
     internet_reachable,
+    service_reachable,
 )
 
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="backdoor-failover-state-"))
@@ -43,6 +46,7 @@ def make(clock, **kw):
         # only has mechanics to exercise when the host has no internet.
         online_fn=kw.pop("online_fn", lambda: False),
         state_path=kw.pop("state_path", state_path),
+        **kw,
     )
     br.state_path = state_path
     return br, notes
@@ -545,3 +549,499 @@ def test_ladder_bounds_are_monotonic():
     bounds = [b for b, _ in FAILOVER_LADDER]
     assert bounds == sorted(bounds)
     assert bounds[-1] == float("inf")
+
+
+# ── The handshake-timeout hole ───────────────────────────────────────────────
+#
+# The mirror of the middlebox hole above, and the reason internet_reachable grew
+# a second attempt on 2026-09-03. Reading every non-verifying outcome as the
+# middlebox lie made a slow link indistinguishable from a box answering for the
+# whole internet, and the router opened the breaker three times on the evening of
+# 2026-09-02 against a working connection — every one logging `The handshake
+# operation timed out`, not one logging a certificate error.
+
+
+class _TimingOutThenVerifying:
+    """A peer too slow for the first budget and fast enough for the patient one."""
+
+    def __init__(self, patient_at: float):
+        self.patient_at = patient_at
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_a_slow_handshake_gets_a_patient_second_attempt(monkeypatch):
+    """A link that stalls is online, and must not be read as a lying middlebox.
+
+    This is the false-open case. Opening the breaker is expensive in exactly the
+    way this module warns about — it claims the GPU, evicts the llm-jury council,
+    and silently downgrades live sessions to a local model — so an outcome that
+    only means "not yet" must not be spent as if it meant "offline".
+    """
+    budgets = []
+
+    def connect(address, timeout=None):
+        return _TimingOutThenVerifying(1.0)
+
+    class Ctx:
+        def wrap_socket(self, sock, server_hostname=None):
+            budget = sock.timeouts[-1]
+            budgets.append(budget)
+            if budget < 1.0:
+                raise TimeoutError("_ssl.c:1064: The handshake operation timed out")
+            return contextlib.nullcontext()
+
+    monkeypatch.setattr("src.proxy.failover.socket.create_connection", connect)
+    monkeypatch.setattr("src.proxy.failover._tls_context", Ctx)
+
+    assert internet_reachable(probes=_PROBES, timeout=0.25) is True
+    assert budgets == [0.25, 1.0], (
+        "the timeout must be retried once at CONNECTIVITY_SLOW_FACTOR x the budget"
+    )
+
+
+def test_a_certificate_error_is_not_worth_retrying(monkeypatch):
+    """An impostor is a definite answer — more time cannot change it.
+
+    Retrying it would double the stall on every genuine captive portal for no
+    new information, so the patient attempt must be reserved for the ambiguous
+    outcome.
+    """
+    attempts = []
+
+    def connect(address, timeout=None):
+        attempts.append((address, timeout))
+        return _FakeSocket()
+
+    class Ctx:
+        def wrap_socket(self, sock, server_hostname=None):
+            raise ssl.SSLCertVerificationError("hostname mismatch")
+
+    monkeypatch.setattr("src.proxy.failover.socket.create_connection", connect)
+    monkeypatch.setattr("src.proxy.failover._tls_context", Ctx)
+
+    assert internet_reachable(probes=_PROBES, timeout=0.25) is False
+    assert [t for _, t in attempts] == [0.25, 0.25], (
+        "each probe gets one attempt when the peer proves it is someone else"
+    )
+
+
+def test_a_persistently_silent_box_still_reads_as_offline():
+    """The patient retry must not re-open the hole the verification closed.
+
+    A real silent acceptor never completes a handshake at any budget, so giving
+    it more room changes nothing — which is the whole reason more room is a safe
+    way to tell it apart from a slow peer.
+    """
+    srv, port = _accept_only_listener()
+    try:
+        assert internet_reachable(
+            probes=(("127.0.0.1", port, "one.one.one.one"),), timeout=0.05
+        ) is False
+    finally:
+        srv.close()
+
+
+# ── Recovery without a rider ─────────────────────────────────────────────────
+#
+# Until 2026-09-03 an OPEN breaker could only close when a real /v1/messages
+# passthrough happened to arrive and succeed. An outage removes those requests —
+# a session on a local 4B generates far less traffic, and an abandoned one none —
+# so recovery depended on the thing the outage takes away. Measured 2026-09-02:
+# open 22:28:14, closed 23:45:51, 77m37s, closing the second outside traffic hit.
+
+
+def test_recovery_probe_closes_the_breaker_with_no_traffic():
+    clock = Clock()
+    online = [False]
+    br, notes = make(clock, threshold=1, online_fn=lambda: online[0])
+
+    assert br.record_failure("ConnectError") is True
+    assert br.open
+
+    online[0] = True                       # the network came back
+    clock.t += 60.0
+    assert br.maybe_recover() is True       # no request needed
+    assert not br.open
+    assert br.reason == ""
+
+
+def test_recovery_probe_respects_the_probe_interval():
+    clock = Clock()
+    calls = []
+
+    def online():
+        calls.append(clock.t)
+        return True
+
+    br, _ = make(clock, threshold=1, online_fn=lambda: False)
+    br.record_failure("ConnectError")
+    assert br.open
+
+    br._online = online
+    clock.t += 59.0
+    assert br.maybe_recover() is False
+    assert calls == [], "the probe must not run before the interval elapses"
+
+    clock.t += 1.0
+    assert br.maybe_recover() is True
+
+
+def test_recovery_probe_leaves_a_still_offline_host_open():
+    clock = Clock()
+    br, _ = make(clock, threshold=1)         # online_fn stays False
+    br.record_failure("ConnectError")
+    assert br.open
+
+    clock.t += 600.0
+    assert br.maybe_recover() is False
+    assert br.open, "still offline: the reason the breaker opened has not gone away"
+
+
+def test_recovery_probe_is_a_no_op_while_closed():
+    clock = Clock()
+    br, notes = make(clock, threshold=1, online_fn=lambda: True)
+    assert br.maybe_recover() is False
+    assert not br.open
+    assert notes == [], "a closed breaker must not announce a recovery"
+
+
+def test_recovery_probe_does_not_starve_the_half_open_slot():
+    """The two timers are independent on purpose.
+
+    Sharing one would let the recovery probe consume the slot that lets a real
+    request try upstream, trading one starvation for another.
+    """
+    clock = Clock()
+    br, _ = make(clock, threshold=1, online_fn=lambda: False)
+    br.record_failure("ConnectError")
+    assert br.open
+
+    clock.t += 60.0
+    assert br.maybe_recover() is False       # spends the recovery timer
+    assert br.allow_upstream() is True, "half-open must still get its own turn"
+
+
+def test_recovery_probe_waits_a_full_interval_after_opening():
+    """Opening already ran the probe; re-running it immediately proves nothing."""
+    clock = Clock()
+    calls = []
+
+    def online():
+        calls.append(clock.t)
+        return False
+
+    br, _ = make(clock, threshold=1, online_fn=online)
+    br.record_failure("ConnectError")
+    assert br.open
+    assert len(calls) == 1                   # the open's own probe
+
+    assert br.maybe_recover() is False
+    assert len(calls) == 1, "no second probe in the same instant the breaker opened"
+
+
+def test_recovery_probe_refuses_a_service_level_breaker_with_no_probe():
+    """A breaker that never asked about the network cannot be answered by it.
+
+    The Codex upstream runs `require_offline=False`: it opens on consecutive
+    service failures alone, so it can be open while this host's connectivity is
+    perfect. Closing it on an online probe would reopen it on the very next
+    request, every interval, forever — and each cycle would throw a real request
+    at a service already known to be down. Its only honest route back is the
+    half-open path, which actually reaches the service.
+    """
+    clock = Clock()
+    br, _ = make(
+        clock, threshold=1, require_offline=False, online_fn=lambda: True
+    )
+    assert br.record_failure("HTTP 429", transport_error=False) is True
+    assert br.open, "a service-level breaker opens without consulting the probe"
+
+    clock.t += 600.0
+    assert br.maybe_recover() is False
+    assert br.open, "connectivity says nothing about whether the service is back"
+
+
+def test_recovery_probe_still_serves_an_offline_gated_breaker():
+    """The mirror: require_offline=True is exactly where the probe is decisive."""
+    clock = Clock()
+    online = [False]
+    br, _ = make(
+        clock, threshold=1, require_offline=True, online_fn=lambda: online[0]
+    )
+    br.record_failure("ConnectError")
+    assert br.open
+
+    online[0] = True
+    clock.t += 60.0
+    assert br.maybe_recover() is True
+    assert not br.open
+
+
+# ── Probing the service, not the internet ────────────────────────────────────
+#
+# A service-level breaker (the Codex upstream) opens without consulting
+# connectivity, so `internet_reachable` cannot answer it. What this router *can*
+# ask on its own is whether that upstream's host is reachable — it relays the
+# caller's credentials and holds none, so it cannot make an authenticated Codex
+# request outside a real one. That measurement disproves exactly one kind of
+# open, and the breaker must not pretend otherwise.
+
+
+def test_service_probe_closes_a_breaker_that_opened_on_a_transport_error():
+    clock = Clock()
+    reachable = [False]
+    br, _ = make(
+        clock,
+        threshold=1,
+        require_offline=False,
+        service_fn=lambda: reachable[0],
+    )
+    assert br.record_failure("ConnectTimeout") is True
+    assert br.open
+
+    reachable[0] = True
+    clock.t += 60.0
+    assert br.maybe_recover() is True
+    assert not br.open
+
+
+def test_service_probe_will_not_close_a_breaker_that_opened_on_a_status():
+    """Reachability disproves "I could not reach it", never "it answered 429".
+
+    The front door of a rate-limited service is perfectly reachable. Closing on
+    that would reopen on the next request, every interval, and spend real
+    requests against a service that already said no — while the router cannot
+    even ask properly, since the credential belongs to the caller.
+    """
+    clock = Clock()
+    br, _ = make(
+        clock,
+        threshold=1,
+        require_offline=False,
+        service_fn=lambda: True,          # host is up; quota is not
+    )
+    assert br.record_failure("HTTP 429", transport_error=False) is True
+    assert br.open
+
+    clock.t += 600.0
+    assert br.maybe_recover() is False
+    assert br.open
+
+
+def test_service_probe_leaves_an_unreachable_upstream_open():
+    clock = Clock()
+    br, _ = make(
+        clock, threshold=1, require_offline=False, service_fn=lambda: False
+    )
+    br.record_failure("ConnectError")
+    assert br.open
+    clock.t += 60.0
+    assert br.maybe_recover() is False
+    assert br.open
+
+
+def test_an_offline_gated_breaker_still_uses_the_connectivity_probe():
+    """The Claude breaker must not start asking the service instead."""
+    clock = Clock()
+    asked = []
+    online = [False]                       # offline, so the breaker may open
+
+    def online_fn():
+        asked.append("online")
+        return online[0]
+
+    br, _ = make(
+        clock,
+        threshold=1,
+        require_offline=True,
+        online_fn=online_fn,
+        service_fn=lambda: (asked.append("service"), True)[1],
+    )
+    br.record_failure("ConnectError")
+    assert br.open
+
+    online[0] = True
+    clock.t += 60.0
+    assert br.maybe_recover() is True
+    assert "service" not in asked, "an offline-gated breaker asks connectivity"
+
+
+def test_service_reachable_targets_the_url_s_host_and_port(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "src.proxy.failover._probe_all",
+        lambda probes, timeout, verify: seen.append((tuple(probes), verify)) or True,
+    )
+    assert service_reachable("https://chatgpt.com/backend-api/codex") is True
+    assert seen[0][0] == (("chatgpt.com", 443, "chatgpt.com"),), (
+        "the certificate must be checked against the service's own name"
+    )
+    assert seen[0][1] is True
+
+
+def test_service_reachable_skips_verification_for_plain_http(monkeypatch):
+    """There is no certificate to check on http://, so a handshake is the wrong test."""
+    seen = []
+    monkeypatch.setattr(
+        "src.proxy.failover._probe_all",
+        lambda probes, timeout, verify: seen.append((tuple(probes), verify)) or True,
+    )
+    assert service_reachable("http://127.0.0.1:11434/v1") is True
+    assert seen[0][0] == (("127.0.0.1", 11434, "127.0.0.1"),)
+    assert seen[0][1] is False
+
+
+def test_service_reachable_reports_false_for_an_unparseable_url(monkeypatch):
+    monkeypatch.setattr(
+        "src.proxy.failover._probe_all",
+        lambda *a, **k: pytest.fail("must not dial when there is no host"),
+    )
+    assert service_reachable("") is False
+
+
+# ── Failing fast is not the same as failing for long ─────────────────────────
+#
+# Requests are concurrent, so a "consecutive failure" count can be satisfied in
+# one instant. Measured 2026-09-03 14:46:18.113: four transport failures in the
+# SAME MILLISECOND, all `[Errno 8] nodename nor servname provided` from one DNS
+# hiccup. Any threshold trips on that, which is why the real guard is elapsed
+# time — see Settings.failover_min_outage_seconds.
+
+
+def test_a_burst_of_failures_in_one_instant_does_not_open_the_breaker():
+    """The 14:46:18.113 shape: four failures, same millisecond, offline probe."""
+    clock = Clock()
+    br, notes = make(clock, threshold=1, min_outage=30.0)
+    for _ in range(4):
+        assert br.record_failure("ConnectError") is False
+    assert not br.open, "one instant of failure is not an outage"
+    assert notes == [], "and nothing to interrupt the human about"
+
+
+def test_the_breaker_opens_once_the_outage_has_lasted():
+    clock = Clock()
+    br, notes = make(clock, threshold=1, min_outage=30.0)
+    assert br.record_failure("ConnectError") is False
+
+    clock.t += 29.0
+    assert br.record_failure("ConnectError") is False, "29s is not yet 30s"
+
+    clock.t += 1.0
+    assert br.record_failure("ConnectError") is True
+    assert br.open
+    assert len(notes) == 1
+
+
+def test_a_recovered_upstream_restarts_the_clock():
+    """A success in the middle means the next outage is measured from scratch."""
+    clock = Clock()
+    br, _ = make(clock, threshold=1, min_outage=30.0)
+    br.record_failure("ConnectError")
+    clock.t += 25.0
+    br.record_success()                      # cloud came back
+
+    br.record_failure("ConnectError")
+    clock.t += 25.0
+    assert br.record_failure("ConnectError") is False, (
+        "the earlier failures must not count toward this outage"
+    )
+    assert not br.open
+
+
+def test_the_duration_gate_runs_before_the_connectivity_probe():
+    """The probe is a TLS handshake; a burst must not fire one per failure."""
+    clock = Clock()
+    probes = []
+    br, _ = make(
+        clock,
+        threshold=1,
+        min_outage=30.0,
+        online_fn=lambda: (probes.append(clock.t), False)[1],
+    )
+    for _ in range(5):
+        br.record_failure("ConnectError")
+    assert probes == [], "nothing worth probing until the outage has lasted"
+
+    clock.t += 30.0
+    br.record_failure("ConnectError")
+    assert len(probes) == 1
+
+
+# ── Rationing the interruption ───────────────────────────────────────────────
+#
+# Sixteen desktop notifications on the evening of 2026-09-02. The log keeps every
+# transition; the popup is for the human, and the recovery ticker makes
+# transitions MORE frequent, so this has to exist for the ticker to be a net win.
+
+
+def test_a_second_outage_inside_the_cooldown_is_silent():
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    assert br.open and len(notes) == 1
+    br.record_success()
+    assert len(notes) == 2, "the first outage announces both ends"
+
+    clock.t += 60.0
+    br.record_failure("ConnectError")
+    assert br.open, "the breaker still opens — only the notification is rationed"
+    br.record_success()
+    assert len(notes) == 2, "a flap inside the cooldown says nothing"
+
+
+def test_a_suppressed_outage_does_not_announce_its_recovery():
+    """An orphan "back to cloud" for an outage you were never told about is worse
+    than silence — it reads as a bug."""
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    br.record_success()
+    notes.clear()
+
+    clock.t += 10.0
+    br.record_failure("ConnectError")
+    br.record_success()
+    assert notes == []
+
+
+def test_an_outage_after_the_cooldown_speaks_again():
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    br.record_success()
+    notes.clear()
+
+    clock.t += 901.0
+    br.record_failure("ConnectError")
+    assert len(notes) == 1
+    br.record_success()
+    assert len(notes) == 2
+
+
+def test_every_transition_is_still_logged_even_when_silent(caplog):
+    """Rationing the popup must not ration the record."""
+    import logging
+
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    br.record_success()
+    notes.clear()
+
+    with caplog.at_level(logging.WARNING, logger="src.proxy.failover"):
+        clock.t += 5.0
+        br.record_failure("ConnectError")
+        br.record_success()
+
+    text = caplog.text
+    assert "failover OPEN" in text and "failover CLOSED" in text
+    assert notes == []

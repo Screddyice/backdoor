@@ -238,6 +238,19 @@ logs a warning naming the address, because "no network" and "something is answer
 internet" need different responses from you, and moves on to the next probe rather than giving up —
 interception is per-route, so a hijacked path to `1.1.1.1` does not make a clean `8.8.8.8` unusable.
 
+**A handshake that times out gets a second, patient attempt** (added 2026-09-03). Reading every
+non-verifying outcome as the middlebox lie was the mirror image of the 2026-08-17 hole, and it cost
+a full evening: on a tethered link measuring 744 ms average RTT with 3.1 s spikes, an honest peer
+cannot finish inside the 2 s budget, so the probe reported "offline" three times against a working
+internet and the breaker claimed the GPU each time. Every one of those opens logged `The handshake
+operation timed out`; not one logged a certificate error, which is what tells the two apart.
+
+So a timeout is now treated as *inconclusive* rather than as an answer, and the probe re-dials once
+with `CONNECTIVITY_SLOW_FACTOR` × the budget (8 s by default). A genuinely silent acceptor never
+completes a handshake at any budget, so it still reads as offline; a real peer on a stalling link
+finally gets enough room to answer. A certificate error is a definite answer and is never retried.
+The extra wait is paid only on the timeout path, and only on a request that is already failing.
+
 Still literal IPs, and the hostname is only ever used as SNI and verified — never resolved — so a
 broken resolver still cannot fold itself into the answer.
 
@@ -450,6 +463,47 @@ What each route does now when upstream will not answer:
 | `/{path:path}` | `502` |
 
 Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+
+### Opening needs a sustained outage, not a fast one
+
+Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
+
+The breaker now requires the upstream to have been failing for `failover_min_outage_seconds` (30 s, and `codex_failover_min_outage_seconds` for the Codex side) before it may open. The gate is checked *before* the connectivity probe, so a burst no longer fires one TLS handshake per failure.
+
+During those 30 seconds the real errors are relayed, and the client retries through them. That is the cheaper failure: the alternative was silently moving a live session onto a local model, eight times in one evening.
+
+Worth knowing when reading the log: **a short outage shows as a long open.** Half-open only retries once per `failover_probe_seconds`, so a five-second blip can appear as a 60–90 second open with nothing wrong.
+
+### One notification per outage, not per transition
+
+Sixteen desktop popups on the evening of 2026-09-02. Every transition is still logged in full; the notification is for the human and is rationed to one per breaker per `failover_notify_cooldown_seconds` (900 s). A close announces only if its open did, so a suppressed outage never leaves an orphan "back to cloud" for something you were never told about.
+
+This is load-bearing rather than politeness: the recovery ticker below makes transitions *more* frequent, so without rationing it would have made the noise worse.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `failover_min_outage_seconds` | `30.0` | How long the upstream must stay broken before failover may open |
+| `failover_notify_cooldown_seconds` | `900.0` | Minimum gap between failover notifications, per breaker |
+| `codex_failover_min_outage_seconds` | `30.0` | The same gate for the Codex breaker |
+| `codex_failover_notify_cooldown_seconds` | `900.0` | The same rationing for the Codex breaker |
+
+### Recovery does not wait for traffic
+
+An open breaker used to have exactly one way back: `allow_upstream` hands a real `/v1/messages` passthrough a half-open slot once per `failover_probe_seconds`, and only that request's success closes it. Recovery therefore depended on the traffic an outage takes away — a session being served by a local 4B generates far less of it, and a session you walked away from generates none.
+
+Measured on 2026-09-02, the breaker was open from 22:28:14 to 23:45:51 — 77 minutes 37 seconds, most of them on a network that had already recovered — and it closed at the exact second unrelated test traffic reached it. For that whole window every routed session was quietly answered by qwen instead of the cloud model, which reads as "the API errors never stopped" rather than as a stuck breaker.
+
+A background ticker now re-runs the connectivity probe every `failover_probe_seconds` while the breaker is open, and closes it the moment this host is online again — releasing the local tiers exactly as an upstream success would. It is the negation of the condition that opened the breaker: opening means "this host is offline", so recovery is "that stopped being true". If Anthropic itself is still down, the next real request fails, the probe finds the host online, and the error is relayed — the documented behaviour for an upstream outage on a working link. The ticker does nothing at all while the breaker is closed, and starts only when `failover_to_local` is on.
+
+The ticker watches **both** breakers this router owns — the Claude one and the Codex one — each released through its own tier path.
+
+**Each breaker is answered by the probe that matches its premise.** The Claude breaker opens because this host had no route out, so connectivity is the exact negation of what it concluded. The Codex breaker never consults connectivity at all — `codex_failover_require_offline` is `false`, so it opens on consecutive service failures and can be open while the network is perfect. Answering it with a connectivity probe would be answering a question it never asked. It gets `service_reachable()` instead: the same verified handshake, aimed at its own upstream host.
+
+Unlike `internet_reachable`, that one resolves DNS on purpose. Literal IPs exist so a broken resolver cannot fold itself into "has this machine got a route"; "is *that service* reachable from here" is a different question, and a name that will not resolve is a real way for a service to be unreachable.
+
+**Reachability disproves "I could not reach it" and never "it answered 429".** The front door of a rate-limited service is perfectly reachable, and this router cannot check the difference on its own: it relays the caller's credentials and holds none, so it cannot make an authenticated Codex request outside a real one. So `record_failure` takes `transport_error`, passed `False` at the two `f"HTTP {status}"` call sites, and the breaker remembers which kind opened it. A transport-error open can be reconsidered by the probe; a status open keeps the half-open path, which is the only route that actually settles a quota and the only one carrying a credential.
+
+The practical difference: an idle Codex outage that was a transport failure now ends on its own, instead of holding a qwen tier resident and llm-jury disabled until traffic happens to return. A usage limit still waits for a real request, which is correct.
 
 ### A stream that dies after the headers
 
