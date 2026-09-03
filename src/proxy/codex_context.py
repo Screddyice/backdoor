@@ -515,6 +515,12 @@ def build_local_payload(
         "input": input_items,
         "stream": bool(payload.get("stream", True)),
         "parallel_tool_calls": bool(payload.get("parallel_tool_calls", False)),
+        # Ollama answers a Responses request with reasoning items of its own, and
+        # their `encrypted_content` is signed locally. ChatGPT cannot verify that
+        # once the breaker closes, so a thread carrying them cannot go back to
+        # cloud inference. Asking for no reasoning keeps the local turn a plain
+        # assistant message, which replays cleanly.
+        "reasoning": {"effort": "none"},
     }
     if tools:
         local["tools"] = tools
