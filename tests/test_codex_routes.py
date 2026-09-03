@@ -176,12 +176,13 @@ async def test_codex_compaction_request_stays_on_chatgpt_relay(codex_app, monkey
 async def codex_app(monkeypatch, tmp_path):
     settings = Settings(
         codex_chatgpt_upstream="https://chatgpt.test/backend-api/codex",
-        codex_failover_threshold=3,
     )
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: settings
     breaker = FailoverBreaker(
-        threshold=3,
+        threshold=settings.codex_failover_threshold,
+        min_outage=settings.codex_failover_min_outage_seconds,
+        notify_cooldown=settings.codex_failover_notify_cooldown_seconds,
         notify_fn=lambda *_: None,
         online_fn=lambda: True,
         state_path=tmp_path / "codex-state.json",
@@ -685,6 +686,59 @@ async def test_disabling_local_failover_always_relays_trigger_statuses(
     assert cloud_calls == 2
     assert local_calls == 0
     assert breaker.open is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "http-502"])
+async def test_first_trigger_failure_uses_qwen_with_production_policy(
+    codex_app, monkeypatch, failure
+):
+    app, settings, breaker = codex_app
+    local_calls = 0
+
+    def cloud(request: httpx.Request) -> httpx.Response:
+        if failure == "transport":
+            raise httpx.ConnectError("cloud unavailable", request=request)
+        return httpx.Response(502, json={"error": "bad gateway"})
+
+    def local(_request: httpx.Request) -> httpx.Response:
+        nonlocal local_calls
+        local_calls += 1
+        return httpx.Response(
+            200,
+            stream=BytesStream(SSE),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def no_recall(_query, _settings):
+        return []
+
+    monkeypatch.setattr(codex_routes, "recall_context", no_recall)
+    monkeypatch.setattr(
+        codex_routes,
+        "_chatgpt_client",
+        httpx.AsyncClient(
+            base_url=settings.codex_chatgpt_upstream,
+            transport=httpx.MockTransport(cloud),
+        ),
+    )
+    monkeypatch.setattr(
+        codex_routes,
+        "_ollama_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(local)),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+
+    assert response.status_code == 200
+    assert response.content == SSE
+    assert local_calls == 1
+    assert breaker.open
 
 
 @pytest.mark.asyncio

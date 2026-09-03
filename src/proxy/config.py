@@ -170,12 +170,12 @@ class Settings(BaseSettings):
     codex_failover_to_local: bool = True
     codex_chatgpt_upstream: str = "https://chatgpt.com/backend-api/codex"
     codex_max_request_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
-    codex_failover_threshold: int = Field(default=3, ge=1)
+    codex_failover_threshold: int = Field(default=1, ge=1)
     codex_failover_window_seconds: float = Field(default=120.0, gt=0)
     codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
-    # Same reasoning as failover_min_outage_seconds above; a burst of concurrent
-    # 429s is one moment, not a sustained refusal.
-    codex_failover_min_outage_seconds: float = Field(default=30.0, ge=0)
+    # Codex Desktop surfaces a 502 instead of retrying through a duration gate.
+    # Serve the first trigger-class failure locally, with no second hold-down.
+    codex_failover_min_outage_seconds: float = Field(default=0.0, ge=0)
     codex_failover_notify_cooldown_seconds: float = Field(default=900.0, ge=0)
     codex_failover_statuses: str = "429,500,502,503,504,529"
     codex_failover_require_offline: bool = False
