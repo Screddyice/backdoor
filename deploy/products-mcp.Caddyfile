@@ -1,0 +1,11 @@
+hypercrawl-mcp.5-161-126-205.sslip.io {
+    reverse_proxy 127.0.0.1:8011
+}
+
+hyperscale-mcp.5-161-126-205.sslip.io {
+    reverse_proxy 127.0.0.1:8012
+}
+
+engagemate-mcp.5-161-126-205.sslip.io {
+    reverse_proxy 127.0.0.1:8013
+}
