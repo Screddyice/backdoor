@@ -12,6 +12,7 @@ def fake_tokenizer(tmp_path) -> Path:
     executable = tmp_path / "llama-tokenize"
     executable.write_text(
         "#!/bin/sh\n"
+        "if [ -n \"$FAKE_ARGS_PATH\" ]; then printf '%s\\n' \"$@\" > \"$FAKE_ARGS_PATH\"; fi\n"
         "printf '%s\\n' \"${FAKE_TOKEN_OUTPUT:-tokens: ${FAKE_TOKEN_COUNT:-7}}\"\n",
         encoding="utf-8",
     )
@@ -44,6 +45,28 @@ def test_token_gate_parses_llama_tokenize_completion_output(fake_tokenizer, mode
 
     assert result.tokens == 12
     assert result.exact is True
+
+
+def test_token_gate_requests_show_count_from_llama_tokenize(fake_tokenizer, model_path, monkeypatch, tmp_path):
+    args_path = tmp_path / "tokenizer-args.txt"
+    monkeypatch.setenv("FAKE_ARGS_PATH", str(args_path))
+    monkeypatch.setenv("FAKE_TOKEN_OUTPUT", "Total number of tokens: 12")
+    gate = QwenTokenGate(executable=str(fake_tokenizer), model_path=str(model_path))
+    payload = {"messages": [{"role": "user", "content": "hello"}]}
+
+    result = gate.count(payload)
+
+    assert args_path.read_text(encoding="utf-8").splitlines() == [
+        "-m",
+        str(model_path),
+        "--prompt",
+        gate.render(payload),
+        "--show-count",
+        "--log-disable",
+    ]
+    assert result.tokens == 12
+    assert result.exact is True
+    assert result.method == "llama-tokenize"
 
 
 def test_token_gate_counts_full_utf8_bytes_when_exact_tokenizer_is_unavailable():

@@ -182,3 +182,100 @@ def test_selector_reports_active_pair_when_mandatory_pair_cannot_fit(store):
     result = select_working_set(context, store, lineage, 10, 250, fake_counter)
 
     assert result.reason == "active_pair_over_limit"
+
+
+def _budget_fixture() -> MessagesRequest:
+    messages = [
+        {"role": "user", "content": "needle needle needle high retrieval"},
+        {"role": "assistant", "content": "needle low retrieval"},
+        {"role": "assistant", "content": "src/proxy/keep.py traceback failure"},
+    ]
+    messages.extend(
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"recent completed turn {index}"}
+        for index in range(8)
+    )
+    messages.append({"role": "user", "content": "needle"})
+    return MessagesRequest.model_validate({"model": "claude-opus-4-6", "messages": messages})
+
+
+def _budget_counter(context):
+    weights = {
+        segment.segment_id: (
+            1_000
+            if segment.segment_id == context.current_segment_id
+            else 2_000
+            if "recent completed turn" in segment.searchable_text
+            or "keep.py" in segment.searchable_text
+            else 0
+        )
+        for segment in context.segments
+    }
+
+    def count(selected_ids, retrieved) -> int:
+        return sum(weights[segment_id] for segment_id in selected_ids) + 1_000 * len(retrieved)
+
+    return count
+
+
+def test_selector_drops_low_ranked_retrieval_before_oldest_completed_turn(store):
+    context = ClaudeContextAdapter().normalize(_budget_fixture())
+    lineage = store.archive(context)
+    counter = _budget_counter(context)
+    active_reference = next(segment for segment in context.segments if "keep.py" in segment.searchable_text)
+    oldest_completed = next(
+        segment for segment in context.segments if segment.searchable_text == "recent completed turn 0"
+    )
+    newest_completed = next(
+        segment for segment in context.segments if segment.searchable_text == "recent completed turn 7"
+    )
+
+    result = select_working_set(context, store, lineage, 18_000, 22_000, counter)
+
+    assert result.retrieved == ()
+    assert active_reference.segment_id in result.selected_ids
+    assert oldest_completed.segment_id not in result.selected_ids
+    assert newest_completed.segment_id in result.selected_ids
+    assert result.estimated_tokens == 17_000
+    assert result.estimated_tokens <= 18_000
+
+
+def test_selector_removes_lowest_ranked_retrieval_before_completed_turns(store):
+    context = ClaudeContextAdapter().normalize(_budget_fixture())
+    lineage = store.archive(context)
+    counter = _budget_counter(context)
+    oldest_completed = next(
+        segment for segment in context.segments if segment.searchable_text == "recent completed turn 0"
+    )
+
+    result = select_working_set(context, store, lineage, 20_000, 22_000, counter)
+
+    retrieved_text = " ".join(segment.searchable_text for segment in result.retrieved)
+    assert "high retrieval" in retrieved_text
+    assert "low retrieval" not in retrieved_text
+    assert oldest_completed.segment_id in result.selected_ids
+    assert result.estimated_tokens == 20_000
+
+
+def test_selector_reports_active_pair_over_the_22000_token_hard_limit(store):
+    context = ClaudeContextAdapter().normalize(oversized_fixture(ClaudeContextAdapter()))
+    lineage = store.archive(context)
+    active_pair_ids = {
+        segment.segment_id for segment in context.segments if segment.pair_id == "active_tool"
+    }
+
+    def hard_counter(selected_ids, retrieved) -> int:
+        del retrieved
+        return sum(
+            18_000
+            if segment_id == context.current_segment_id
+            else 2_500
+            if segment_id in active_pair_ids
+            else 0
+            for segment_id in selected_ids
+        )
+
+    result = select_working_set(context, store, lineage, 18_000, 22_000, hard_counter)
+
+    assert result.reason == "active_pair_over_limit"
+    assert result.estimated_tokens == 18_000
+    assert result.estimated_tokens <= 22_000
