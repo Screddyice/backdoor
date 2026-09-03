@@ -84,6 +84,11 @@ from .models import MessagesRequest, Message
 # keep-list only with a tool-capable model, and set it to "" for one that is not.
 DEFAULT_KEEP_TOOLS: tuple[str, ...] = ("local",)
 
+# During a confirmed outage, only tools that inspect local state are safe and
+# useful. In particular, mutation tools and remote integrations must not be
+# offered to the local model.
+READ_ONLY_OUTAGE_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+
 # Tools from an MCP server carry this prefix. Everything else is harness-local.
 MCP_PREFIX = "mcp__"
 
@@ -182,6 +187,16 @@ def parse_keep(raw: str | Iterable[str] | None) -> tuple[str, ...]:
         parts = [str(p).strip() for p in raw]
     kept = tuple(p for p in parts if p)
     return kept or ()
+
+
+def apply_outage_tool_policy(req: MessagesRequest) -> MessagesRequest:
+    """Return a deep copy exposing only read-only local inspection tools."""
+    output = req.model_copy(deep=True)
+    allowed = set(READ_ONLY_OUTAGE_TOOLS)
+    output.tools = [tool for tool in (output.tools or []) if tool.name in allowed] or None
+    if not output.tools:
+        output.tool_choice = None
+    return output
 
 
 def _truncate(text: str, limit: int) -> str:
