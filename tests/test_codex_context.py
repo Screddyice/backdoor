@@ -95,6 +95,12 @@ def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
     )
 
 
+def test_build_local_payload_disables_unverifiable_ollama_reasoning_items():
+    local, _ = build_local_payload(load_request(), [], Settings())
+
+    assert local["reasoning"] == {"effort": "none"}
+
+
 def test_build_local_payload_drops_cloud_only_items_after_active_user():
     cloud = load_request()
     cloud["input"].extend(
