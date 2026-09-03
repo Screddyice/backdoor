@@ -91,6 +91,30 @@ class Settings(BaseSettings):
     failover_threshold: int = 1
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
+    # How long the upstream must stay broken before failover is allowed.
+    #
+    # This is the guard the count was supposed to be and never could be.
+    # Requests are concurrent, so a "consecutive failure" count is satisfied by
+    # a single instant: measured 2026-09-03 14:46:18.113, four transport
+    # failures landed in the SAME MILLISECOND, all of them `[Errno 8] nodename
+    # nor servname provided` from one DNS hiccup. Any threshold — 1, 3, 10 —
+    # trips on that burst, so counting never distinguished a two-second blip
+    # from a real outage. Elapsed time does.
+    #
+    # The cost of getting it wrong is asymmetric and was being paid daily. On
+    # 2026-09-02 the breaker opened eight times, several for episodes that were
+    # over almost immediately (the open then lasts up to a further
+    # `failover_probe_seconds` purely because half-open only retries once per
+    # interval, which is why short outages read as long ones in the log). Each
+    # one silently moved live sessions onto a local model and fired a desktop
+    # notification. Thirty seconds of relayed API errors — which the client
+    # already retries through — is the cheaper failure.
+    failover_min_outage_seconds: float = 30.0
+    # At most one failover announcement per breaker per cooldown. The log keeps
+    # every transition; the notification is for the human, and a flapping link
+    # produced sixteen of them in one evening. A close only announces if its
+    # open did, so a suppressed outage never produces an orphan "back to cloud".
+    failover_notify_cooldown_seconds: float = 900.0
 
     # Bare mode: strip the Claude Code harness (system prompt, tool definitions,
     # tool results, images) off a failed-over request, keeping only the tools
@@ -150,6 +174,10 @@ class Settings(BaseSettings):
     codex_failover_threshold: int = Field(default=3, ge=1)
     codex_failover_window_seconds: float = Field(default=120.0, gt=0)
     codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
+    # Same reasoning as failover_min_outage_seconds above; a burst of concurrent
+    # 429s is one moment, not a sustained refusal.
+    codex_failover_min_outage_seconds: float = Field(default=30.0, ge=0)
+    codex_failover_notify_cooldown_seconds: float = Field(default=900.0, ge=0)
     codex_failover_statuses: str = "429,500,502,503,504,529"
     codex_failover_require_offline: bool = False
 
