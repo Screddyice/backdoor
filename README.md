@@ -954,6 +954,12 @@ The backend must also return usable summary text. On 2026-08-28 the action-tuned
 
 #### Memory is the other half of a small window
 
+Automatic Qwen context compaction is specified for both Claude Messages and Codex Responses.
+When either client switches a mature task to Qwen, Backdoor will archive the exact transcript
+locally and send the 32K model a bounded 18K–22K working set. Cloud requests keep the full client
+history. Cognee remains an optional durable-memory layer rather than an outage dependency. See
+[`docs/superpowers/specs/2026-09-04-automatic-qwen-context-compaction-design.md`](docs/superpowers/specs/2026-09-04-automatic-qwen-context-compaction-design.md).
+
 A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
 
 This is the one documented exception to the MCP-off rule, and the token arithmetic is why it survives that rule. The global MCP set costs about 142K tokens of schema. The shim exposes `cognee_search` and `cognee_remember` and nothing else, so it costs hundreds. Against a 32K window the first is impossible and the second is affordable.
