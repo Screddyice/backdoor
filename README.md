@@ -238,6 +238,19 @@ logs a warning naming the address, because "no network" and "something is answer
 internet" need different responses from you, and moves on to the next probe rather than giving up —
 interception is per-route, so a hijacked path to `1.1.1.1` does not make a clean `8.8.8.8` unusable.
 
+**A handshake that times out gets a second, patient attempt** (added 2026-09-03). Reading every
+non-verifying outcome as the middlebox lie was the mirror image of the 2026-08-17 hole, and it cost
+a full evening: on a tethered link measuring 744 ms average RTT with 3.1 s spikes, an honest peer
+cannot finish inside the 2 s budget, so the probe reported "offline" three times against a working
+internet and the breaker claimed the GPU each time. Every one of those opens logged `The handshake
+operation timed out`; not one logged a certificate error, which is what tells the two apart.
+
+So a timeout is now treated as *inconclusive* rather than as an answer, and the probe re-dials once
+with `CONNECTIVITY_SLOW_FACTOR` × the budget (8 s by default). A genuinely silent acceptor never
+completes a handshake at any budget, so it still reads as offline; a real peer on a stalling link
+finally gets enough room to answer. A certificate error is a definite answer and is never retried.
+The extra wait is paid only on the timeout path, and only on a request that is already failing.
+
 Still literal IPs, and the hostname is only ever used as SNI and verified — never resolved — so a
 broken resolver still cannot fold itself into the answer.
 
@@ -358,6 +371,74 @@ A handful of Claude Code's internal housekeeping requests (quota probes, title g
 
 ---
 
+## Codex cloud-to-local failover
+
+Codex uses a different protocol from Claude Code. Its ChatGPT-backed sessions post to the Responses API, so the Anthropic `/v1/messages` router cannot catch a failed Codex turn. Backdoor exposes a separate Responses relay at `http://127.0.0.1:8083/backend-api/codex`.
+
+Add this to `~/.codex/config.toml` while keeping your existing ChatGPT login:
+
+```toml
+model_provider = "backdoor"
+
+[model_providers.backdoor]
+name = "Backdoor"
+base_url = "http://127.0.0.1:8083/backend-api/codex"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+supports_standalone_web_search = false
+```
+
+Restart Codex Desktop after changing the shared configuration. Dock-launched processes do not reload terminal configuration or a modified TOML file mid-session.
+
+Leave `model_context_window` and `model_auto_compact_token_limit` unset. Codex uses the selected cloud model's catalog limits. Backdoor applies Qwen's smaller window after it chooses local failover and rebuilds the request.
+
+### What happens to a running thread
+
+While ChatGPT inference works, Backdoor relays the original request, OAuth headers, response status, and SSE bytes. Backdoor sends cloud traffic without parsing it or applying Qwen's 32K check. ChatGPT enforces the selected cloud model's input limit. Codex compaction requests also stay on the ChatGPT relay. Codex sends account, plugin, and other hosted traffic to ChatGPT because Backdoor replaces the inference provider alone.
+
+The relay accepts request bodies up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must send a larger encoded request.
+
+After three eligible failures inside 120 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+
+The visible Codex thread does not change. Qwen receives a fresh internal request containing:
+
+- the latest user instruction and the active local tool loop, including a paired tool continuation that does not repeat the user message;
+- a bounded recall from Cognee when `QWEN_COGNEE` is enabled;
+- local Code Mode tools converted from Codex's Responses Lite namespace format.
+
+It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Cognee can provide continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads agent recall through `POST /api/v1/recall`. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_COGNEE=0` to suppress every Cognee read and write on the local path.
+
+Cognee authentication resolves from the running process, `~/.cognee/.env`, then the existing `~/.cognee-plugin/api_key.json` cache when its server URL matches. The key is not copied into the Backdoor LaunchAgent.
+
+The breaker permits one ChatGPT probe every 60 seconds while open. A probe closes it the moment ChatGPT returns response headers, the same point the Anthropic path uses: a status line proves this host can still reach the upstream, and reachability is the only question the breaker asks. Later turns return to cloud immediately. Qwen is released separately, once a relayed stream finishes, because a probe whose body dies mid-flight is about to be retried and unloading the tier that will serve that retry only buys a reload.
+
+Crediting the probe at the end of the stream instead looks equivalent and is not, because the failure is silent. On 2026-08-30 a blip opened the Codex breaker at 23:09:48. Probes at 23:13:46 and 23:15:23 both reached ChatGPT and logged `path=cloud status=200`. The breaker stayed open for 19 minutes anyway, answering two Codex turns from the local 27B in 309s and 385s while the cloud was fine. Both clients hung up before their bodies finished, and closing a generator raises `GeneratorExit` at the `yield`, which runs neither the transport-error branch nor the success branch. A probe that plainly worked was discarded twice. A client that hangs up before the first chunk never starts the generator at all, so no handling inside the body can see that probe succeed.
+
+Before Codex receives a local response, Backdoor removes Qwen reasoning items from streaming SSE and non-streaming JSON. It reindexes retained SSE output and removes every local `encrypted_content` field. Ollama places plaintext reasoning in that field, while ChatGPT expects an opaque value that it issued and can verify. Letting a local reasoning item enter the thread makes the first recovered cloud turn fail with `invalid_encrypted_content`. Tool calls and visible assistant output remain in the thread; healthy cloud responses still pass through byte-for-byte.
+
+Backdoor caps each local SSE frame and non-streaming JSON body at 8 MiB. It requests uncompressed local responses and rejects any encoded response before reading its body, which prevents decompression from bypassing those limits. Invalid or oversized JSON returns `502 Local Qwen returned an invalid response`. An invalid or oversized SSE frame closes the local stream and releases its runtime slot.
+
+### The local 32K allocation
+
+Backdoor enforces this allocation on the fresh request that it sends to Qwen:
+
+| Component | Limit |
+| --- | ---: |
+| Local guidance | 1,000 tokens |
+| Cognee recall | 2,000 tokens |
+| Local tool schemas | 4,000 tokens |
+| Current task and active tool results | 21,000 tokens |
+| Reply reserve | 4,000 tokens |
+
+Backdoor removes extra recall, optional tools, old tool output, attachments, then the oldest assistant updates and completed call/output pairs. It keeps the latest textual instruction and the newest progress from the active turn. If trimming removes every pair from a tool-only continuation, Backdoor inserts a small continuation instruction instead of sending Qwen an empty task. Codex receives HTTP 413 only when the latest textual instruction or a required tool cannot fit.
+
+Set `CODEX_LOCAL_TOOLS=` to remove all local tools. The default `local` keeps non-MCP Code Mode tools. Remote `mcp__*` namespaces stay out of the outage request because they cannot work without the network.
+
+Set `CODEX_FAILOVER_TO_LOCAL=false` to disable Qwen fallback without removing the custom provider. Cloud inference still crosses the Responses relay and returns its real errors. Backdoor logs correlation IDs, route choice, status class, timing, cloud request byte counts, local token counts, recall counts, and tool counts. It never logs prompts, recalled text, OAuth values, tool arguments, or model output.
+
+---
+
 ## Offline failover (hybrid mode)
 
 ### Keep Codex Desktop active while offline
@@ -410,6 +491,69 @@ What each route does now when upstream will not answer:
 | `/{path:path}` | `502` |
 
 Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+
+### Deploying: scripts/deploy-router.sh
+
+Deploying the router is a fast-forward and a restart, and on 2026-09-03 doing it as a list of shell lines went wrong in the dullest way available: the two git steps failed, the restart at the bottom ran anyway, and the router came back on unchanged code having dropped every in-flight request. Every live session reported an API error. Nothing deployed, and something still broke.
+
+`scripts/deploy-router.sh` exists so that cannot happen. It cannot half-run:
+
+- every step is gated on the previous one, including the restart command being present — checked in preflight, because discovering it late would leave the checkout advanced and the old code serving
+- a checkout already at the target exits `0` **without restarting**; a restart that changes no code is pure cost
+- it waits for the log to go quiet first, since a restart kills in-flight requests and there is no zero-downtime path here (socket activation on 8083/8084 is forbidden on this machine after the 2026-08-31 experiments were reverted)
+- it verifies the **new** code is running by finding the startup marker in the log written *after* the restart, not merely that something restarted
+- it rolls back and restarts again automatically when that verification fails
+
+The restart itself is not in the file. It arrives in `RESTART_CMD`, supplied by whoever runs the deploy, because operating this machine's live control plane is a human's job and the repo should not encode one host's launch agent.
+
+```bash
+RESTART_CMD='<restart the router>' scripts/deploy-router.sh <service-checkout-dir> [ref]
+```
+
+`DRY_RUN=1` prints the plan and changes nothing. `FORCE=1` skips the quiet wait and accepts that in-flight requests will fail. `QUIET_SECONDS` / `QUIET_TIMEOUT` tune the wait.
+
+The service checkout on this machine is a **detached worktree** sharing one repository with about twenty others, so the script fast-forwards the detached HEAD and never runs `git checkout <branch>` — that collides with whichever worktree holds the branch.
+
+### Opening needs a sustained outage, not a fast one
+
+Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
+
+The breaker now requires the upstream to have been failing for `failover_min_outage_seconds` (30 s, and `codex_failover_min_outage_seconds` for the Codex side) before it may open. The gate is checked *before* the connectivity probe, so a burst no longer fires one TLS handshake per failure.
+
+During those 30 seconds the real errors are relayed, and the client retries through them. That is the cheaper failure: the alternative was silently moving a live session onto a local model, eight times in one evening.
+
+Worth knowing when reading the log: **a short outage shows as a long open.** Half-open only retries once per `failover_probe_seconds`, so a five-second blip can appear as a 60–90 second open with nothing wrong.
+
+### One notification per outage, not per transition
+
+Sixteen desktop popups on the evening of 2026-09-02. Every transition is still logged in full; the notification is for the human and is rationed to one per breaker per `failover_notify_cooldown_seconds` (900 s). A close announces only if its open did, so a suppressed outage never leaves an orphan "back to cloud" for something you were never told about.
+
+This is load-bearing rather than politeness: the recovery ticker below makes transitions *more* frequent, so without rationing it would have made the noise worse.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `failover_min_outage_seconds` | `30.0` | How long the upstream must stay broken before failover may open |
+| `failover_notify_cooldown_seconds` | `900.0` | Minimum gap between failover notifications, per breaker |
+| `codex_failover_min_outage_seconds` | `30.0` | The same gate for the Codex breaker |
+| `codex_failover_notify_cooldown_seconds` | `900.0` | The same rationing for the Codex breaker |
+
+### Recovery does not wait for traffic
+
+An open breaker used to have exactly one way back: `allow_upstream` hands a real `/v1/messages` passthrough a half-open slot once per `failover_probe_seconds`, and only that request's success closes it. Recovery therefore depended on the traffic an outage takes away — a session being served by a local 4B generates far less of it, and a session you walked away from generates none.
+
+Measured on 2026-09-02, the breaker was open from 22:28:14 to 23:45:51 — 77 minutes 37 seconds, most of them on a network that had already recovered — and it closed at the exact second unrelated test traffic reached it. For that whole window every routed session was quietly answered by qwen instead of the cloud model, which reads as "the API errors never stopped" rather than as a stuck breaker.
+
+A background ticker now re-runs the connectivity probe every `failover_probe_seconds` while the breaker is open, and closes it the moment this host is online again — releasing the local tiers exactly as an upstream success would. It is the negation of the condition that opened the breaker: opening means "this host is offline", so recovery is "that stopped being true". If Anthropic itself is still down, the next real request fails, the probe finds the host online, and the error is relayed — the documented behaviour for an upstream outage on a working link. The ticker does nothing at all while the breaker is closed, and starts only when `failover_to_local` is on.
+
+The ticker watches **both** breakers this router owns — the Claude one and the Codex one — each released through its own tier path.
+
+**Each breaker is answered by the probe that matches its premise.** The Claude breaker opens because this host had no route out, so connectivity is the exact negation of what it concluded. The Codex breaker never consults connectivity at all — `codex_failover_require_offline` is `false`, so it opens on consecutive service failures and can be open while the network is perfect. Answering it with a connectivity probe would be answering a question it never asked. It gets `service_reachable()` instead: the same verified handshake, aimed at its own upstream host.
+
+Unlike `internet_reachable`, that one resolves DNS on purpose. Literal IPs exist so a broken resolver cannot fold itself into "has this machine got a route"; "is *that service* reachable from here" is a different question, and a name that will not resolve is a real way for a service to be unreachable.
+
+**Reachability disproves "I could not reach it" and never "it answered 429".** The front door of a rate-limited service is perfectly reachable, and this router cannot check the difference on its own: it relays the caller's credentials and holds none, so it cannot make an authenticated Codex request outside a real one. So `record_failure` takes `transport_error`, passed `False` at the two `f"HTTP {status}"` call sites, and the breaker remembers which kind opened it. A transport-error open can be reconsidered by the probe; a status open keeps the half-open path, which is the only route that actually settles a quota and the only one carrying a credential.
+
+The practical difference: an idle Codex outage that was a transport failure now ends on its own, instead of holding a qwen tier resident and llm-jury disabled until traffic happens to return. A usage limit still waits for a real request, which is correct.
 
 ### A stream that dies after the headers
 
@@ -731,9 +875,9 @@ This is the one documented exception to the MCP-off rule, and the token arithmet
 
 Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
 
-Large fetched pages also bypass the model window at the proxy layer, making the behavior independent of GUI plugins. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. It submits the original source, its URL, and a content hash to the dedicated `qwen_external_context` Cognee dataset. Later Qwen turns search that dataset and inject only a bounded set of recalled passages. The first turn does not wait for Cognee indexing: local ranking supplies its excerpts while Cognee processes the durable copy in the background.
+Large fetched pages also bypass the model window at the proxy layer, making the behavior independent of GUI plugins. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted with its URL and content hash to the dedicated `qwen_external_context` Cognee dataset. Browser-session tools never persist their output. Later Qwen turns search that dataset and inject only a bounded set of recalled passages. The first turn does not wait for Cognee indexing: local ranking supplies its excerpts while Cognee processes an approved durable copy in the background.
 
-This boundary is client-independent because every local Qwen request crosses Backdoor. Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Source text is marked as untrusted data, high-confidence credential-shaped documents are not written, individual documents are capped at 500,000 characters, and Cognee calls time out after 1.5 seconds. A Cognee or SSH-tunnel failure never drops the request. `QWEN_COGNEE=0` disables writes and recall for true-offline work, while the local 6,000-character reduction still protects Qwen's window.
+This boundary is client-independent because every local Qwen request crosses Backdoor. Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Unapproved, authenticated, intranet, and client sources remain ephemeral even when their content looks harmless. Approved source text is marked as untrusted data, high-confidence credential-shaped documents are not written, and stored source URLs exclude user information, query strings, and fragments. Individual documents are capped at 500,000 characters before ranking, and each request can enqueue at most four documents. Cognee calls time out after 1.5 seconds. A Cognee or SSH-tunnel failure never drops the request. `QWEN_COGNEE=0` disables writes and recall for true-offline work, while the local 6,000-character reduction still protects Qwen's window.
 
 The proxy resolves Cognee settings from its process environment, then `~/.cognee/.env`, then `~/projects/.env`. That makes the same behavior available to terminal launchers and Dock-launched clients that never source `.zshrc`. A missing key or unreachable service degrades to local reduction only.
 
@@ -1086,13 +1230,15 @@ ps -E -o command= -p $(pgrep -x claude | head -1) | tr ' ' '\n' | grep ANTHROPIC
 
 Claude Code reads that variable once at startup, so a session that began unrouted can never gain failover — restarting the router or the shell will not reach it, and only relaunching does.
 
-**Coordination with other local-GPU consumers.** Every breaker transition is published atomically to `~/.backdoor/failover-state.json`:
+**Coordination with other model consumers.** Every breaker transition is published atomically to `~/.backdoor/failover-state.json`:
 
 ```json
 { "failover_active": true, "reason": "ConnectError", "updated_at": 1754130000.0, "pid": 4242 }
 ```
 
-llm-jury reads that file and disables itself while failover is active, so the router and the council never contend for the same VRAM. Writing is best-effort — a router that cannot write the file still routes, and a missing or unreadable file reads as "not failing over".
+Claude and Codex also write a process-scoped lease under `~/.backdoor/compute-leases/` before `qwen3.8:27b-obliterated` starts inference. This covers explicit Qwen sessions as well as failover and closes the load-time gap before Ollama lists the model in `/api/ps`. LLM-Jury checks the breaker, active leases, and Ollama residency before it constructs any backend. If the 27B model owns compute, LLM-Jury disables the local council and all frontier providers, including OpenRouter. Expired leases and leases from dead router processes are ignored.
+
+Writing is best-effort. A router that cannot publish state still routes, and LLM-Jury treats missing or unreadable state as inactive. Ollama residency remains the final backstop after a lease expires.
 
 | Setting | Default | Effect |
 |---|---|---|
@@ -1105,6 +1251,7 @@ llm-jury reads that file and disables itself while failover is active, so the ro
 | `failover_probe_seconds` | `60` | How often an open breaker retries upstream (half-open) |
 | `BACKDOOR_FAILOVER_STATUSES` | *(empty)* | Comma-separated HTTP statuses to restore as triggers, e.g. `429,529` |
 | `BACKDOOR_FAILOVER_STATE` | `~/.backdoor/failover-state.json` | Where breaker state is published |
+| `BACKDOOR_COMPUTE_LEASE_DIR` | `~/.backdoor/compute-leases` | Where Claude and Codex publish exclusive 27B ownership leases |
 
 ---
 

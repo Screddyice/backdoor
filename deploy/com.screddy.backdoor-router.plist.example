@@ -34,6 +34,28 @@
         <string>660</string>
         <key>FORWARD_MAX_CONNECTIONS</key>
         <string>512</string>
+        <key>CODEX_FAILOVER_TO_LOCAL</key>
+        <string>true</string>
+        <key>CODEX_CHATGPT_UPSTREAM</key>
+        <string>https://chatgpt.com/backend-api/codex</string>
+        <key>CODEX_FAILOVER_THRESHOLD</key>
+        <string>3</string>
+        <key>CODEX_FAILOVER_STATUSES</key>
+        <string>429,500,502,503,504,529</string>
+        <key>CODEX_MAX_REQUEST_BYTES</key>
+        <string>67108864</string>
+        <key>CODEX_CONTEXT_WINDOW</key>
+        <string>32000</string>
+        <key>CODEX_LOCAL_RESPONSES_URL</key>
+        <string>http://127.0.0.1:11434/v1/responses</string>
+        <key>CODEX_LOCAL_MODEL</key>
+        <string>qwen3.8:27b-obliterated</string>
+        <key>CODEX_LOCAL_TOOLS</key>
+        <string>local</string>
+        <key>COGNEE_BASE_URL</key>
+        <string>http://127.0.0.1:8001</string>
+        <!-- Cognee auth stays in ~/.cognee/.env or its existing local key
+             cache. Do not duplicate the key into this plist. -->
     </dict>
 
     <!-- Each CONNECT tunnel consumes two descriptors. Intercepted Anthropic

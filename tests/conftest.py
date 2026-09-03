@@ -15,7 +15,7 @@ that ran the tests.
 
 import pytest
 
-from src.proxy import failover
+from src.proxy import compute_lease, failover
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +23,7 @@ def _isolate_failover_state(tmp_path, monkeypatch):
     monkeypatch.setattr(
         failover, "STATE_PATH", tmp_path / "failover-state.json"
     )
+    monkeypatch.setattr(compute_lease, "LEASE_DIR", tmp_path / "compute-leases")
 
 
 @pytest.fixture(autouse=True)

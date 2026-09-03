@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 import src.proxy.routes as routes
+from src.proxy import compute_lease
 from src.proxy.app import create_app
 from src.proxy.config import Settings, get_settings
 from src.proxy.failover import FailoverBreaker
@@ -210,14 +211,26 @@ def _route_request(turns: int) -> dict:
     }
 
 
-async def test_small_route_session_stays_on_the_heavy_tier(route_app):
+async def test_small_route_session_stays_on_the_heavy_tier(route_app, monkeypatch):
     """The common case must not regress: bare mode keeps the prompt small, so a
     normal `qwen` session keeps the strongest tier rather than escalating."""
     app, _recorder, seen = route_app
+    claims = []
+    monkeypatch.setattr(
+        compute_lease,
+        "claim_exclusive_model",
+        lambda model, **kwargs: claims.append((model, kwargs)),
+    )
     resp = await _post(app, _route_request(turns=1))
 
     assert resp.status_code == 200
     assert seen[-1] == "local-qwen38-obliterated", seen
+    assert claims == [
+        (
+            "qwen3.8:27b-obliterated",
+            {"source": "claude-explicit", "ttl_seconds": 600},
+        )
+    ]
 
 
 async def test_profile_mode_oversized_session_escalates(monkeypatch):
