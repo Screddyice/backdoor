@@ -548,7 +548,26 @@ def test_ladder_tiers_have_profile_files():
 def test_ladder_bounds_are_monotonic():
     bounds = [b for b, _ in FAILOVER_LADDER]
     assert bounds == sorted(bounds)
-    assert bounds[-1] == float("inf")
+
+
+def test_ladder_always_returns_a_tier_however_large_the_session():
+    """The guarantee the `inf` sentinel used to stand in for.
+
+    This assertion used to read `bounds[-1] == float("inf")`, which tested the
+    SHAPE of the data rather than any behaviour — and the shape is redundant,
+    because `pick_failover_profile` ends in `return FAILOVER_LADDER[-1][1]` and
+    answers even with no unbounded tier. So the old line locked in one
+    representation while leaving the actual guarantee untested: that an outage
+    never leaves a session with no tier at all.
+
+    Asserting the guarantee is strictly more useful. It passes on the current
+    ladder, and it fails loudly for anyone who changes the selector to return
+    None for an oversized session — which #86 does deliberately, paired with
+    context virtualization that shrinks the prompt before the selector runs.
+    That coupling is exactly what should surface as a failing test rather than
+    as a session with no local answer during an outage.
+    """
+    assert pick_failover_profile(10**9) is not None
 
 
 # ── The handshake-timeout hole ───────────────────────────────────────────────

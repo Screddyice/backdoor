@@ -100,15 +100,25 @@ class Settings(BaseSettings):
     # trips on that burst, so counting never distinguished a two-second blip
     # from a real outage. Elapsed time does.
     #
-    # The cost of getting it wrong is asymmetric and was being paid daily. On
-    # 2026-09-02 the breaker opened eight times, several for episodes that were
-    # over almost immediately (the open then lasts up to a further
-    # `failover_probe_seconds` purely because half-open only retries once per
-    # interval, which is why short outages read as long ones in the log). Each
-    # one silently moved live sessions onto a local model and fired a desktop
-    # notification. Thirty seconds of relayed API errors — which the client
-    # already retries through — is the cheaper failure.
-    failover_min_outage_seconds: float = 30.0
+    # The cost of getting it wrong was being paid daily. On 2026-09-02 the
+    # breaker opened eight times, several for episodes that were over almost
+    # immediately (the open then lasts up to a further `failover_probe_seconds`
+    # purely because half-open only retries once per interval, which is why
+    # short outages read as long ones in the log). Each one silently moved live
+    # sessions onto a local model and fired a desktop notification.
+    #
+    # TEN seconds, not the thirty this shipped with on 2026-09-03. During the
+    # gate the router hands the client a 502 — the SAME 502 the Codex path
+    # returns, from symmetric code — and that is not free just because Claude
+    # Code retries. Measured on the one real outage after the gate went live:
+    # first failure 17:50:08, breaker open 17:51:08. Sixty seconds of errors.
+    #
+    # The duration histogram across 79 outage bursts in the router logs is what
+    # sets the number. Median 3s. A 10s gate absorbs 64% of bursts; 30s absorbs
+    # 69%. Five points of extra protection for three times the user-visible
+    # error window is a bad trade, and 30% of bursts outlast any gate at all,
+    # where the wait is pure cost.
+    failover_min_outage_seconds: float = 10.0
     # At most one failover announcement per breaker per cooldown. The log keeps
     # every transition; the notification is for the human, and a flapping link
     # produced sixteen of them in one evening. A close only announces if its
@@ -173,9 +183,20 @@ class Settings(BaseSettings):
     codex_failover_threshold: int = Field(default=1, ge=1)
     codex_failover_window_seconds: float = Field(default=120.0, gt=0)
     codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
-    # Codex Desktop surfaces a 502 instead of retrying through a duration gate.
-    # Serve the first trigger-class failure locally, with no second hold-down.
-    codex_failover_min_outage_seconds: float = Field(default=0.0, ge=0)
+    # Held at the same 10s as Claude, deliberately, though this one is the harder
+    # call. Codex Desktop does NOT retry: it surfaces the 502, so during the gate
+    # a Codex user sees a hard error where a Claude user sees a retry banner.
+    # PR #91 set this to 0 for exactly that reason, and dropping the Claude gate
+    # to 10s removed the asymmetry's justification rather than its cost — the
+    # gap between the two paths is now 10s of visible errors versus 10s of
+    # retries, not 60s versus none.
+    #
+    # What the 10s buys, on both paths, is not loading a 17GB local tier for a
+    # blip: 48% of measured outage bursts are 2 seconds or shorter. Failing over
+    # on those spends the GPU and evicts the llm-jury council to ride out
+    # something already over. Revert to 0 if Codex 502s prove worse in practice
+    # than that churn; the number is one edit and the reasoning is here.
+    codex_failover_min_outage_seconds: float = Field(default=10.0, ge=0)
     codex_failover_notify_cooldown_seconds: float = Field(default=900.0, ge=0)
     codex_failover_statuses: str = "429,500,502,503,504,529"
     codex_failover_require_offline: bool = False

@@ -525,6 +525,10 @@ async def create_message(
     # Set only when the failover path successfully stripped the harness; it then
     # replaces the parsed request below so the stripped version is what is sent.
     bare_req: MessagesRequest | None = None
+    # `settings` is rebound to the PROFILE's settings further down, and a profile
+    # file does not carry the router's mode. Keep the router's own view so the
+    # profile-mode guard below cannot misread a hybrid request as a direct one.
+    router_settings = settings
     # Large fetched documents are compacted once, before bare mode gets a chance
     # to discard their full text. Kept separately for non-bare Qwen profiles.
     prepared_req: MessagesRequest | None = None
@@ -648,6 +652,43 @@ async def create_message(
         req = prepared_req
     else:
         req = await prepare_external_context(MessagesRequest.model_validate_json(body), settings)
+
+    # Profile mode is a direct path too (`bd switch ...; bd claude`). It bypasses
+    # MODEL_ROUTES entirely, so the hybrid branch above never ran and nothing has
+    # honored this profile's bare contract yet. The `qwen` wrapper launches Claude
+    # Code with --bare, but the server has to stay safe when a caller skips the
+    # wrapper — which is the whole gap this closes.
+    #
+    # Ported from PR #61, which predates `route_system`: the strip must carry the
+    # operator rules for exactly the reason the hybrid path does, since replacing
+    # the system prompt deletes the only copy the session had.
+    #
+    # Both extra conditions were paid for by a regression this port caused and its
+    # tests caught. `router_settings` because `settings` is the PROFILE's by now,
+    # and a profile carries no router mode, so a plain `settings.router_mode`
+    # read "profile" on hybrid requests and fired on every one of them.
+    # `bare_req is None` because failover already stripped with OFFLINE_SYSTEM,
+    # and re-stripping replaced "you have lost your network" with the route text
+    # that says nothing failed — telling an offline model it is online.
+    if (
+        router_settings.router_mode != "hybrid"
+        and settings.route_bare
+        and bare_req is None
+    ):
+        try:
+            req = make_bare(
+                req,
+                keep=parse_keep(settings.failover_keep_tools),
+                system=route_system(
+                    load_route_system_extra(settings.route_system_file)
+                ),
+                tool_result_chars=settings.failover_tool_result_chars,
+            )
+        except Exception:
+            # Same rule as the other two strip sites: stripping never becomes a
+            # new request failure. Unstripped may overflow the window, but that
+            # surfaces as an honest provider error rather than one we invented.
+            logger.exception("profile bare-mode failed; sending unstripped")
 
     fast = _check_optimizations(req, settings)
     if fast:
