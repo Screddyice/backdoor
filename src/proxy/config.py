@@ -74,10 +74,9 @@ class Settings(BaseSettings):
     # (see FAILOVER_LADDER), measured AFTER bare-mode stripping — the size that
     # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
-    # 2026-08-25: the abliterated 27B on MLX, by explicit decision. It is not
-    # lazily loaded like the Ollama tiers, so routes.py starts it on demand and
-    # drops to local-failover-heavy (9B) when it will not come up. See
-    # src/proxy/mlx_admin.py.
+    # The default 27B is an Ollama tier and loads on demand. The optional MLX
+    # action checkpoint has its own runtime supervisor and falls back to the
+    # 4B fast profile when its launchd service cannot start.
     failover_profile: str = "local-qwen38-obliterated"  # default tier
     # Probe on the first transport failure. The connectivity probe remains the
     # safety gate: local failover opens only when the host is offline. Waiting
@@ -122,6 +121,17 @@ class Settings(BaseSettings):
     memory_inject: bool = True
     memory_top_k: int = 6
     memory_char_budget: int = 1200
+
+    # Large pages and attachments fetched by any client are reduced before a
+    # local Qwen sees them, then stored in and recalled from Cognee. Local
+    # ranking always runs; QWEN_COGNEE=0 disables only network memory for true
+    # offline use. Every Cognee call is bounded and fail-open.
+    qwen_cognee: bool = True
+    external_context_threshold_chars: int = 12000
+    external_context_char_budget: int = 6000
+    external_context_max_document_chars: int = 500000
+    external_context_top_k: int = 6
+    external_context_timeout_seconds: float = 1.5
 
     # Bare mode for an EXPLICIT `/model <name>` route, not just failover.
     # MODEL_ROUTES hits skip the failover branch entirely, so before this flag a
@@ -251,13 +261,9 @@ def resolve_model_route(model: str | None) -> str | None:
 MODEL_ROUTES: dict[str, str] = {
     "qwen": "local-qwen38-obliterated",  # Qwen3.8-27B OBLITERATED GGUF on Ollama
     "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
-    "qwen-9b": "local-qwen-9b",   # qwen3.5:9b-64k — stronger brain for subagents
     "qwen38-obliterated": "local-qwen38-obliterated",
     # Keep the action-tuned MLX checkpoint reachable as an explicit rollback.
     "qwen38-action": "local-qwen38-action",
-    # The stock 9B, still reachable by name. This is what to type when you want
-    # a model with its refusal behaviour intact.
-    "qwen-stock": "local-failover-heavy",
 }
 
 

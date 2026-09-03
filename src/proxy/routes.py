@@ -15,7 +15,8 @@ from .config import (
     MODEL_ROUTES, Settings, get_settings, load_profile_settings, load_route_system_extra,
     pick_failover_profile, resolve_model_route,
 )
-from .bare import make_bare, parse_keep, route_system
+from .bare import OFFLINE_SYSTEM, make_bare, parse_keep, route_system
+from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
 from . import mlx_admin, ollama_admin
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
@@ -450,6 +451,9 @@ async def create_message(
     # Set only when the failover path successfully stripped the harness; it then
     # replaces the parsed request below so the stripped version is what is sent.
     bare_req: MessagesRequest | None = None
+    # Large fetched documents are compacted once, before bare mode gets a chance
+    # to discard their full text. Kept separately for non-bare Qwen profiles.
+    prepared_req: MessagesRequest | None = None
     # True only for requests the BREAKER diverted, never for a deliberate
     # `/model qwen`. Decides whether the tier this request loads is one the
     # router may clamp and later evict on its own — see ollama_admin.
@@ -480,10 +484,18 @@ async def create_message(
             try:
                 fr = MessagesRequest.model_validate_json(body)
                 raw_est = count_messages(fr.messages, fr.system, fr.tools)
+                context_settings = load_profile_settings(profile)
+                # The router-level QWEN_COGNEE=0 escape hatch must survive the
+                # profile load, including true offline failover.
+                if not settings.qwen_cognee:
+                    context_settings.qwen_cognee = False
+                prepared_req = await prepare_external_context(fr, context_settings)
+                fr = prepared_req
                 if settings.failover_bare:
                     stripped = make_bare(
                         fr,
                         keep=parse_keep(settings.failover_keep_tools),
+                        system=OFFLINE_SYSTEM,
                         tool_result_chars=settings.failover_tool_result_chars,
                     )
                     bare_req = stripped  # only on success: make_bare is pure
@@ -505,11 +517,14 @@ async def create_message(
         # failover branch above — the only place that stripped. Tiers whose
         # window assumes bare mode declare ROUTE_BARE; without this a deliberate
         # `/model qwen` sends a full harness session at a 32K window.
-        # `bare_req is None` guards the failover path, which already stripped.
-        if bare_req is None and settings.route_bare:
+        # `not failed_over` keeps this branch exclusive to a deliberate route;
+        # failover_bare remains an effective operator escape hatch.
+        if not failed_over and bare_req is None and settings.route_bare:
             try:
                 fr = MessagesRequest.model_validate_json(body)
                 raw_est = count_messages(fr.messages, fr.system, fr.tools)
+                prepared_req = await prepare_external_context(fr, settings)
+                fr = prepared_req
                 stripped = make_bare(
                     fr,
                     keep=parse_keep(settings.failover_keep_tools),
@@ -553,7 +568,12 @@ async def create_message(
         # request, and the client must follow the profile actually chosen.
         client = _get_profile_client(profile, settings)
 
-    req = bare_req if bare_req is not None else MessagesRequest.model_validate_json(body)
+    if bare_req is not None:
+        req = bare_req
+    elif prepared_req is not None:
+        req = prepared_req
+    else:
+        req = await prepare_external_context(MessagesRequest.model_validate_json(body), settings)
 
     fast = _check_optimizations(req, settings)
     if fast:

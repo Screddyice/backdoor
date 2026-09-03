@@ -9,7 +9,7 @@ The load-bearing test in this file is test_fallback_profile_is_a_lazy_ollama_tie
 Unlike every other local tier, this one does not load on demand: it is a launchd
 job that is either up or absent. Failover fires when the host is offline and
 nobody is watching, so a tier that cannot self-start would turn the fallback into
-a dead session. mlx_admin starts it and drops to the 9B when it cannot.
+a dead session. mlx_admin starts it and drops to the 4B fast tier when it cannot.
 """
 
 from pathlib import Path
@@ -18,7 +18,7 @@ from src.proxy import mlx_admin
 from src.proxy.config import MODEL_ROUTES
 
 ACTION_PROFILE = "local-qwen38-action"
-FALLBACK_PROFILE = "local-failover-heavy"
+FALLBACK_PROFILE = "local-fast"
 PROFILES = Path(__file__).resolve().parents[1] / "profiles"
 
 
@@ -26,9 +26,9 @@ def test_reachable_by_its_own_name_too() -> None:
     assert MODEL_ROUTES["qwen38-action"] == ACTION_PROFILE
 
 
-def test_stock_refusal_tier_is_still_reachable() -> None:
-    """`/model qwen-stock` is the documented way back to an unablated model."""
-    assert MODEL_ROUTES["qwen-stock"] == FALLBACK_PROFILE
+def test_removed_9b_routes_are_not_reachable() -> None:
+    assert "qwen-9b" not in MODEL_ROUTES
+    assert "qwen-stock" not in MODEL_ROUTES
 
 
 def test_fallback_profile_is_a_lazy_ollama_tier() -> None:

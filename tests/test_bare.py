@@ -5,6 +5,7 @@ import pytest
 from src.proxy.bare import (
     DEFAULT_KEEP_TOOLS,
     DEFAULT_SYSTEM,
+    OFFLINE_SYSTEM,
     make_bare,
     parse_keep,
 )
@@ -90,6 +91,20 @@ def test_harness_system_prompt_is_replaced():
     assert len(out.system) < len(huge) / 100
 
 
+def test_default_system_exposes_optional_internet_tools():
+    out = make_bare(req(system="huge harness"))
+    assert "WebSearch" in out.system
+    assert "WebFetch" in out.system
+    assert "curl" in out.system
+    assert "lost its network connection" not in out.system
+
+
+def test_offline_system_does_not_invite_network_calls():
+    out = make_bare(req(system="huge harness"), system=OFFLINE_SYSTEM)
+    assert "lost its network connection" in out.system
+    assert "WebSearch" not in out.system
+
+
 def test_system_can_be_dropped_entirely():
     assert make_bare(req(system="x"), system=None).system is None
 
@@ -162,6 +177,25 @@ def test_dropped_tool_result_is_flattened_and_truncated():
     assert isinstance(body, str)
     assert "omitted offline" in body
     assert len(body) < 400
+
+
+def test_external_context_capsule_gets_its_own_bounded_budget():
+    """The general 2K tool-result cap must not erase the ranked link capsule.
+
+    The capsule has already discarded the full page and is independently
+    bounded. Bare mode may retain up to 6K characters from this one marked
+    result without reopening the unbounded-tool-result bug.
+    """
+    capsule = "<qwen-external-context source=example>\n" + ("relevant passage " * 300)
+    out = make_bare(
+        req(messages=[Message(role="user", content=[{
+            "type": "tool_result", "tool_use_id": "fetch", "content": capsule,
+        }])]),
+        tool_result_chars=100,
+    )
+    body = str(out.messages[0].content)
+    assert len(body) > 100
+    assert len(body) < 6_500
 
 
 def test_kept_tool_result_keeps_its_structure_but_is_still_truncated():

@@ -62,7 +62,8 @@ def offline_app(monkeypatch):
 
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
-        router_mode="hybrid", failover_to_local=True, failover_threshold=1
+        router_mode="hybrid", failover_to_local=True, failover_threshold=1,
+        qwen_cognee=False,
     )
     try:
         yield app, recorder
@@ -122,6 +123,8 @@ async def test_failed_over_request_arrives_stripped(offline_app):
     names = [t.get("function", {}).get("name", "") for t in (recorder.payload.get("tools") or [])]
     assert "Bash" in names and "Read" in names, names
     assert not any(n.startswith("mcp__") for n in names), names
+    assert "lost its network connection" in sent
+    assert "When current information would improve the answer" not in sent
 
 
 async def test_the_users_actual_question_survives(offline_app):
@@ -138,7 +141,7 @@ async def test_bare_mode_can_be_disabled(offline_app, monkeypatch):
     app, recorder = offline_app
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="hybrid", failover_to_local=True, failover_threshold=1,
-        failover_bare=False,
+        failover_bare=False, qwen_cognee=False,
     )
     await _post(app, _harness_request())
     assert "official CLI" in json.dumps(recorder.payload)
@@ -238,7 +241,7 @@ async def test_profile_mode_oversized_session_escalates(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:9b-64k",
+        provider_model="qwen3.5:4b-64k",
         route_max_input_tokens=28_000,
     )
     try:
@@ -264,7 +267,7 @@ async def test_profile_mode_normal_session_stays_put(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
-        provider_model="qwen3.5:9b-64k",
+        provider_model="qwen3.5:4b-64k",
         route_max_input_tokens=28_000,
     )
     try:
@@ -300,7 +303,9 @@ async def test_profile_mode_runs_the_runtime_interlock_before_provider_call(monk
         provider_base_url="http://127.0.0.1:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
         runtime_profile="local-qwen38-obliterated",
-        route_max_input_tokens=27_000,
+        # This test isolates runtime supervision. Tier escalation has separate
+        # coverage and would replace the runtime profile before this assertion.
+        route_max_input_tokens=0,
     )
     try:
         resp = await _post(app, _route_request(turns=1))
@@ -389,14 +394,14 @@ def test_memory_injected_for_local_provider(monkeypatch):
 
     monkeypatch.setattr(translate, "_hoist_system_messages", lambda m: m)
     import src.proxy.memory as memory
-    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["the 27B tier is qwen3.5:9b-64k"])
+    monkeypatch.setattr(memory, "recall", lambda *a, **k: ["the fast tier is qwen3.5:4b-64k"])
 
     out = translate._inject_memory(
         [{"role": "system", "content": "You are offline."}, {"role": "user", "content": "which tier?"}],
         _mem_settings(),
     )
     assert memory.BLOCK_OPEN in out[0]["content"]
-    assert "qwen3.5:9b-64k" in out[0]["content"]
+    assert "qwen3.5:4b-64k" in out[0]["content"]
     assert "You are offline." in out[0]["content"], "the real system prompt must survive"
 
 
