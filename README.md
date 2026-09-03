@@ -497,6 +497,16 @@ Recording a failure never opens the breaker on its own. `internet_reachable()` s
 
 ### Deploying: scripts/deploy-router.sh
 
+`DRY_RUN=1` prints the plan and skips the quiet-window wait, because a dry run restarts nothing and
+therefore has no in-flight requests to protect. That wait is also the one step a dry run could never
+finish: a live Claude session writes to the router log every few seconds, so the window never opens,
+and asking to see the plan would end in `ABORT: still busy after 180s` with the plan never printed.
+
+A real run still waits. When it cannot get a quiet window — another session is mid-turn, and on this
+machine one usually is — `FORCE=1` proceeds and drops whatever is in flight. There is no
+zero-downtime path here, so that is the honest trade rather than a workaround.
+
+
 Deploying the router is a fast-forward and a restart, and on 2026-09-03 doing it as a list of shell lines went wrong in the dullest way available: the two git steps failed, the restart at the bottom ran anyway, and the router came back on unchanged code having dropped every in-flight request. Every live session reported an API error. Nothing deployed, and something still broke.
 
 `scripts/deploy-router.sh` exists so that cannot happen. It cannot half-run:
