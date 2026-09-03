@@ -468,9 +468,20 @@ Recording a failure never opens the breaker on its own. `internet_reachable()` s
 
 Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
 
-The breaker now requires the upstream to have been failing for `failover_min_outage_seconds` (30 s, and `codex_failover_min_outage_seconds` for the Codex side) before it may open. The gate is checked *before* the connectivity probe, so a burst no longer fires one TLS handshake per failure.
+The Claude breaker requires the upstream to have been failing for
+`failover_min_outage_seconds` (30 s) before it may open. The gate runs before
+the connectivity probe, so a burst no longer fires one TLS handshake per
+failure.
 
-During those 30 seconds the real errors are relayed, and the client retries through them. That is the cheaper failure: the alternative was silently moving a live session onto a local model, eight times in one evening.
+Codex uses a different client contract. Codex Desktop surfaces the first 502
+instead of retrying through a threshold or a 30-second hold-down. Its breaker
+uses a one-failure threshold and sets `codex_failover_min_outage_seconds` to
+zero, so the triggering request goes to Qwen. Authentication and request errors
+still bypass failover.
+
+During Claude's 30-second gate the real errors are relayed, and Claude Code
+retries through them. That avoids moving a live Claude session onto a local
+model for a short link stall.
 
 Worth knowing when reading the log: **a short outage shows as a long open.** Half-open only retries once per `failover_probe_seconds`, so a five-second blip can appear as a 60–90 second open with nothing wrong.
 
@@ -484,7 +495,7 @@ This is load-bearing rather than politeness: the recovery ticker below makes tra
 | --- | --- | --- |
 | `failover_min_outage_seconds` | `30.0` | How long the upstream must stay broken before failover may open |
 | `failover_notify_cooldown_seconds` | `900.0` | Minimum gap between failover notifications, per breaker |
-| `codex_failover_min_outage_seconds` | `30.0` | The same gate for the Codex breaker |
+| `codex_failover_min_outage_seconds` | `0.0` | Opens Codex failover on the threshold request instead of surfacing a 30-second run of 502s |
 | `codex_failover_notify_cooldown_seconds` | `900.0` | The same rationing for the Codex breaker |
 
 ### Recovery does not wait for traffic

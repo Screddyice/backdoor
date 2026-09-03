@@ -291,7 +291,7 @@ def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch
     settings = Settings()
     assert settings.failover_min_outage_seconds == 30.0
     assert settings.failover_notify_cooldown_seconds == 900.0
-    assert settings.codex_failover_min_outage_seconds == 30.0
+    assert settings.codex_failover_min_outage_seconds == 0.0
     assert settings.codex_failover_notify_cooldown_seconds == 900.0
 
     monkeypatch.setattr(routes, "_breaker", None)
@@ -305,12 +305,30 @@ def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch
             (codex, settings.codex_failover_min_outage_seconds,
              settings.codex_failover_notify_cooldown_seconds),
         ):
-            assert breaker.min_outage == min_outage, (
-                "a breaker with no duration gate trips on one instant of failures"
-            )
+            assert breaker.min_outage == min_outage
             assert breaker.notify_cooldown == cooldown
     finally:
         routes._breaker = None
+        codex_routes._codex_breaker = None
+
+
+def test_codex_fallback_opens_on_the_first_desktop_failure(monkeypatch):
+    """Codex Desktop surfaces a 502 instead of waiting through a hold-down.
+
+    Cloud failures arrived within one second during the 2026-09-03 outage. The
+    default Codex breaker must hand the first triggering request to Qwen; a
+    threshold or duration gate exposes 502 before the client can recover.
+    """
+    import src.proxy.codex_routes as codex_routes
+
+    settings = Settings()
+    monkeypatch.setattr(codex_routes, "_codex_breaker", None)
+    try:
+        breaker = codex_routes.get_codex_breaker(settings)
+        assert settings.codex_failover_threshold == 1
+        assert breaker.record_failure("ConnectError") is True
+        assert breaker.open
+    finally:
         codex_routes._codex_breaker = None
 
 
