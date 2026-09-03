@@ -92,15 +92,16 @@ figures for each path:
 
 - Local open-source models: measured Claude and Codex turns served by Qwen, Gemma, Llama, or
   Phi on this Mac, compared with the configured Claude counterfactual.
-- OpenRouter: measured account spend, netted against a configurable Codex/Opus-class cost ratio.
+- OpenRouter: transcript usage shown separately for Claude and Codex. The report excludes
+  account-wide spend because the key endpoint cannot attribute charges to either client.
 - Codex: measured token usage from `~/.codex/sessions/**/*.jsonl`, valued at configurable metered
   API rates and netted against the weekly Codex plan cost.
 
 The script also reads Claude Code's transcript logs (`~/.claude/projects/**/*.jsonl`) to show
 first-party Claude usage and local-model turns. Each source stays in its own row, so the total
-does not hide which savings are measured and which depend on a counterfactual. OpenRouter
-provides daily, weekly, and monthly spend counters; other `--days` windows exclude its row from
-the total rather than mixing periods.
+does not hide which savings are measured and which depend on a counterfactual. Local-model usage
+stays separate from OpenRouter routing, and the OpenRouter section splits usage between Claude
+and Codex.
 
 Prompt caching is tracked as a separate efficiency stat, never counted as dollars saved — on a
 flat-rate subscription plan there's no per-token bill for it to discount off of.
@@ -112,7 +113,7 @@ python3 scripts/claude-savings-report.py --dry-run   # preview, writes and email
 
 Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
 `SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it. The local-model counterfactual,
-OpenRouter ratio, Codex token rates, subscription costs, and Claude plan assumptions are tunable
+Codex token rates, subscription costs, and Claude plan assumptions are tunable
 through the `SAVINGS_*` environment variables defined near the top of the script.
 
 ---

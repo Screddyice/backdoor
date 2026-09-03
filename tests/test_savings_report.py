@@ -131,23 +131,30 @@ def test_codex_plan_savings_uses_cached_rate_and_subtracts_the_plan():
     assert saved == pytest.approx(1.2)
 
 
-def test_openrouter_savings_nets_measured_spend_from_counterfactual_value():
-    value, saved = REPORT.openrouter_savings(3.0, cost_ratio=10.0)
+def test_openrouter_usage_is_identified_without_mixing_in_local_models():
+    usage = {
+        "anthropic/claude-sonnet-4": {"turns": 2},
+        "openai/gpt-5": {"turns": 3},
+        "Qwen": {"turns": 5},
+        "claude-opus-5": {"turns": 7},
+    }
 
-    assert value == 30.0
-    assert saved == 27.0
+    routed = REPORT.openrouter_usage(usage)
+
+    assert set(routed) == {"anthropic/claude-sonnet-4", "openai/gpt-5"}
 
 
-def test_email_lists_open_source_openrouter_and_codex_savings():
+def test_email_keeps_local_savings_separate_from_claude_and_codex_openrouter_usage():
     body = REPORT.build_savings_email_md(
         {
-            "usd_saved": 60.0,
+            "usd_saved": 40.0,
             "cache_rate": 50.0,
             "local_saved": 10.0,
             "local_turns": 2,
-            "openrouter_saved": 20.0,
-            "openrouter_spend": 1.0,
-            "openrouter_available": True,
+            "openrouter_claude_turns": 3,
+            "openrouter_claude_tokens": 1_200_000,
+            "openrouter_codex_turns": 5,
+            "openrouter_codex_tokens": 2_500_000,
             "codex_saved": 30.0,
             "codex_turns": 4,
         },
@@ -156,21 +163,24 @@ def test_email_lists_open_source_openrouter_and_codex_savings():
     )
 
     assert "Open-source models (local) | $10.00" in body
-    assert "OpenRouter | $20.00" in body
     assert "Codex plan | $30.00" in body
-    assert "**Total: $60.00 saved.**" in body
+    assert "OpenRouter via Claude | 3 | 1.2M" in body
+    assert "OpenRouter via Codex | 5 | 2.5M" in body
+    assert "**Total: $40.00 saved.**" in body
+    assert "measured spend" not in body
 
 
-def test_email_marks_openrouter_unavailable_instead_of_claiming_zero_spend():
+def test_email_reports_zero_openrouter_usage_for_each_client():
     body = REPORT.build_savings_email_md(
         {
             "usd_saved": 0.0,
             "cache_rate": 0.0,
             "local_saved": 0.0,
             "local_turns": 0,
-            "openrouter_saved": 0.0,
-            "openrouter_spend": 0.0,
-            "openrouter_available": False,
+            "openrouter_claude_turns": 0,
+            "openrouter_claude_tokens": 0,
+            "openrouter_codex_turns": 0,
+            "openrouter_codex_tokens": 0,
             "codex_saved": 0.0,
             "codex_turns": 0,
         },
@@ -178,4 +188,5 @@ def test_email_marks_openrouter_unavailable_instead_of_claiming_zero_spend():
         "2026-09-03",
     )
 
-    assert "OpenRouter | $0.00 | Usage unavailable; excluded from the total" in body
+    assert "OpenRouter via Claude | 0 | 0" in body
+    assert "OpenRouter via Codex | 0 | 0" in body
