@@ -9,6 +9,7 @@ from .context_segments import (
     ContextSegment,
     NormalizedContext,
     canonical_json,
+    content_hash,
     segment_identifier,
     selected_with_pairs,
 )
@@ -81,15 +82,16 @@ def _user_text(content: str | list[dict[str, Any]]) -> tuple[int, str] | None:
 class ClaudeContextAdapter:
     def normalize(self, req: MessagesRequest) -> NormalizedContext:
         latest_user_index: int | None = None
+        current_content_index: int | None = None
         for index in range(len(req.messages) - 1, -1, -1):
-            if req.messages[index].role == "user":
+            if req.messages[index].role != "user":
+                continue
+            text = _user_text(req.messages[index].content)
+            if text is not None:
                 latest_user_index = index
+                current_content_index = text[0]
                 break
         if latest_user_index is None:
-            raise ValueError("Claude request has no textual current user instruction")
-
-        current_content_index = _user_text(req.messages[latest_user_index].content)
-        if current_content_index is None:
             raise ValueError("Claude request has no textual current user instruction")
 
         segments: list[ContextSegment] = []
@@ -105,7 +107,10 @@ class ClaudeContextAdapter:
                 kind = _kind(content)
                 exact = {"role": message.role, "content": content}
                 segment = ContextSegment(
-                    segment_id=segment_identifier("claude", message.role, kind, content),
+                    segment_id=segment_identifier(
+                        "claude", message.role, kind, content, ordinal
+                    ),
+                    content_hash=content_hash("claude", message.role, kind, content),
                     ordinal=ordinal,
                     role=message.role,
                     kind=kind,
@@ -116,7 +121,7 @@ class ClaudeContextAdapter:
                 segments.append(segment)
                 if (
                     message_index == latest_user_index
-                    and content_index == current_content_index[0]
+                    and content_index == current_content_index
                 ):
                     current_segment_id = segment.segment_id
                 ordinal += 1
@@ -153,8 +158,15 @@ class ClaudeContextAdapter:
                     ordinal += 1
                     continue
                 kept = []
+                keep_current_message = (
+                    context.current_segment_id in selected
+                    and any(
+                        segment.segment_id == context.current_segment_id
+                        for segment in context.segments[ordinal : ordinal + len(source)]
+                    )
+                )
                 for content in source:
-                    if context.segments[ordinal].segment_id in selected:
+                    if keep_current_message or context.segments[ordinal].segment_id in selected:
                         kept.append(content)
                     ordinal += 1
                 if kept:

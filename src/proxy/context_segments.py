@@ -17,10 +17,10 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def segment_identifier(
+def content_hash(
     client_kind: ClientKind, role: str, kind: str, native_content: Any
 ) -> str:
-    """Return the content-addressed identity shared by equal native segments."""
+    """Return the stable content address used to deduplicate exact segments."""
     material = canonical_json(
         {
             "client_kind": client_kind,
@@ -32,9 +32,24 @@ def segment_identifier(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def segment_identifier(
+    client_kind: ClientKind,
+    role: str,
+    kind: str,
+    native_content: Any,
+    ordinal: int = 0,
+) -> str:
+    """Return a request-local occurrence id for exact working-set selection."""
+    material = canonical_json(
+        {"content_hash": content_hash(client_kind, role, kind, native_content), "ordinal": ordinal}
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class ContextSegment:
     segment_id: str
+    content_hash: str
     ordinal: int
     role: str
     kind: str

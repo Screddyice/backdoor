@@ -10,6 +10,7 @@ from .context_segments import (
     ContextSegment,
     NormalizedContext,
     canonical_json,
+    content_hash,
     segment_identifier,
     selected_with_pairs,
 )
@@ -95,7 +96,8 @@ class CodexContextAdapter:
             kind = _kind(item)
             segments.append(
                 ContextSegment(
-                    segment_id=segment_identifier("codex", role, kind, item),
+                    segment_id=segment_identifier("codex", role, kind, item, ordinal),
+                    content_hash=content_hash("codex", role, kind, item),
                     ordinal=ordinal,
                     role=role,
                     kind=kind,
