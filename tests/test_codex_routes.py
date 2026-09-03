@@ -562,7 +562,7 @@ async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
     assert "bounded result" in rendered
     assert "older task" not in rendered
     assert "prompt_cache_key" not in rendered
-    assert "reasoning" not in rendered
+    assert local_payload["reasoning"] == {"effort": "none"}
     assert "authorization" not in local_calls[0].headers
     assert "chatgpt-account-id" not in local_calls[0].headers
     assert breaker.open is True
