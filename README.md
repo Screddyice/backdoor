@@ -588,7 +588,7 @@ A failed-over request does not reach the local model as Claude Code sent it. Bac
 
 Measure an ordinary session and the reason becomes obvious. With the usual MCP servers attached, the system prompt and tool definitions alone came to roughly 286K tokens on this machine, before a word of conversation. Two model generations of this failover ladder were shrunk to cope with that number: the tier went 9B down to 4B in July 2025 after a 9B spent about five minutes per turn prefilling a 186K-token session and then returned a 500. The context was treated as fixed and the model kept getting smaller.
 
-Bare mode attacks the other term. Before the request goes to Ollama, Backdoor drops the system prompt (replacing it with two sentences of orientation), drops tool definitions, truncates tool results in the transcript to a character budget, and replaces images with a placeholder. Your conversation stays. On a representative request that arrived carrying a full harness and an 80KB file read:
+Bare mode attacks the other term. Before the request goes to Ollama, Backdoor drops the system prompt (replacing it with a few sentences of orientation — which sentences depends on the path, see [Two paths, two replacement prompts](#two-paths-two-replacement-prompts)), drops tool definitions, truncates tool results in the transcript to a character budget, and replaces images with a placeholder. Your conversation stays. On a representative request that arrived carrying a full harness and an 80KB file read:
 
 ```
 50,439 tokens  ->  1,196 tokens        (42x)
@@ -644,6 +644,29 @@ artifacts. The terminal `fusion-qwen` agent now uses `qwen-fast` for its local
 orchestration step; the verifier council keeps its separate models.
 
 Stripping reuses the `failover_*` keep-list and truncation budget, so both paths build the same request shape. A route that stripped differently from failover would be a second behaviour to keep in sync for no gain.
+
+#### Two paths, two replacement prompts
+
+Same strip, different standing text — because the situations are not the same. `make_bare` replaces `system` **wholesale**, so whatever it substitutes is the only orientation the model gets.
+
+| Path | Constant | What it says |
+|---|---|---|
+| Failover (breaker open) | `DEFAULT_SYSTEM` | the session has lost its network — which is true, that is why the breaker opened |
+| `/model <name>` + `ROUTE_BARE` | `ROUTE_SYSTEM` | nothing failed, the switch was deliberate; states the 32K window and the reduced tool set |
+
+The route path used to borrow the failover text, which told a healthy session it was mid-outage. A model that believes it is offline hedges and declines work it can do, and the claim is simply false on a path nobody failed over on.
+
+Wholesale replacement had a second cost that was easier to miss. The `qwen` wrapper injects the repo's PR rules with `--append-system-prompt`, precisely because `--bare` skips `CLAUDE.md`. Those rules live in `system` — so `ROUTE_BARE` deleted them, and a routed session never saw the every-branch-gets-a-PR rule at all. The route path now appends them back:
+
+```
+ROUTE_SYSTEM_FILE=prompts/qwen-pr-rules.md   # default; empty disables
+```
+
+Relative paths resolve against the repo cwd, the same way `profiles/` does. The file is read through an `lru_cache`, so it costs one stat per process, and a missing or unreadable file is deliberately **not** fatal — the route still works carrying `ROUTE_SYSTEM` alone. Failing a request over a documentation file would be the worse outcome.
+
+Budget: `ROUTE_SYSTEM` plus the default rules file composes to ~2.8KB, about 700 tokens, roughly 2% of the 32K window. That is the price of a routed session that knows the rules it is supposed to follow.
+
+The failover path is untouched and keeps `DEFAULT_SYSTEM`; `test_failover_keeps_the_outage_prompt` pins that so this change cannot leak across.
 
 #### Stripping bounds the prompt, not the transcript
 

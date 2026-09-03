@@ -146,6 +146,14 @@ class Settings(BaseSettings):
     # to keep in sync for no benefit.
     route_bare: bool = False
 
+    # Operator instructions appended to `bare.ROUTE_SYSTEM` on the `/model <name>`
+    # route path. Stripping replaces the WHOLE system prompt, which silently
+    # deleted rules the session is still expected to follow: the qwen wrapper
+    # injects the PR-per-branch rule with `--append-system-prompt`, and ROUTE_BARE
+    # then threw it away, so a routed session never saw it. Relative paths resolve
+    # against the repo cwd, the same way `profiles/` does. Empty disables.
+    route_system_file: str = "prompts/qwen-pr-rules.md"
+
     # Largest post-strip session this tier will accept on an explicit
     # `/model <name>` route. 0 disables the check.
     #
@@ -288,6 +296,24 @@ def pick_failover_profile(est_input_tokens: int) -> str:
         if est_input_tokens <= bound:
             return profile
     return FAILOVER_LADDER[-1][1]
+
+
+@lru_cache(maxsize=4)
+def load_route_system_extra(path: str) -> str | None:
+    """Operator instructions appended to ROUTE_SYSTEM, or None.
+
+    A missing or unreadable file is deliberately not fatal — the route still
+    works, it just carries ROUTE_SYSTEM alone. Failing the request over a
+    documentation file would be a worse outcome than losing the rules. Cached
+    because this is consulted per request.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
 
 
 @lru_cache(maxsize=8)

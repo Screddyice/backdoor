@@ -191,3 +191,66 @@ def test_qwen_route_targets_a_profile_that_declares_route_bare():
         f"MODEL_ROUTES['qwen'] -> {profile}, which does not set ROUTE_BARE. "
         "A full harness session will overflow its 32K window."
     )
+
+
+# --- the replacement system prompt --------------------------------------
+#
+# Stripping is only half the job: something has to stand in for the prompt that
+# was removed. The route path shipped using the FAILOVER text, which told a
+# perfectly healthy session it had "lost its network connection" — and took the
+# operator rules with it, because make_bare replaces `system` wholesale and the
+# qwen wrapper's `--append-system-prompt` copy lived there.
+
+
+async def test_route_is_not_told_it_is_in_an_outage(routed_app):
+    """A `/model qwen` switch is a choice, not a failure. Saying otherwise makes
+    the model hedge and decline work it can actually do."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True, route_system_file="")
+
+    await _post(app, _harness_request())
+
+    sent = json.dumps(recorder.payload)
+    assert "lost its network connection" not in sent, "route path got the FAILOVER prompt"
+    assert "chosen on purpose" in sent, sent[:400]
+
+
+async def test_operator_rules_survive_the_strip(routed_app, tmp_path):
+    """The rules the wrapper injects must reach the model on this path too."""
+    app, recorder, monkeypatch = routed_app
+    rules = tmp_path / "rules.md"
+    rules.write_text("EVERY BRANCH GETS A PR.\n", encoding="utf-8")
+    _pin(monkeypatch, route_bare=True, route_system_file=str(rules))
+
+    await _post(app, _harness_request())
+
+    assert "EVERY BRANCH GETS A PR." in json.dumps(recorder.payload)
+
+
+async def test_missing_rules_file_still_routes(routed_app, tmp_path):
+    """A documentation file must never be able to fail a request."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True, route_system_file=str(tmp_path / "nope.md"))
+
+    resp = await _post(app, _harness_request())
+
+    assert resp.status_code == 200
+    assert "chosen on purpose" in json.dumps(recorder.payload)
+
+
+def test_failover_keeps_the_outage_prompt():
+    """The route change must not leak into failover, where the text IS true."""
+    from src.proxy.bare import OFFLINE_SYSTEM, ROUTE_SYSTEM, make_bare
+    from src.proxy.models import MessagesRequest
+
+    req = MessagesRequest.model_validate({
+        "model": "claude-opus-5",
+        "system": "harness",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    # The failover branch in routes.py passes OFFLINE_SYSTEM explicitly; the
+    # route path passes its own. Neither text leaks into the other.
+    assert make_bare(req, system=OFFLINE_SYSTEM).system == OFFLINE_SYSTEM
+    assert "lost its network connection" in OFFLINE_SYSTEM
+    assert "lost its network connection" not in ROUTE_SYSTEM
