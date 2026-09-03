@@ -240,7 +240,7 @@ async def test_missing_rules_file_still_routes(routed_app, tmp_path):
 
 def test_failover_keeps_the_outage_prompt():
     """The route change must not leak into failover, where the text IS true."""
-    from src.proxy.bare import DEFAULT_SYSTEM, ROUTE_SYSTEM, make_bare
+    from src.proxy.bare import OFFLINE_SYSTEM, ROUTE_SYSTEM, make_bare
     from src.proxy.models import MessagesRequest
 
     req = MessagesRequest.model_validate({
@@ -249,7 +249,8 @@ def test_failover_keeps_the_outage_prompt():
         "messages": [{"role": "user", "content": "hi"}],
     })
 
-    # make_bare's default is the failover text; the route path passes its own.
-    assert make_bare(req).system == DEFAULT_SYSTEM
-    assert "lost its network connection" in DEFAULT_SYSTEM
+    # The failover branch in routes.py passes OFFLINE_SYSTEM explicitly; the
+    # route path passes its own. Neither text leaks into the other.
+    assert make_bare(req, system=OFFLINE_SYSTEM).system == OFFLINE_SYSTEM
+    assert "lost its network connection" in OFFLINE_SYSTEM
     assert "lost its network connection" not in ROUTE_SYSTEM
