@@ -110,6 +110,18 @@ def test_outage_policy_clears_tool_choice_when_no_tool_survives():
     assert output.tool_choice is None
 
 
+def test_outage_policy_clears_choice_for_removed_tool_when_one_survives():
+    from src.proxy.models import ToolChoice
+
+    output = apply_outage_tool_policy(req(
+        tools=[Tool(name="Read"), Tool(name="Bash")],
+        tool_choice=ToolChoice(type="tool", name="Bash"),
+    ))
+
+    assert [tool.name for tool in output.tools or []] == ["Read"]
+    assert output.tool_choice is None
+
+
 # ── system prompt ────────────────────────────────────────────────────────────
 
 def test_harness_system_prompt_is_replaced():

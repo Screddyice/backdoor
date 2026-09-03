@@ -194,7 +194,15 @@ def apply_outage_tool_policy(req: MessagesRequest) -> MessagesRequest:
     output = req.model_copy(deep=True)
     allowed = set(READ_ONLY_OUTAGE_TOOLS)
     output.tools = [tool for tool in (output.tools or []) if tool.name in allowed] or None
-    if not output.tools:
+    choice = output.tool_choice
+    if (
+        not output.tools
+        or (
+            choice is not None
+            and choice.type == "tool"
+            and choice.name not in {tool.name for tool in output.tools}
+        )
+    ):
         output.tool_choice = None
     return output
 
