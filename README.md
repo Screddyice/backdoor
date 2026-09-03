@@ -1432,6 +1432,13 @@ uv run pytest                 # full suite
 uv run pytest tests/<file>    # one file
 ```
 
+`.claude-harness/init.sh` is not tracked. The claude-harness plugin rewrites it from its
+own template in whichever checkout it runs in, so tracking it left every checkout carrying a
+permanent modification — and `scripts/deploy-router.sh` aborts at preflight on a dirty service
+checkout, which made a plugin artifact able to block a deploy. It also kept reverting the
+committed version to an older format. The plugin recreates the file on demand; nothing needs it
+in a fresh clone.
+
 Worktrees usually point `.venv` at the main checkout's rather than building their own.
 `.gitignore` carries `.venv` without a trailing slash so those symlinks are ignored too;
 `.venv/` matches directories only, and a symlink shows up as untracked in every
