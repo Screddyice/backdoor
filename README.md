@@ -474,7 +474,13 @@ A background ticker now re-runs the connectivity probe every `failover_probe_sec
 
 The ticker watches **both** breakers this router owns — the Claude one and the Codex one — each released through its own tier path.
 
-**It can only close a breaker that required an offline host to open.** `codex_failover_require_offline` is `false`, so the Codex breaker opens on consecutive service failures alone and can be open while this host's connectivity is perfect. A connectivity probe says nothing about whether that service is back, so closing on one would reopen on the very next request, every interval, forever — throwing a real request at a known-dead service each cycle. `maybe_recover` refuses for a service-level breaker, which leaves it the half-open path: the only route back that actually reaches the service. That path still needs a rider, so the Codex breaker keeps the starvation this change removes from the Claude one; closing it properly means probing Codex itself, which is a larger change than this.
+**Each breaker is answered by the probe that matches its premise.** The Claude breaker opens because this host had no route out, so connectivity is the exact negation of what it concluded. The Codex breaker never consults connectivity at all — `codex_failover_require_offline` is `false`, so it opens on consecutive service failures and can be open while the network is perfect. Answering it with a connectivity probe would be answering a question it never asked. It gets `service_reachable()` instead: the same verified handshake, aimed at its own upstream host.
+
+Unlike `internet_reachable`, that one resolves DNS on purpose. Literal IPs exist so a broken resolver cannot fold itself into "has this machine got a route"; "is *that service* reachable from here" is a different question, and a name that will not resolve is a real way for a service to be unreachable.
+
+**Reachability disproves "I could not reach it" and never "it answered 429".** The front door of a rate-limited service is perfectly reachable, and this router cannot check the difference on its own: it relays the caller's credentials and holds none, so it cannot make an authenticated Codex request outside a real one. So `record_failure` takes `transport_error`, passed `False` at the two `f"HTTP {status}"` call sites, and the breaker remembers which kind opened it. A transport-error open can be reconsidered by the probe; a status open keeps the half-open path, which is the only route that actually settles a quota and the only one carrying a credential.
+
+The practical difference: an idle Codex outage that was a transport failure now ends on its own, instead of holding a qwen tier resident and llm-jury disabled until traffic happens to return. A usage limit still waits for a real request, which is correct.
 
 ### A stream that dies after the headers
 
