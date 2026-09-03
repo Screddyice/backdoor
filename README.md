@@ -517,6 +517,12 @@ RESTART_CMD='<restart the router>' scripts/deploy-router.sh <service-checkout-di
 
 The service checkout on this machine is a **detached worktree** sharing one repository with about twenty others, so the script fast-forwards the detached HEAD and never runs `git checkout <branch>` — that collides with whichever worktree holds the branch.
 
+### The ladder always answers
+
+`pick_failover_profile` ends in `return FAILOVER_LADDER[-1][1]`, so an oversized session gets the widest tier rather than nothing. That is the guarantee worth holding: **an outage never leaves a session with no local tier at all.**
+
+It used to be asserted as `bounds[-1] == float("inf")` — the shape of the data rather than the behaviour, and redundant with that trailing return. The test now asserts the behaviour, which both passes today and fails loudly for anyone who changes the selector to return `None` for a session no tier can serve. That is a legitimate design (it pairs with shrinking the prompt before the selector runs, so an impossible request gets an honest answer instead of a model call that cannot complete) — but it is a change in contract, and a failing test is where that should surface.
+
 ### Opening needs a sustained outage, not a fast one
 
 Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
