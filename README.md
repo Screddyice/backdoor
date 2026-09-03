@@ -400,7 +400,7 @@ While ChatGPT inference works, Backdoor relays the original request, OAuth heade
 
 The relay accepts request bodies up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must send a larger encoded request.
 
-On the first eligible failure, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Codex Desktop has a bounded five-attempt reconnect loop, so a duration gate can outlast every retry and prevent fallback. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+After an eligible failure persists for 20 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
 
 Cloudflare can also lose a valid provider route and return a bare `404` with a
 `cf-ray` header. Backdoor counts that unstructured response as outage evidence
@@ -534,25 +534,12 @@ It used to be asserted as `bounds[-1] == float("inf")` — the shape of the data
 
 Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
 
-Claude requires the upstream to fail for ten seconds before its breaker may
-open. The gate runs before the connectivity probe, so a burst no longer fires
-one TLS handshake per failure. Codex opens on its first eligible failure because
-Desktop can exhaust its reconnect loop before a duration gate elapses.
+Both clients require the upstream to fail for 20 seconds before their breakers
+may open. The gate runs before the connectivity probe, so a burst does not fire
+one TLS handshake per failure.
 
-**Ten, and the number came from the logs rather than taste.** It shipped at 30 s
-on 2026-09-03 and came down the same day. During the gate the router hands the
-client a 502 — the *same* 502 on both paths, from symmetric code — and the one
-real outage after the gate went live cost 60 seconds of them: first failure
-17:50:08, breaker open 17:51:08. Measuring 79 outage bursts across the router
-logs settles it: median 3 s, and a 10 s gate absorbs 64% of bursts where 30 s
-absorbs 69%. Five points of extra protection for triple the user-visible error
-window is a bad trade, and 30% of bursts outlast any gate at all, where the wait
-is pure cost.
-
-**Codex keeps a zero-second gate.** Its bounded five-attempt reconnect loop can
-finish before ten seconds pass. A hold-down then blocks local fallback for the
-whole incident. Codex may load the local tier for a short service blip, but that
-cost is smaller than exhausting every visible retry with no fallback.
+The shared 20-second gate is the operator policy for Codex and Claude. During
+that window, each client retains its normal retry or error behavior.
 Authentication and request errors still bypass failover on both paths.
 
 During the gate the real errors are relayed, and Claude Code retries through
@@ -569,9 +556,9 @@ This is load-bearing rather than politeness: the recovery ticker below makes tra
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `failover_min_outage_seconds` | `10.0` | How long the upstream must stay broken before failover may open |
+| `failover_min_outage_seconds` | `20.0` | How long the Claude upstream must stay broken before failover may open |
 | `failover_notify_cooldown_seconds` | `900.0` | Minimum gap between failover notifications, per breaker |
-| `codex_failover_min_outage_seconds` | `0.0` | Immediate because Codex Desktop can exhaust its bounded reconnect loop before a hold-down elapses |
+| `codex_failover_min_outage_seconds` | `20.0` | How long the Codex upstream must stay broken before failover may open |
 | `codex_failover_notify_cooldown_seconds` | `900.0` | The same rationing for the Codex breaker |
 
 ### Recovery does not wait for traffic

@@ -688,12 +688,20 @@ async def test_disabling_local_failover_always_relays_trigger_statuses(
     assert breaker.open is False
 
 
+class _GateClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["transport", "http-502"])
-async def test_trigger_failure_uses_qwen_on_the_first_codex_attempt(
+async def test_trigger_failure_uses_qwen_once_the_gate_elapses(
     codex_app, monkeypatch, failure
 ):
-    """Codex must fail over before Desktop exhausts its reconnect budget."""
+    """Codex relays failures for 20 seconds, then serves through Qwen."""
     app, settings, breaker = codex_app
     local_calls = 0
 
@@ -729,9 +737,20 @@ async def test_trigger_failure_uses_qwen_on_the_first_codex_attempt(
         httpx.AsyncClient(transport=httpx.MockTransport(local)),
     )
 
+    clock = _GateClock()
+    breaker._now = clock
+
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
     ) as client:
+        first = await client.post(
+            "/backend-api/codex/responses", content=FIXTURE.read_bytes()
+        )
+        assert first.status_code != 200
+        assert local_calls == 0
+        assert not breaker.open
+
+        clock.t += settings.codex_failover_min_outage_seconds + 1
         response = await client.post(
             "/backend-api/codex/responses", content=FIXTURE.read_bytes()
         )

@@ -107,18 +107,9 @@ class Settings(BaseSettings):
     # short outages read as long ones in the log). Each one silently moved live
     # sessions onto a local model and fired a desktop notification.
     #
-    # TEN seconds, not the thirty this shipped with on 2026-09-03. During the
-    # gate the router hands the client a 502 — the SAME 502 the Codex path
-    # returns, from symmetric code — and that is not free just because Claude
-    # Code retries. Measured on the one real outage after the gate went live:
-    # first failure 17:50:08, breaker open 17:51:08. Sixty seconds of errors.
-    #
-    # The duration histogram across 79 outage bursts in the router logs is what
-    # sets the number. Median 3s. A 10s gate absorbs 64% of bursts; 30s absorbs
-    # 69%. Five points of extra protection for three times the user-visible
-    # error window is a bad trade, and 30% of bursts outlast any gate at all,
-    # where the wait is pure cost.
-    failover_min_outage_seconds: float = 10.0
+    # Twenty seconds is the shared operator policy for Claude and Codex. Both
+    # clients relay their normal retry/error behavior while the gate runs.
+    failover_min_outage_seconds: float = 20.0
     # At most one failover announcement per breaker per cooldown. The log keeps
     # every transition; the notification is for the human, and a flapping link
     # produced sixteen of them in one evening. A close only announces if its
@@ -183,11 +174,8 @@ class Settings(BaseSettings):
     codex_failover_threshold: int = Field(default=1, ge=1)
     codex_failover_window_seconds: float = Field(default=120.0, gt=0)
     codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
-    # Codex Desktop exhausts its five reconnect attempts before a duration gate
-    # can elapse. A hold-down therefore prevents failover instead of filtering
-    # short incidents. Keep Codex immediate and leave Claude's 10-second gate in
-    # place; Claude Code keeps retrying while that gate runs.
-    codex_failover_min_outage_seconds: float = Field(default=0.0, ge=0)
+    # Keep this aligned with Claude's 20-second gate by operator policy.
+    codex_failover_min_outage_seconds: float = Field(default=20.0, ge=0)
     codex_failover_notify_cooldown_seconds: float = Field(default=900.0, ge=0)
     codex_failover_statuses: str = "429,500,502,503,504,529"
     codex_failover_require_offline: bool = False

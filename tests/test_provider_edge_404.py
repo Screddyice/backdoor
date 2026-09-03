@@ -142,7 +142,6 @@ async def test_claude_structured_api_404_stays_visible(monkeypatch, tmp_path):
 async def test_codex_edge_404_activates_failover(monkeypatch, tmp_path):
     settings = Settings(
         codex_chatgpt_upstream="https://chatgpt.test/backend-api/codex",
-        codex_failover_min_outage_seconds=0,
     )
     breaker = _breaker(tmp_path, "codex", require_offline=False)
     monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)
@@ -185,7 +184,6 @@ async def test_codex_edge_404_activates_failover(monkeypatch, tmp_path):
 async def test_codex_structured_api_404_stays_visible(monkeypatch, tmp_path):
     settings = Settings(
         codex_chatgpt_upstream="https://chatgpt.test/backend-api/codex",
-        codex_failover_min_outage_seconds=0,
     )
     breaker = _breaker(tmp_path, "codex", require_offline=False)
     monkeypatch.setattr(codex_routes, "_codex_breaker", breaker)

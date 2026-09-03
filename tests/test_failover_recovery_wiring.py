@@ -299,9 +299,9 @@ def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch
     import src.proxy.codex_routes as codex_routes
 
     settings = Settings()
-    assert settings.failover_min_outage_seconds == 10.0
+    assert settings.failover_min_outage_seconds == 20.0
     assert settings.failover_notify_cooldown_seconds == 900.0
-    assert settings.codex_failover_min_outage_seconds == 0.0
+    assert settings.codex_failover_min_outage_seconds == 20.0
     assert settings.codex_failover_notify_cooldown_seconds == 900.0
 
     monkeypatch.setattr(routes, "_breaker", None)
@@ -322,8 +322,8 @@ def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch
         codex_routes._codex_breaker = None
 
 
-def test_codex_fallback_opens_on_the_first_failure(monkeypatch):
-    """Desktop's bounded reconnect loop requires immediate Codex failover."""
+def test_codex_fallback_opens_after_twenty_seconds(monkeypatch):
+    """Codex uses the same 20-second outage gate as Claude."""
     import src.proxy.codex_routes as codex_routes
 
     clock = _Clock()
@@ -334,6 +334,10 @@ def test_codex_fallback_opens_on_the_first_failure(monkeypatch):
         breaker._now = clock
         assert settings.codex_failover_threshold == 1
 
+        assert breaker.record_failure("ConnectError") is False
+        assert not breaker.open
+
+        clock.t += settings.codex_failover_min_outage_seconds + 1
         assert breaker.record_failure("ConnectError") is True
         assert breaker.open
     finally:

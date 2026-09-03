@@ -339,7 +339,7 @@ class FailoverBreaker:
         # Deliberately inert by default, unlike `threshold` above. These two are
         # policy — how long to tolerate a broken upstream, and how often to
         # interrupt the human — and the router sets them from
-        # Settings.failover_min_outage_seconds (30s) and
+        # Settings.failover_min_outage_seconds (20s) and
         # Settings.failover_notify_cooldown_seconds (900s). A zero default keeps
         # this class a pure state machine that opens the moment its inputs say
         # to, which is what the mechanics tests are about; the wiring is pinned
