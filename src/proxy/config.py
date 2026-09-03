@@ -183,20 +183,11 @@ class Settings(BaseSettings):
     codex_failover_threshold: int = Field(default=1, ge=1)
     codex_failover_window_seconds: float = Field(default=120.0, gt=0)
     codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
-    # Held at the same 10s as Claude, deliberately, though this one is the harder
-    # call. Codex Desktop does NOT retry: it surfaces the 502, so during the gate
-    # a Codex user sees a hard error where a Claude user sees a retry banner.
-    # PR #91 set this to 0 for exactly that reason, and dropping the Claude gate
-    # to 10s removed the asymmetry's justification rather than its cost — the
-    # gap between the two paths is now 10s of visible errors versus 10s of
-    # retries, not 60s versus none.
-    #
-    # What the 10s buys, on both paths, is not loading a 17GB local tier for a
-    # blip: 48% of measured outage bursts are 2 seconds or shorter. Failing over
-    # on those spends the GPU and evicts the llm-jury council to ride out
-    # something already over. Revert to 0 if Codex 502s prove worse in practice
-    # than that churn; the number is one edit and the reasoning is here.
-    codex_failover_min_outage_seconds: float = Field(default=10.0, ge=0)
+    # Codex Desktop exhausts its five reconnect attempts before a duration gate
+    # can elapse. A hold-down therefore prevents failover instead of filtering
+    # short incidents. Keep Codex immediate and leave Claude's 10-second gate in
+    # place; Claude Code keeps retrying while that gate runs.
+    codex_failover_min_outage_seconds: float = Field(default=0.0, ge=0)
     codex_failover_notify_cooldown_seconds: float = Field(default=900.0, ge=0)
     codex_failover_statuses: str = "429,500,502,503,504,529"
     codex_failover_require_offline: bool = False

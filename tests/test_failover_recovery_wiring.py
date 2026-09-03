@@ -301,7 +301,7 @@ def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch
     settings = Settings()
     assert settings.failover_min_outage_seconds == 10.0
     assert settings.failover_notify_cooldown_seconds == 900.0
-    assert settings.codex_failover_min_outage_seconds == 10.0
+    assert settings.codex_failover_min_outage_seconds == 0.0
     assert settings.codex_failover_notify_cooldown_seconds == 900.0
 
     monkeypatch.setattr(routes, "_breaker", None)
@@ -322,24 +322,8 @@ def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch
         codex_routes._codex_breaker = None
 
 
-def test_codex_fallback_opens_on_the_first_failure_once_the_gate_elapses(monkeypatch):
-    """Codex opens on the FIRST failure after the gate, not the first failure.
-
-    This asserted immediate failover when PR #91 wrote it, because Codex Desktop
-    surfaces a 502 rather than retrying, so any hold-down was a visible error.
-    That reasoning was sound against a 30s Claude gate. It stopped being decisive
-    when the Claude gate came down to 10s on 2026-09-03: the gap between the two
-    paths is now 10s of visible errors against 10s of retried ones, not 60s
-    against none, and the 10s buys something both paths want — not loading a
-    17GB local tier for a blip, when 48% of measured outage bursts are under two
-    seconds.
-
-    The threshold of 1 is unchanged and still load-bearing: it is the DURATION
-    that gates now, and a single sustained failure is enough to trip it.
-
-    If Codex 502s prove worse in practice than the GPU churn, the revert is one
-    number in config.py and the reasoning is recorded there.
-    """
+def test_codex_fallback_opens_on_the_first_failure(monkeypatch):
+    """Desktop's bounded reconnect loop requires immediate Codex failover."""
     import src.proxy.codex_routes as codex_routes
 
     clock = _Clock()
@@ -350,12 +334,6 @@ def test_codex_fallback_opens_on_the_first_failure_once_the_gate_elapses(monkeyp
         breaker._now = clock
         assert settings.codex_failover_threshold == 1
 
-        # First failure starts the clock and is relayed, not failed over.
-        assert breaker.record_failure("ConnectError") is False
-        assert not breaker.open
-
-        # A failure once the gate has elapsed opens it immediately.
-        clock.t += settings.codex_failover_min_outage_seconds + 1
         assert breaker.record_failure("ConnectError") is True
         assert breaker.open
     finally:
