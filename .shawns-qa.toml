@@ -1,0 +1,10 @@
+# Backdoor carries the repair channel used by both Claude and Codex. Automated
+# review remains useful, but a bot must never land a control-plane change.
+
+[merge]
+enabled = false
+
+[verify]
+test = "pytest -q"
+timeout_seconds = 900
+
