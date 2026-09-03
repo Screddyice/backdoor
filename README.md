@@ -630,6 +630,34 @@ Both paths now answer for themselves:
 The cloud side had the quieter half of the same problem. A relayed upstream error carried no status into the log, so a `500` from Anthropic and a turn that worked both printed `→ passthrough [claude-opus-5] /v1/messages` and nothing more. One session hit that on 2026-09-03 at 21:24, and the log could not tell you which side wrote the error. Backdoor now logs `upstream POST /v1/messages → 500 (relayed verbatim)` at WARNING for every relayed status at or above 400. Healthy turns still cost one line each.
 
 
+### The breaker's verdict does not run on the event loop
+
+`record_failure` calls `internet_reachable`, a blocking socket probe against a public address. It
+is the thing that decides whether a run of failures means *this host is offline* or just *Anthropic
+is having a moment*, and it was called straight from the request coroutine. So every failed turn
+froze the router for the length of that probe, for every other session on it, at exactly the moment
+the router is busiest.
+
+Moving it to a worker thread fixes the stall and exposes a second fault underneath. A probe started
+by one request can finish after a NEWER request has already succeeded and closed the breaker, and it
+then writes its stale verdict over that success. The window is the probe's own duration, which on a
+degraded link is seconds.
+
+So one lock serialises every breaker verdict, failure and success alike, and the breaker sees them in
+the order the requests actually resolved. Cancellation gets its own rule: cancelling an `await` cannot
+stop the worker thread it is waiting on, so a cancelled caller keeps the lock until its probe finishes.
+Releasing early would let that thread mutate the breaker behind whoever took the lock next.
+
+| | |
+|---|---|
+| Probe | Runs in a worker thread, never on the event loop |
+| Ordering | One `asyncio.Lock` over failure and success, so a slow probe cannot overwrite a newer success |
+| Cancellation | The lock is held until the orphaned probe thread finishes |
+
+`DEFAULT_FAILOVER_THRESHOLD` replaces the bare `1` that `Settings.failover_threshold` and
+`FailoverBreaker.__init__` each carried, with a comment on each asking the other to stay in step.
+
+
 ### Forward-proxy mode: failover *and* Remote Control
 
 Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
@@ -693,10 +721,12 @@ Two behaviours are worth knowing before you rely on it:
 
 Settings `env` has no health gate of its own, so pair it with a wrapper that checks the port when you care about that degradation path.
 
-**Backdoor retries one transient Anthropic transport failure before surfacing it.** Connect,
-write, read, and protocol failures can clear between attempts. The router retries once on the
-same pool, then lets the circuit breaker decide whether the host is offline. Pool exhaustion uses
-a fresh pool as described below.
+**Backdoor retries one pre-send Anthropic transport failure before surfacing it.** A connect or
+pool failure means nothing reached Anthropic, so a second attempt cannot duplicate anything. The
+router retries those once on the same pool, then lets the circuit breaker decide whether the host
+is offline. Pool exhaustion uses a fresh pool as described below. Read, write and protocol errors
+are never replayed: the request may already be on Anthropic's side, and a blind retry would bill
+and run the turn twice.
 
 **Backdoor recovers the Anthropic pool after a dropped network.** Active streams can occupy every
 shared HTTP connection while Wi-Fi changes or DNS disappears. A later request then raises

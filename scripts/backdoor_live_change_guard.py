@@ -15,8 +15,23 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-LIVE_PLIST = Path.home() / "Library/LaunchAgents/com.screddy.backdoor-router.plist"
-LIVE_CHECKOUT = Path.home() / "projects/SRC/backdoor-service"
+CANONICAL_HOME = Path("/Users/screddy")
+LIVE_PLISTS = tuple(
+    dict.fromkeys(
+        [
+            CANONICAL_HOME / "Library/LaunchAgents/com.screddy.backdoor-router.plist",
+            Path.home() / "Library/LaunchAgents/com.screddy.backdoor-router.plist",
+        ]
+    )
+)
+LIVE_CHECKOUTS = tuple(
+    dict.fromkeys(
+        [
+            CANONICAL_HOME / "projects/SRC/backdoor-service",
+            Path.home() / "projects/SRC/backdoor-service",
+        ]
+    )
+)
 ROUTER_LABEL = "com.screddy.backdoor-router"
 
 FILE_MUTATION_TOOLS = {"write", "edit", "multiedit", "apply_patch"}
@@ -84,6 +99,10 @@ def _contains_path(text: str, path: Path) -> bool:
     return any(candidate in text for candidate in (absolute, home_form, tilde_form))
 
 
+def _contains_any_path(text: str, paths: Iterable[Path]) -> bool:
+    return any(_contains_path(text, path) for path in paths)
+
+
 def _file_target(tool_input: Any) -> str:
     if not isinstance(tool_input, dict):
         return ""
@@ -103,7 +122,9 @@ def _is_protected_file(path_text: str) -> bool:
         resolved = expanded.resolve(strict=False)
     except OSError:
         resolved = expanded
-    return resolved == LIVE_PLIST or resolved == LIVE_CHECKOUT or LIVE_CHECKOUT in resolved.parents
+    return any(resolved == path for path in LIVE_PLISTS) or any(
+        resolved == checkout or checkout in resolved.parents for checkout in LIVE_CHECKOUTS
+    )
 
 
 def evaluate(payload: dict[str, Any]) -> str | None:
@@ -118,8 +139,8 @@ def evaluate(payload: dict[str, Any]) -> str | None:
             return BLOCK_REASON
         if tool_name.endswith("apply_patch"):
             patch_text = "\n".join(_strings(tool_input))
-            if _contains_path(patch_text, LIVE_PLIST) or _contains_path(
-                patch_text, LIVE_CHECKOUT
+            if _contains_any_path(patch_text, LIVE_PLISTS) or _contains_any_path(
+                patch_text, LIVE_CHECKOUTS
             ):
                 return BLOCK_REASON
 
@@ -128,18 +149,18 @@ def evaluate(payload: dict[str, Any]) -> str | None:
         return None
 
     if "apply_patch" in text and (
-        _contains_path(text, LIVE_PLIST) or _contains_path(text, LIVE_CHECKOUT)
+        _contains_any_path(text, LIVE_PLISTS) or _contains_any_path(text, LIVE_CHECKOUTS)
     ):
         return BLOCK_REASON
 
-    targets_router = ROUTER_LABEL in text or _contains_path(text, LIVE_PLIST)
-    targets_checkout = _contains_path(text, LIVE_CHECKOUT) or bool(
+    targets_router = ROUTER_LABEL in text or _contains_any_path(text, LIVE_PLISTS)
+    targets_checkout = _contains_any_path(text, LIVE_CHECKOUTS) or bool(
         re.search(r"(?:^|[/\s])backdoor-service(?:[/\s]|$)", text)
     )
 
     if targets_router and LAUNCHD_MUTATIONS.search(text):
         return BLOCK_REASON
-    if _contains_path(text, LIVE_PLIST) and (
+    if _contains_any_path(text, LIVE_PLISTS) and (
         PLIST_MUTATIONS.search(text) or SHELL_FILE_MUTATIONS.search(text)
     ):
         return BLOCK_REASON
