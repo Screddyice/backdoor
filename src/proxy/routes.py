@@ -443,7 +443,7 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         err_body = await uresp.aread()  # decoded: content-encoding is undone here
         err_headers = _decoded_relay_headers(uresp)
         await uresp.aclose()
-        if br.record_failure(f"HTTP {uresp.status_code}"):
+        if br.record_failure(f"HTTP {uresp.status_code}", transport_error=False):
             return None
         # Below the threshold: relay the error verbatim so the client's own
         # retry/backoff logic still runs (a lone 429 is normal backpressure).

@@ -11,11 +11,14 @@ import ssl
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from src.proxy.failover import (
     FAILOVER_STATUSES,
     FailoverBreaker,
     _statuses_from_env,
     internet_reachable,
+    service_reachable,
 )
 
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="backdoor-failover-state-"))
@@ -745,7 +748,7 @@ def test_recovery_probe_waits_a_full_interval_after_opening():
     assert len(calls) == 1, "no second probe in the same instant the breaker opened"
 
 
-def test_recovery_probe_refuses_a_service_level_breaker():
+def test_recovery_probe_refuses_a_service_level_breaker_with_no_probe():
     """A breaker that never asked about the network cannot be answered by it.
 
     The Codex upstream runs `require_offline=False`: it opens on consecutive
@@ -759,7 +762,7 @@ def test_recovery_probe_refuses_a_service_level_breaker():
     br, _ = make(
         clock, threshold=1, require_offline=False, online_fn=lambda: True
     )
-    assert br.record_failure("HTTP 429") is True
+    assert br.record_failure("HTTP 429", transport_error=False) is True
     assert br.open, "a service-level breaker opens without consulting the probe"
 
     clock.t += 600.0
@@ -781,3 +784,125 @@ def test_recovery_probe_still_serves_an_offline_gated_breaker():
     clock.t += 60.0
     assert br.maybe_recover() is True
     assert not br.open
+
+
+# ── Probing the service, not the internet ────────────────────────────────────
+#
+# A service-level breaker (the Codex upstream) opens without consulting
+# connectivity, so `internet_reachable` cannot answer it. What this router *can*
+# ask on its own is whether that upstream's host is reachable — it relays the
+# caller's credentials and holds none, so it cannot make an authenticated Codex
+# request outside a real one. That measurement disproves exactly one kind of
+# open, and the breaker must not pretend otherwise.
+
+
+def test_service_probe_closes_a_breaker_that_opened_on_a_transport_error():
+    clock = Clock()
+    reachable = [False]
+    br, _ = make(
+        clock,
+        threshold=1,
+        require_offline=False,
+        service_fn=lambda: reachable[0],
+    )
+    assert br.record_failure("ConnectTimeout") is True
+    assert br.open
+
+    reachable[0] = True
+    clock.t += 60.0
+    assert br.maybe_recover() is True
+    assert not br.open
+
+
+def test_service_probe_will_not_close_a_breaker_that_opened_on_a_status():
+    """Reachability disproves "I could not reach it", never "it answered 429".
+
+    The front door of a rate-limited service is perfectly reachable. Closing on
+    that would reopen on the next request, every interval, and spend real
+    requests against a service that already said no — while the router cannot
+    even ask properly, since the credential belongs to the caller.
+    """
+    clock = Clock()
+    br, _ = make(
+        clock,
+        threshold=1,
+        require_offline=False,
+        service_fn=lambda: True,          # host is up; quota is not
+    )
+    assert br.record_failure("HTTP 429", transport_error=False) is True
+    assert br.open
+
+    clock.t += 600.0
+    assert br.maybe_recover() is False
+    assert br.open
+
+
+def test_service_probe_leaves_an_unreachable_upstream_open():
+    clock = Clock()
+    br, _ = make(
+        clock, threshold=1, require_offline=False, service_fn=lambda: False
+    )
+    br.record_failure("ConnectError")
+    assert br.open
+    clock.t += 60.0
+    assert br.maybe_recover() is False
+    assert br.open
+
+
+def test_an_offline_gated_breaker_still_uses_the_connectivity_probe():
+    """The Claude breaker must not start asking the service instead."""
+    clock = Clock()
+    asked = []
+    online = [False]                       # offline, so the breaker may open
+
+    def online_fn():
+        asked.append("online")
+        return online[0]
+
+    br, _ = make(
+        clock,
+        threshold=1,
+        require_offline=True,
+        online_fn=online_fn,
+        service_fn=lambda: (asked.append("service"), True)[1],
+    )
+    br.record_failure("ConnectError")
+    assert br.open
+
+    online[0] = True
+    clock.t += 60.0
+    assert br.maybe_recover() is True
+    assert "service" not in asked, "an offline-gated breaker asks connectivity"
+
+
+def test_service_reachable_targets_the_url_s_host_and_port(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "src.proxy.failover._probe_all",
+        lambda probes, timeout, verify: seen.append((tuple(probes), verify)) or True,
+    )
+    assert service_reachable("https://chatgpt.com/backend-api/codex") is True
+    assert seen[0][0] == (("chatgpt.com", 443, "chatgpt.com"),), (
+        "the certificate must be checked against the service's own name"
+    )
+    assert seen[0][1] is True
+
+
+def test_service_reachable_skips_verification_for_plain_http(monkeypatch):
+    """There is no certificate to check on http://, so a handshake is the wrong test."""
+    seen = []
+    monkeypatch.setattr(
+        "src.proxy.failover._probe_all",
+        lambda probes, timeout, verify: seen.append((tuple(probes), verify)) or True,
+    )
+    assert service_reachable("http://127.0.0.1:11434/v1") is True
+    assert seen[0][0] == (("127.0.0.1", 11434, "127.0.0.1"),)
+    assert seen[0][1] is False
+
+
+def test_service_reachable_reports_false_for_an_unparseable_url(monkeypatch):
+    monkeypatch.setattr(
+        "src.proxy.failover._probe_all",
+        lambda *a, **k: pytest.fail("must not dial when there is no host"),
+    )
+    assert service_reachable("") is False

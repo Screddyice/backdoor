@@ -192,3 +192,81 @@ def test_the_default_targets_cover_both_breakers(monkeypatch):
     assert [name for name, _ in released] == ["claude", "codex"], (
         "each breaker must be released through its own path"
     )
+
+
+def test_the_codex_breaker_is_built_with_a_probe_for_its_own_upstream(monkeypatch):
+    """The Codex breaker must be pointed at Codex, not at the internet.
+
+    Wiring it to the shared connectivity probe would let a working network close
+    a breaker that opened because ChatGPT specifically was unreachable — the
+    false-close mirror of the false-open this branch is about.
+    """
+    import src.proxy.codex_routes as codex_routes
+
+    asked = []
+    monkeypatch.setattr(
+        codex_routes, "service_reachable", lambda url: asked.append(url) or True
+    )
+    monkeypatch.setattr(codex_routes, "_codex_breaker", None)
+
+    settings = Settings()
+    breaker = codex_routes.get_codex_breaker(settings)
+    try:
+        assert breaker._service is not None, "a service-level breaker needs a probe"
+        assert breaker._service() is True
+        assert asked == [settings.codex_chatgpt_upstream]
+        assert breaker.require_offline is False, (
+            "Codex fails over on service errors, not only on an offline host"
+        )
+    finally:
+        codex_routes._codex_breaker = None
+
+
+def test_the_ticker_recovers_the_codex_breaker_through_its_service_probe(monkeypatch):
+    """End to end: transport-error open, host comes back, ticker closes it."""
+    import src.proxy.codex_routes as codex_routes
+
+    monkeypatch.setattr(codex_routes, "_codex_breaker", None)
+    reachable = [False]
+    monkeypatch.setattr(codex_routes, "service_reachable", lambda url: reachable[0])
+
+    settings = Settings()
+    codex = codex_routes.get_codex_breaker(settings)
+    released = []
+
+    async def release_codex(br):
+        released.append(br)
+
+    monkeypatch.setattr(codex_routes, "_release_claims", release_codex)
+    monkeypatch.setattr(
+        routes, "get_breaker", lambda s: _Breaker(open_=False, recovers=False)
+    )
+
+    try:
+        for _ in range(settings.codex_failover_threshold):
+            codex.record_failure("ConnectTimeout")
+        assert codex.open, "consecutive transport failures open the Codex breaker"
+
+        reachable[0] = True                      # ChatGPT is back
+        # This breaker runs on the real clock (get_codex_breaker takes no
+        # now_fn), and opening stamps the recovery timer, so wind it back rather
+        # than sleeping a whole probe interval in a unit test.
+        codex._last_recovery_at -= settings.codex_failover_probe_seconds + 1
+
+        remaining = [2]
+
+        async def sleep(_interval):
+            if remaining[0] <= 0:
+                raise _Stop
+            remaining[0] -= 1
+
+        async def drive():
+            with pytest.raises(_Stop):
+                await routes.failover_recovery_loop(settings, sleep=sleep)
+
+        asyncio.run(drive())
+
+        assert not codex.open, "the ticker closed it with no Codex request at all"
+        assert released == [codex]
+    finally:
+        codex_routes._codex_breaker = None
