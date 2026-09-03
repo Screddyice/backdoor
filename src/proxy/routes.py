@@ -15,7 +15,17 @@ from .config import (
     MODEL_ROUTES, Settings, get_settings, load_profile_settings, load_route_system_extra,
     pick_failover_profile, resolve_model_route,
 )
-from .bare import OFFLINE_SYSTEM, make_bare, parse_keep, route_system
+from .bare import (
+    OFFLINE_SYSTEM,
+    apply_outage_tool_policy,
+    make_bare,
+    parse_keep,
+    route_system,
+)
+from .claude_context_adapter import ClaudeContextAdapter
+from .context_runtime import ContextRuntime, PreparedContext, normalized_request_hash
+from .context_store import ContextStore, ContextStoreUnavailable
+from .context_tokenizer import ContextLimitError, QwenTokenGate
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
 from . import compute_lease, mlx_admin, ollama_admin
@@ -33,6 +43,124 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _client: ProviderClient | None = None
+_claude_context_runtime: ContextRuntime | None = None
+_claude_context_runtime_config: tuple[object, ...] | None = None
+
+
+class _UnavailableContextStore:
+    """Let the runtime use its stateless fallback when SQLite cannot open."""
+
+    @staticmethod
+    def _raise(*_args, **_kwargs):
+        raise ContextStoreUnavailable("private transcript archive is unavailable")
+
+    archive = _raise
+    prune_if_needed = _raise
+    search = _raise
+    segments = _raise
+    put_cached_response = _raise
+    get_cached_response = _raise
+
+
+def _context_config(settings: Settings) -> tuple[object, ...]:
+    return (
+        settings.context_archive_path,
+        settings.context_archive_max_bytes,
+        settings.context_archive_inactive_days,
+        settings.context_tokenizer_executable,
+        settings.context_tokenizer_model_path,
+        settings.context_response_cache_seconds,
+        settings.context_archive_timeout_seconds,
+        settings.context_assembly_timeout_seconds,
+    )
+
+
+def _get_claude_context_runtime(settings: Settings) -> ContextRuntime:
+    global _claude_context_runtime, _claude_context_runtime_config
+    config = _context_config(settings)
+    if _claude_context_runtime is not None and _claude_context_runtime_config == config:
+        return _claude_context_runtime
+    if _claude_context_runtime is not None:
+        _claude_context_runtime.close()
+    try:
+        store = ContextStore(
+            settings.context_archive_path,
+            max_bytes=settings.context_archive_max_bytes,
+            inactive_days=settings.context_archive_inactive_days,
+        )
+    except ContextStoreUnavailable:
+        store = _UnavailableContextStore()
+    gate = QwenTokenGate(
+        executable=settings.context_tokenizer_executable,
+        model_path=settings.context_tokenizer_model_path,
+    )
+    _claude_context_runtime = ContextRuntime(store, gate, settings)  # type: ignore[arg-type]
+    _claude_context_runtime_config = config
+    return _claude_context_runtime
+
+
+def _profile_context_settings(profile: Settings, router_settings: Settings) -> Settings:
+    """Carry router-level context controls into a selected local profile."""
+    names = (
+        "context_virtualization",
+        "context_target_input_tokens",
+        "context_hard_input_tokens",
+        "context_archive_path",
+        "context_archive_max_bytes",
+        "context_archive_inactive_days",
+        "context_response_cache_seconds",
+        "context_archive_timeout_seconds",
+        "context_assembly_timeout_seconds",
+        "context_tokenizer_executable",
+        "context_tokenizer_model_path",
+    )
+    return profile.model_copy(
+        update={name: getattr(router_settings, name) for name in names}
+    )
+
+
+async def _prepare_claude_local(
+    req: MessagesRequest,
+    settings: Settings,
+    failed_over: bool,
+) -> PreparedContext:
+    """Prepare a bounded Claude request after routing has selected local Qwen."""
+    if not settings.context_virtualization:
+        return PreparedContext(
+            payload=req,
+            request_hash=normalized_request_hash("claude", req),
+            lineage_id=None,
+            token_count=count_messages(req.messages, req.system, req.tools),
+            used_store=False,
+        )
+    if failed_over:
+        req = apply_outage_tool_policy(req)
+    adapter = ClaudeContextAdapter()
+    context = adapter.normalize(req)
+    runtime = _get_claude_context_runtime(settings)
+    estimate = count_messages(req.messages, req.system, req.tools)
+    if estimate > settings.context_hard_input_tokens:
+        return await runtime.prepare_local(context, adapter, settings)
+    runtime.archive_cloud(context)
+    return PreparedContext(
+        payload=req,
+        request_hash=normalized_request_hash(context.client_kind, context.native),
+        lineage_id=None,
+        token_count=estimate,
+        used_store=False,
+    )
+
+
+def _archive_claude_cloud(body: bytes, settings: Settings) -> None:
+    """Queue one accepted cloud request without changing the relayed bytes."""
+    if not settings.context_virtualization:
+        return
+    try:
+        adapter = ClaudeContextAdapter()
+        context = adapter.normalize(MessagesRequest.model_validate_json(body))
+        _get_claude_context_runtime(settings).archive_cloud(context)
+    except Exception:
+        logger.exception("Claude cloud context archive skipped")
 
 
 def set_provider_client(c: ProviderClient):
@@ -550,6 +678,7 @@ async def create_message(
     # `/model qwen`. Decides whether the tier this request loads is one the
     # router may clamp and later evict on its own — see ollama_admin.
     failed_over = False
+    context_prepared: PreparedContext | None = None
 
     if settings.router_mode == "hybrid":
         model = _model_from_body(body)
@@ -560,10 +689,12 @@ async def create_message(
                 relayed = await _guarded_passthrough(request, body, settings)
                 if relayed is None:
                     raise HTTPException(status_code=502, detail="Anthropic unreachable")
+                _archive_claude_cloud(body, settings)
                 return relayed
             relay = await _try_upstream(request, body, settings)
             if relay is not None:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
+                _archive_claude_cloud(body, settings)
                 return relay
             # Failed over. Strip the harness FIRST, then size the tier: what the
             # local model has to prefill is the STRIPPED request, so that is what
@@ -576,7 +707,9 @@ async def create_message(
             try:
                 fr = MessagesRequest.model_validate_json(body)
                 raw_est = count_messages(fr.messages, fr.system, fr.tools)
-                context_settings = load_profile_settings(profile)
+                context_settings = _profile_context_settings(
+                    load_profile_settings(profile), router_settings
+                )
                 # The router-level QWEN_COGNEE=0 escape hatch must survive the
                 # profile load, including true offline failover.
                 if not settings.qwen_cognee:
@@ -592,8 +725,25 @@ async def create_message(
                     )
                     bare_req = stripped  # only on success: make_bare is pure
                     fr = stripped
-                est = count_messages(fr.messages, fr.system, fr.tools)
+                if context_settings.context_virtualization:
+                    context_prepared = await _prepare_claude_local(
+                        fr, context_settings, failed_over=True
+                    )
+                    fr = context_prepared.payload
+                    if bare_req is not None:
+                        bare_req = fr
+                    else:
+                        prepared_req = fr
+                    est = context_prepared.token_count
+                else:
+                    est = count_messages(fr.messages, fr.system, fr.tools)
                 profile = pick_failover_profile(est)
+            except ContextLimitError:
+                logger.warning("Claude failover context cannot fit the local hard limit")
+                return _mock_response(
+                    fr,
+                    "local inference could not fit this turn; retry when the cloud route recovers",
+                )
             except Exception:
                 # Never let stripping break the failover itself — an unstripped
                 # answer beats no answer. The floor profile still serves it.
@@ -603,7 +753,9 @@ async def create_message(
                 model or "?", profile, est, raw_est, request.url.path,
                 get_breaker(settings).reason,
             )
-        settings = load_profile_settings(profile)
+        settings = _profile_context_settings(
+            load_profile_settings(profile), router_settings
+        )
 
         # An explicit `/model <name>` hit MODEL_ROUTES and so skipped the
         # failover branch above — the only place that stripped. Tiers whose
@@ -631,6 +783,14 @@ async def create_message(
                 bare_req = stripped  # only on success: make_bare is pure
                 est = count_messages(stripped.messages, stripped.system, stripped.tools)
 
+                if settings.context_virtualization:
+                    context_prepared = await _prepare_claude_local(
+                        stripped, settings, failed_over=False
+                    )
+                    stripped = context_prepared.payload
+                    bare_req = stripped
+                    est = context_prepared.token_count
+
                 # Size the tier AFTER stripping, the same ordering and the same
                 # ladder the failover branch uses. Stripping bounds the prompt but
                 # not the transcript, so a long-lived route session outgrows its
@@ -644,12 +804,22 @@ async def create_message(
                             profile, escalated, est, settings.route_max_input_tokens,
                         )
                         profile = escalated
-                        settings = load_profile_settings(profile)
+                        settings = _profile_context_settings(
+                            load_profile_settings(profile), router_settings
+                        )
 
                 logger.info(
                     "→ local [%s → %s] bare in≈%s (raw %s)",
                     model, profile, est, raw_est,
                 )
+            except ContextLimitError as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "Local Qwen cannot fit the current instruction. "
+                        "Start a fresh task with a shorter instruction."
+                    ),
+                ) from exc
             except Exception:
                 # Same rule as failover: stripping must never break the request.
                 # Unstripped may overflow the window, but that surfaces as an
@@ -704,6 +874,30 @@ async def create_message(
             # surfaces as an honest provider error rather than one we invented.
             logger.exception("profile bare-mode failed; sending unstripped")
 
+    if (
+        context_prepared is None
+        and settings.context_virtualization
+        and "qwen" in settings.provider_model.lower()
+    ):
+        try:
+            context_prepared = await _prepare_claude_local(
+                req, settings, failed_over=failed_over
+            )
+        except ContextLimitError as exc:
+            if failed_over:
+                return _mock_response(
+                    req,
+                    "local inference could not fit this turn; retry when the cloud route recovers",
+                )
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Local Qwen cannot fit the current instruction. "
+                    "Start a fresh task with a shorter instruction."
+                ),
+            ) from exc
+        req = context_prepared.payload
+
     fast = _check_optimizations(req, settings)
     if fast:
         return fast
@@ -730,7 +924,9 @@ async def create_message(
     if settings.route_max_input_tokens and est_in > settings.route_max_input_tokens:
         try:
             escalated = pick_failover_profile(est_in)
-            esettings = load_profile_settings(escalated)
+            esettings = _profile_context_settings(
+                load_profile_settings(escalated), router_settings
+            )
             if esettings.provider_model != settings.provider_model:
                 logger.warning(
                     "⇢ TIER ESCALATE [%s → %s] in≈%s over %s",
@@ -791,8 +987,30 @@ async def create_message(
 
     if req.stream:
         input_tokens = est_in
-        body = _stream(client, payload, msg_id, req, input_tokens, provider,
-                       settings.provider_strip_inline_thinking)
+        if context_prepared is not None:
+            runtime = _get_claude_context_runtime(settings)
+            body = runtime.stream_once(
+                context_prepared.request_hash,
+                lambda: _stream(
+                    client,
+                    payload,
+                    msg_id,
+                    req,
+                    input_tokens,
+                    provider,
+                    settings.provider_strip_inline_thinking,
+                ),
+            )
+        else:
+            body = _stream(
+                client,
+                payload,
+                msg_id,
+                req,
+                input_tokens,
+                provider,
+                settings.provider_strip_inline_thinking,
+            )
         if failed_over:
             # Only the failover path: a deliberate `/model qwen` loads a tier
             # too, but the breaker never claimed it and closing must not
@@ -805,7 +1023,14 @@ async def create_message(
         )
 
     try:
-        resp = await client.complete(payload)
+        if context_prepared is not None:
+            runtime = _get_claude_context_runtime(settings)
+            resp = await runtime.run_complete_once(
+                context_prepared.request_hash,
+                lambda: client.complete(payload),
+            )
+        else:
+            resp = await client.complete(payload)
     except ProviderError as e:
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)

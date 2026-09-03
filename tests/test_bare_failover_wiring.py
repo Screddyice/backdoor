@@ -128,6 +128,21 @@ async def test_failed_over_request_arrives_stripped(offline_app):
     assert "When current information would improve the answer" not in sent
 
 
+async def test_failed_over_request_keeps_mutation_tools_when_virtualization_is_disabled(
+    offline_app,
+):
+    """The read-only outage policy belongs to the opt-in context feature."""
+    app, recorder = offline_app
+
+    await _post(app, _harness_request())
+
+    names = [
+        tool.get("function", {}).get("name", "")
+        for tool in (recorder.payload.get("tools") or [])
+    ]
+    assert "Bash" in names
+
+
 async def test_the_users_actual_question_survives(offline_app):
     """Stripping is only correct if the session still makes sense afterwards."""
     app, recorder = offline_app
