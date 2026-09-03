@@ -521,19 +521,35 @@ The service checkout on this machine is a **detached worktree** sharing one repo
 
 Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
 
-The Claude breaker requires the upstream to have been failing for
-`failover_min_outage_seconds` (30 s) before it may open. The gate runs before
-the connectivity probe, so a burst no longer fires one TLS handshake per
-failure.
+Both breakers require the upstream to have been failing for ten seconds
+(`failover_min_outage_seconds`, `codex_failover_min_outage_seconds`) before they
+may open. The gate runs before the connectivity probe, so a burst no longer
+fires one TLS handshake per failure.
 
-Codex uses a different client contract. Codex Desktop surfaces the first 502
-instead of retrying through a threshold or a 30-second hold-down. Its breaker
-uses a one-failure threshold and sets `codex_failover_min_outage_seconds` to
-zero, so the triggering request goes to Qwen. Authentication and request errors
-still bypass failover.
+**Ten, and the number came from the logs rather than taste.** It shipped at 30 s
+on 2026-09-03 and came down the same day. During the gate the router hands the
+client a 502 — the *same* 502 on both paths, from symmetric code — and the one
+real outage after the gate went live cost 60 seconds of them: first failure
+17:50:08, breaker open 17:51:08. Measuring 79 outage bursts across the router
+logs settles it: median 3 s, and a 10 s gate absorbs 64% of bursts where 30 s
+absorbs 69%. Five points of extra protection for triple the user-visible error
+window is a bad trade, and 30% of bursts outlast any gate at all, where the wait
+is pure cost.
 
-During Claude's 30-second gate the real errors are relayed, and Claude Code
-retries through them. That avoids moving a live Claude session onto a local
+**Codex was aligned to the same number, and that is the softer call.** Codex
+Desktop does not retry — it surfaces the 502 — so during the gate a Codex user
+sees a hard error where a Claude user sees a retry banner. PR #91 set its gate to
+zero for exactly that reason, against a 30 s Claude gate. Bringing Claude down to
+10 s removed the asymmetry's justification rather than its cost: the gap is now
+10 s of visible errors against 10 s of retried ones, not 60 s against none. What
+the gate buys on both paths is not loading a 17 GB local tier for a blip, and 48%
+of measured bursts are two seconds or shorter. If Codex 502s prove worse in
+practice than that GPU churn, revert `codex_failover_min_outage_seconds` to zero;
+it is one number and the reasoning is in `config.py`. Authentication and request
+errors still bypass failover on both paths.
+
+During the gate the real errors are relayed, and Claude Code retries through
+them. That avoids moving a live Claude session onto a local
 model for a short link stall.
 
 Worth knowing when reading the log: **a short outage shows as a long open.** Half-open only retries once per `failover_probe_seconds`, so a five-second blip can appear as a 60–90 second open with nothing wrong.
@@ -546,9 +562,9 @@ This is load-bearing rather than politeness: the recovery ticker below makes tra
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `failover_min_outage_seconds` | `30.0` | How long the upstream must stay broken before failover may open |
+| `failover_min_outage_seconds` | `10.0` | How long the upstream must stay broken before failover may open |
 | `failover_notify_cooldown_seconds` | `900.0` | Minimum gap between failover notifications, per breaker |
-| `codex_failover_min_outage_seconds` | `0.0` | Opens Codex failover on the threshold request instead of surfacing a 30-second run of 502s |
+| `codex_failover_min_outage_seconds` | `10.0` | Same gate as Claude. Was `0.0` while Claude's gate was 30 s; see above for why aligning them was the better trade |
 | `codex_failover_notify_cooldown_seconds` | `900.0` | The same rationing for the Codex breaker |
 
 ### Recovery does not wait for traffic
