@@ -74,10 +74,9 @@ class Settings(BaseSettings):
     # (see FAILOVER_LADDER), measured AFTER bare-mode stripping — the size that
     # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
-    # 2026-08-25: the abliterated 27B on MLX, by explicit decision. It is not
-    # lazily loaded like the Ollama tiers, so routes.py starts it on demand and
-    # drops to local-failover-heavy (9B) when it will not come up. See
-    # src/proxy/mlx_admin.py.
+    # The default 27B is an Ollama tier and loads on demand. The optional MLX
+    # action checkpoint has its own runtime supervisor and falls back to the
+    # 4B fast profile when its launchd service cannot start.
     failover_profile: str = "local-qwen38-obliterated"  # default tier
     # Probe on the first transport failure. The connectivity probe remains the
     # safety gate: local failover opens only when the host is offline. Waiting
@@ -220,6 +219,14 @@ class Settings(BaseSettings):
     # to keep in sync for no benefit.
     route_bare: bool = False
 
+    # Operator instructions appended to `bare.ROUTE_SYSTEM` on the `/model <name>`
+    # route path. Stripping replaces the WHOLE system prompt, which silently
+    # deleted rules the session is still expected to follow: the qwen wrapper
+    # injects the PR-per-branch rule with `--append-system-prompt`, and ROUTE_BARE
+    # then threw it away, so a routed session never saw it. Relative paths resolve
+    # against the repo cwd, the same way `profiles/` does. Empty disables.
+    route_system_file: str = "prompts/qwen-pr-rules.md"
+
     # Largest post-strip session this tier will accept on an explicit
     # `/model <name>` route. 0 disables the check.
     #
@@ -327,13 +334,9 @@ def resolve_model_route(model: str | None) -> str | None:
 MODEL_ROUTES: dict[str, str] = {
     "qwen": "local-qwen38-obliterated",  # Qwen3.8-27B OBLITERATED GGUF on Ollama
     "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
-    "qwen-9b": "local-qwen-9b",   # qwen3.5:9b-64k — stronger brain for subagents
     "qwen38-obliterated": "local-qwen38-obliterated",
     # Keep the action-tuned MLX checkpoint reachable as an explicit rollback.
     "qwen38-action": "local-qwen38-action",
-    # The stock 9B, still reachable by name. This is what to type when you want
-    # a model with its refusal behaviour intact.
-    "qwen-stock": "local-failover-heavy",
 }
 
 
@@ -366,6 +369,24 @@ def pick_failover_profile(est_input_tokens: int) -> str:
         if est_input_tokens <= bound:
             return profile
     return FAILOVER_LADDER[-1][1]
+
+
+@lru_cache(maxsize=4)
+def load_route_system_extra(path: str) -> str | None:
+    """Operator instructions appended to ROUTE_SYSTEM, or None.
+
+    A missing or unreadable file is deliberately not fatal — the route still
+    works, it just carries ROUTE_SYSTEM alone. Failing the request over a
+    documentation file would be a worse outcome than losing the rules. Cached
+    because this is consulted per request.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
 
 
 @lru_cache(maxsize=8)

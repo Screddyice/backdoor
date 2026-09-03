@@ -47,7 +47,8 @@
 #     (deploy/registry.example.toml shows the shape).
 #
 # The MCP endpoint is served at /mcp. OAuth deployments also proxy /login,
-# /authorize, /token, /register, and /.well-known/oauth-* to this process.
+# /login/complete, /authorize, /token, /register, and /.well-known/oauth-* to
+# this process.
 
 [Unit]
 Description=Hermes MCP bridge — HTTP MCP surface for Hermes gateways

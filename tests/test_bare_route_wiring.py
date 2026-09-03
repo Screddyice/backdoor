@@ -75,6 +75,8 @@ def _harness_request(model: str = "qwen") -> dict:
         "tools": [
             {"name": "Bash", "description": "run a command", "input_schema": {}},
             {"name": "Read", "description": "read a file", "input_schema": {}},
+            {"name": "WebSearch", "description": "search the web", "input_schema": {}},
+            {"name": "WebFetch", "description": "fetch a URL", "input_schema": {}},
             {"name": "mcp__plugin_mem0_mem0__search_memories",
              "description": "recall", "input_schema": {}},
         ],
@@ -117,8 +119,28 @@ async def test_explicit_route_arrives_stripped(routed_app):
     assert "Z" * 5000 not in sent, "80KB tool result survived the strip"
 
     names = [t.get("function", {}).get("name", "") for t in (recorder.payload.get("tools") or [])]
-    assert "Bash" in names and "Read" in names, names
+    assert {"Bash", "Read", "WebSearch", "WebFetch"}.issubset(names), names
     assert not any(n.startswith("mcp__") for n in names), names
+    assert "When current information would improve the answer" in sent
+    assert "lost its network connection" not in sent
+
+
+async def test_explicit_route_externalizes_large_fetched_page(routed_app):
+    """The GUI may vary; the provider request crossing Backdoor is the seam."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True)
+    body = _harness_request()
+    body["messages"][1]["content"][0]["name"] = "WebFetch"
+    body["messages"][1]["content"][0]["input"] = {"url": "https://example.com/report"}
+    body["messages"].append({"role": "user", "content": "What does the report say?"})
+
+    resp = await _post(app, body)
+
+    assert resp.status_code == 200
+    sent = json.dumps(recorder.payload)
+    assert "<qwen-external-context" in sent
+    assert "https://example.com/report" in sent
+    assert "Z" * 10_000 not in sent
 
 
 async def test_explicit_route_externalizes_large_fetched_page(routed_app):
@@ -148,11 +170,10 @@ async def test_the_users_actual_question_survives(routed_app):
 
 
 async def test_route_without_route_bare_is_left_alone(routed_app):
-    """The 64K tiers (`qwen-fast`, `qwen-9b`) must NOT be stripped.
+    """The 64K `qwen-fast` tier must NOT be stripped.
 
     Blanket-stripping every MODEL_ROUTES hit would silently delete the system
-    prompt and MCP tools out from under the fusion subagent, which is a worse
-    bug than the one being fixed.
+    prompt and MCP tools out from under callers that selected the full profile.
     """
     app, recorder, monkeypatch = routed_app
     _pin(monkeypatch, route_bare=False)
@@ -188,3 +209,66 @@ def test_qwen_route_targets_a_profile_that_declares_route_bare():
         f"MODEL_ROUTES['qwen'] -> {profile}, which does not set ROUTE_BARE. "
         "A full harness session will overflow its 32K window."
     )
+
+
+# --- the replacement system prompt --------------------------------------
+#
+# Stripping is only half the job: something has to stand in for the prompt that
+# was removed. The route path shipped using the FAILOVER text, which told a
+# perfectly healthy session it had "lost its network connection" — and took the
+# operator rules with it, because make_bare replaces `system` wholesale and the
+# qwen wrapper's `--append-system-prompt` copy lived there.
+
+
+async def test_route_is_not_told_it_is_in_an_outage(routed_app):
+    """A `/model qwen` switch is a choice, not a failure. Saying otherwise makes
+    the model hedge and decline work it can actually do."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True, route_system_file="")
+
+    await _post(app, _harness_request())
+
+    sent = json.dumps(recorder.payload)
+    assert "lost its network connection" not in sent, "route path got the FAILOVER prompt"
+    assert "chosen on purpose" in sent, sent[:400]
+
+
+async def test_operator_rules_survive_the_strip(routed_app, tmp_path):
+    """The rules the wrapper injects must reach the model on this path too."""
+    app, recorder, monkeypatch = routed_app
+    rules = tmp_path / "rules.md"
+    rules.write_text("EVERY BRANCH GETS A PR.\n", encoding="utf-8")
+    _pin(monkeypatch, route_bare=True, route_system_file=str(rules))
+
+    await _post(app, _harness_request())
+
+    assert "EVERY BRANCH GETS A PR." in json.dumps(recorder.payload)
+
+
+async def test_missing_rules_file_still_routes(routed_app, tmp_path):
+    """A documentation file must never be able to fail a request."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True, route_system_file=str(tmp_path / "nope.md"))
+
+    resp = await _post(app, _harness_request())
+
+    assert resp.status_code == 200
+    assert "chosen on purpose" in json.dumps(recorder.payload)
+
+
+def test_failover_keeps_the_outage_prompt():
+    """The route change must not leak into failover, where the text IS true."""
+    from src.proxy.bare import OFFLINE_SYSTEM, ROUTE_SYSTEM, make_bare
+    from src.proxy.models import MessagesRequest
+
+    req = MessagesRequest.model_validate({
+        "model": "claude-opus-5",
+        "system": "harness",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    # The failover branch in routes.py passes OFFLINE_SYSTEM explicitly; the
+    # route path passes its own. Neither text leaks into the other.
+    assert make_bare(req, system=OFFLINE_SYSTEM).system == OFFLINE_SYSTEM
+    assert "lost its network connection" in OFFLINE_SYSTEM
+    assert "lost its network connection" not in ROUTE_SYSTEM

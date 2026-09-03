@@ -2,7 +2,9 @@
 
 import base64
 import hashlib
+import html
 import json
+import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -37,6 +39,12 @@ INITIALIZE_BODY = {
         "clientInfo": {"name": "claude-connector-test", "version": "1"},
     },
 }
+
+
+def _completion_target(response) -> str:
+    match = re.search(r'<a href="([^"]+)">Continue to Claude</a>', response.text)
+    assert match is not None
+    return html.unescape(match.group(1))
 
 
 def _oauth_env(monkeypatch, state_path: Path) -> None:
@@ -173,10 +181,21 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
             data={"state": login_state, "password": PASSWORD},
             follow_redirects=False,
         )
-        # 303 forces the browser to follow the successful form POST with GET.
-        # A 302 allowed Comet to replay POST /login after the state was consumed.
         assert approved.status_code == 303
-        redirect = urlparse(approved.headers["location"])
+        assert approved.headers["cache-control"] == "no-store"
+        assert approved.headers["pragma"] == "no-cache"
+        assert approved.headers["referrer-policy"] == "no-referrer"
+        completion = urlparse(approved.headers["location"])
+        assert f"{completion.scheme}://{completion.netloc}{completion.path}" == (
+            f"{ISSUER}/login/complete"
+        )
+
+        callback = client.get(approved.headers["location"], follow_redirects=False)
+        assert callback.status_code == 200
+        assert callback.headers["cache-control"] == "no-store"
+        assert callback.headers["pragma"] == "no-cache"
+        assert callback.headers["referrer-policy"] == "no-referrer"
+        redirect = urlparse(_completion_target(callback))
         query = parse_qs(redirect.query)
         assert f"{redirect.scheme}://{redirect.netloc}{redirect.path}" == REDIRECT_URI
         assert query["state"] == ["claude-state"]
@@ -261,6 +280,89 @@ def test_oauth_mode_supports_claude_login_tokens_refresh_and_mcp(monkeypatch, tm
         persisted["access_tokens"][refreshed_tokens["access_token"]]["resource"]
         == f"{ISSUER}/mcp"
     )
+
+
+def test_login_uses_completion_get_and_tolerates_duplicate_submit(
+    monkeypatch, tmp_path
+):
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        registration = _register(client)
+        login_state, _ = _authorize(client, registration)
+
+        unapproved_completion = client.get(
+            "/login/complete",
+            params={"state": login_state},
+            follow_redirects=False,
+        )
+        assert unapproved_completion.status_code == 400
+
+        approved = client.post(
+            "/login",
+            data={"state": login_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert approved.status_code == 303
+        completion = urlparse(approved.headers["location"])
+        assert f"{completion.scheme}://{completion.netloc}{completion.path}" == (
+            f"{ISSUER}/login/complete"
+        )
+        assert parse_qs(completion.query)["state"] == [login_state]
+
+        repeated = client.post(
+            "/login",
+            data={"state": login_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert repeated.status_code == 303
+        assert repeated.headers["location"] == approved.headers["location"]
+
+        callback = client.get(approved.headers["location"], follow_redirects=False)
+        assert callback.status_code == 200
+        assert "location" not in callback.headers
+        assert "Continue to Claude" in callback.text
+        assert 'href="https://client.example/callback?code=mcp_' in callback.text
+        assert "&amp;state=claude-state" in callback.text
+        assert (
+            client.get(approved.headers["location"], follow_redirects=False).status_code
+            == 400
+        )
+
+
+def test_login_and_completion_reject_state_after_pending_ttl(monkeypatch, tmp_path):
+    now = [100.0]
+    monkeypatch.setattr("src.hermes_mcp.oauth.time.monotonic", lambda: now[0])
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        registration = _register(client)
+        login_state, _ = _authorize(client, registration)
+        approved = client.post(
+            "/login",
+            data={"state": login_state, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert approved.status_code == 303
+
+        now[0] += 601
+        assert (
+            client.get(approved.headers["location"], follow_redirects=False).status_code
+            == 400
+        )
+        assert client.get("/login", params={"state": login_state}).status_code == 400
+        assert (
+            client.post(
+                "/login",
+                data={"state": login_state, "password": PASSWORD},
+                follow_redirects=False,
+            ).status_code
+            == 400
+        )
 
 
 def test_login_throttle_is_global_but_never_blocks_the_correct_password(
@@ -411,7 +513,8 @@ def test_authorization_enforces_resource_and_pkce_code_is_single_use(
             data={"state": login_state, "password": PASSWORD},
             follow_redirects=False,
         )
-        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        callback = client.get(approved.headers["location"], follow_redirects=False)
+        code = parse_qs(urlparse(_completion_target(callback)).query)["code"][0]
         token_data = {
             "grant_type": "authorization_code",
             "code": code,
