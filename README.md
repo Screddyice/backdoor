@@ -87,13 +87,20 @@ The harness is free. The intelligence is cheap. That's the whole point.
 
 ### Measure it for your own usage
 
-`scripts/claude-savings-report.py` measures what the local router and prompt caching saved. It deliberately does NOT count llm-jury or its OpenRouter ladder: that is a separate system, on a separate provider, running different models, with its own billing. The script used to read `~/.llmjury/.env` for an API key and call OpenRouter to fold that spend in. Backdoor has no business holding another system's key, and a report mixing the two answers neither question cleanly.
+`scripts/claude-savings-report.py` produces one weekly model-economics report with separate
+figures for each path:
 
-It turns the numbers above into a weekly report on *your*
-traffic. It reads Claude Code's own transcript logs (`~/.claude/projects/**/*.jsonl`), separates
-turns actually routed through Backdoor (local Ollama, OpenRouter) from turns that went straight
-to Claude, and reports $ saved against what that same work would have cost at metered API
-pricing.
+- Local open-source models: measured Claude and Codex turns served by Qwen, Gemma, Llama, or
+  Phi on this Mac, compared with the configured Claude counterfactual.
+- OpenRouter: measured account spend, netted against a configurable Codex/Opus-class cost ratio.
+- Codex: measured token usage from `~/.codex/sessions/**/*.jsonl`, valued at configurable metered
+  API rates and netted against the weekly Codex plan cost.
+
+The script also reads Claude Code's transcript logs (`~/.claude/projects/**/*.jsonl`) to show
+first-party Claude usage and local-model turns. Each source stays in its own row, so the total
+does not hide which savings are measured and which depend on a counterfactual. OpenRouter
+provides daily, weekly, and monthly spend counters; other `--days` windows exclude its row from
+the total rather than mixing periods.
 
 Prompt caching is tracked as a separate efficiency stat, never counted as dollars saved — on a
 flat-rate subscription plan there's no per-token bill for it to discount off of.
@@ -104,9 +111,9 @@ python3 scripts/claude-savings-report.py --dry-run   # preview, writes and email
 ```
 
 Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
-`SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it. Every counterfactual — the pricing
-model, the subscription cost, the plan's usage band — is a tunable env var documented in the
-script's own header.
+`SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it. The local-model counterfactual,
+OpenRouter ratio, Codex token rates, subscription costs, and Claude plan assumptions are tunable
+through the `SAVINGS_*` environment variables defined near the top of the script.
 
 ---
 
