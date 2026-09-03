@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-LIVE_PLIST = Path.home() / "Library/LaunchAgents/com.screddy.backdoor-router.plist"
-LIVE_CHECKOUT = Path.home() / "projects/SRC/backdoor-service"
+LIVE_HOME = Path("/Users/screddy")
+LIVE_PLIST = LIVE_HOME / "Library/LaunchAgents/com.screddy.backdoor-router.plist"
+LIVE_CHECKOUT = LIVE_HOME / "projects/SRC/backdoor-service"
 ROUTER_LABEL = "com.screddy.backdoor-router"
 
 FILE_MUTATION_TOOLS = {"write", "edit", "multiedit", "apply_patch"}
