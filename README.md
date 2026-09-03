@@ -464,6 +464,28 @@ What each route does now when upstream will not answer:
 
 Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
 
+### Deploying: scripts/deploy-router.sh
+
+Deploying the router is a fast-forward and a restart, and on 2026-09-03 doing it as a list of shell lines went wrong in the dullest way available: the two git steps failed, the restart at the bottom ran anyway, and the router came back on unchanged code having dropped every in-flight request. Every live session reported an API error. Nothing deployed, and something still broke.
+
+`scripts/deploy-router.sh` exists so that cannot happen. It cannot half-run:
+
+- every step is gated on the previous one, including the restart command being present — checked in preflight, because discovering it late would leave the checkout advanced and the old code serving
+- a checkout already at the target exits `0` **without restarting**; a restart that changes no code is pure cost
+- it waits for the log to go quiet first, since a restart kills in-flight requests and there is no zero-downtime path here (socket activation on 8083/8084 is forbidden on this machine after the 2026-08-31 experiments were reverted)
+- it verifies the **new** code is running by finding the startup marker in the log written *after* the restart, not merely that something restarted
+- it rolls back and restarts again automatically when that verification fails
+
+The restart itself is not in the file. It arrives in `RESTART_CMD`, supplied by whoever runs the deploy, because operating this machine's live control plane is a human's job and the repo should not encode one host's launch agent.
+
+```bash
+RESTART_CMD='<restart the router>' scripts/deploy-router.sh <service-checkout-dir> [ref]
+```
+
+`DRY_RUN=1` prints the plan and changes nothing. `FORCE=1` skips the quiet wait and accepts that in-flight requests will fail. `QUIET_SECONDS` / `QUIET_TIMEOUT` tune the wait.
+
+The service checkout on this machine is a **detached worktree** sharing one repository with about twenty others, so the script fast-forwards the detached HEAD and never runs `git checkout <branch>` — that collides with whichever worktree holds the branch.
+
 ### Opening needs a sustained outage, not a fast one
 
 Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
