@@ -46,6 +46,7 @@ import asyncio
 import contextlib
 import logging
 import ssl
+import time
 from typing import Callable, Iterable
 
 from .ca import LocalCA
@@ -62,6 +63,11 @@ _HANDSHAKE_TIMEOUT = 30.0
 _IDLE_TIMEOUT = 660.0
 _MAX_CONNECTIONS = 512
 _CHUNK = 64 * 1024
+# How often to summarise tunnels a client opened and dropped before TLS. One
+# line per occurrence spent about a third of an 8-day 10 MB rotation on an
+# event that carries no information: same host every time, two exception
+# shapes, and Claude Code's own connection pool as the cause.
+_ABANDON_SUMMARY_INTERVAL = 300.0
 
 _ESTABLISHED = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 
@@ -198,10 +204,19 @@ class ForwardProxy:
         ca: LocalCA,
         idle_timeout: float = _IDLE_TIMEOUT,
         max_connections: int = _MAX_CONNECTIONS,
+        now: Callable[[], float] = time.monotonic,
+        abandon_summary_interval: float = _ABANDON_SUMMARY_INTERVAL,
     ) -> None:
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.mitm_hosts = {h.strip().lower() for h in mitm_hosts if h.strip()}
+        self._now = now
+        self._abandon_summary_interval = abandon_summary_interval
+        # Reset by each summary, so the count a summary reports is the count
+        # since the previous one rather than since the process started.
+        self.abandoned_tunnels = 0
+        self._abandoned_by_kind: dict[str, int] = {}
+        self._abandoned_summarised_at = now()
         self.router_host = router_host
         self.router_port = router_port
         self.ca = ca
@@ -302,6 +317,49 @@ class ForwardProxy:
         finally:
             _close(writer)
 
+    _ABANDON_KINDS = {
+        "ConnectionResetError": "reset",
+        "TimeoutError": "handshake timeout",
+    }
+
+    def _note_abandoned_tunnel(self, host: str, exc: BaseException) -> None:
+        """Count a CONNECT tunnel the client dropped before TLS started.
+
+        Claude Code and Codex both reach the router through this proxy, and both
+        pool their sockets: a pooled connection that turns out not to be needed
+        goes away either as an RST (`ConnectionResetError`) or as 30 silent
+        seconds (`TimeoutError` from the handshake deadline). Neither is a
+        fault, and neither line differs from the last one — same host, same two
+        shapes. Over the 8 days ending 2026-09-03 that came to 33,557 lines,
+        roughly a third of a 10 MB rotation, and it buried the 25 lines that
+        did matter (`TLSV1_ALERT_UNKNOWN_CA`, a client that cannot use the
+        router at all).
+
+        So count them and say so once per interval. Deliberately no
+        per-occurrence line, not even at DEBUG: `configure_logging` sets the
+        root logger to DEBUG, so a debug call here would write every one of
+        those 33,557 lines to the same file under a different label.
+        """
+        self.abandoned_tunnels += 1
+        kind = self._ABANDON_KINDS.get(type(exc).__name__, type(exc).__name__)
+        self._abandoned_by_kind[kind] = self._abandoned_by_kind.get(kind, 0) + 1
+
+        now = self._now()
+        elapsed = now - self._abandoned_summarised_at
+        if elapsed < self._abandon_summary_interval:
+            return
+        breakdown = ", ".join(
+            f"{count} {name}" for name, count in sorted(self._abandoned_by_kind.items())
+        )
+        logger.info(
+            "%d %s tunnel(s) dropped before TLS in the last %.0fs (%s) — "
+            "client connection-pool churn, not CA distrust",
+            self.abandoned_tunnels, host, elapsed, breakdown,
+        )
+        self.abandoned_tunnels = 0
+        self._abandoned_by_kind = {}
+        self._abandoned_summarised_at = now
+
     async def _dispatch(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -365,6 +423,7 @@ class ForwardProxy:
             await writer.drain()
             return
 
+        spliced = False
         try:
             # Mint BEFORE announcing the tunnel. On first use for a host this is
             # a blocking RSA keygen (two, if the CA itself is being created), so
@@ -404,6 +463,7 @@ class ForwardProxy:
                 writer.start_tls(ctx), timeout=_HANDSHAKE_TIMEOUT
             )
 
+            spliced = True
             await _splice(
                 reader,
                 writer,
@@ -412,9 +472,28 @@ class ForwardProxy:
                 idle_timeout=self.idle_timeout,
             )
         except (ssl.SSLError, ConnectionResetError, TimeoutError) as exc:
-            # A client that does not trust our CA aborts here. Expected whenever
-            # something other than the configured launcher hits the proxy.
-            logger.info("TLS interception for %s ended early: %s", host, exc)
+            # One clause, three very different events. Separating them is the
+            # whole point: see `_note_abandoned_tunnel` for what the old shared
+            # `TLS interception for %s ended early` line cost.
+            if spliced:
+                # `_pipe` swallows every one of these, and `_splice` gathers its
+                # tasks with return_exceptions=True, so nothing here should be
+                # reachable after the handshake. If it ever is, that is news.
+                logger.warning(
+                    "spliced %s tunnel failed after TLS (%s): %s",
+                    host, type(exc).__name__, exc,
+                )
+            elif isinstance(exc, ssl.SSLError):
+                # The one that means a client on this machine cannot reach the
+                # router at all, and the one worth a line every time: 25 in the
+                # 8 days ending 2026-09-03, against 33,557 benign drops.
+                logger.warning(
+                    "TLS interception for %s refused by the client (%s) — "
+                    "that client does not trust the router CA at %s",
+                    host, exc, self.ca.ca_cert_path,
+                )
+            else:
+                self._note_abandoned_tunnel(host, exc)
         finally:
             _close(r_writer)
 

@@ -611,6 +611,23 @@ A dead stream still runs the connectivity probe before anything opens. If Anthro
 Hanging up yourself does not count. `CancelledError` and `GeneratorExit` are not `httpx.TransportError`, so pressing Ctrl-C never pushes the breaker toward claiming the GPU.
 
 
+### A local tier that stops answering
+
+`API Error: 500 Internal server error` is what Claude Code shows you when a server breaks, and until now Backdoor could write one itself.
+
+Both local-provider call sites caught `ProviderError`, which covers a status Ollama returned and nothing else. A transport failure matched neither clause. In practice that meant `httpx.ReadTimeout` against a tier still prefilling past the 600s read budget: the exception escaped to uvicorn, uvicorn answered `500`, and the router log named neither the tier nor the timeout. It fired 62 times between 2026-08-26 16:19 and 2026-09-02 23:56, the last stretch of them every ten minutes on a scheduled caller.
+
+Both paths now answer for themselves:
+
+| | |
+|---|---|
+| Completion | `504` on a timeout and `502` on anything else, with the tier name in the body, so your client keeps its own retry and backoff |
+| Stream | An SSE `error` event, because the headers left with the first heartbeat and no status remains to send |
+| Either | One `Provider transport failure on <tier>` line carrying the exception name |
+
+The cloud side had the quieter half of the same problem. A relayed upstream error carried no status into the log, so a `500` from Anthropic and a turn that worked both printed `→ passthrough [claude-opus-5] /v1/messages` and nothing more. One session hit that on 2026-09-03 at 21:24, and the log could not tell you which side wrote the error. Backdoor now logs `upstream POST /v1/messages → 500 (relayed verbatim)` at WARNING for every relayed status at or above 400. Healthy turns still cost one line each.
+
+
 ### Forward-proxy mode: failover *and* Remote Control
 
 Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
@@ -724,6 +741,29 @@ create a second, unbounded copy under `/tmp`.
 | `FORWARD_CA_DIR` | `~/.backdoor/ca` | CA and minted leaves |
 
 Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
+
+#### What the proxy log tells you, and what it used to bury
+
+Three things can end an intercepted connection early, and `_intercept` caught all three in one clause and logged them under one message: `TLS interception for api.anthropic.com ended early`. The comment above it blamed a client that does not trust the router CA. Count them over the 8 days ending 2026-09-03 and that story falls apart:
+
+| Exception | Occurrences | What it means |
+|---|---|---|
+| `ConnectionResetError` | 33,092 | The client dropped a pooled tunnel with an RST |
+| `TimeoutError` | 465 | The client took the `200` and never sent a ClientHello |
+| `ssl.SSLError: TLSV1_ALERT_UNKNOWN_CA` | 25 | The client does not trust the router CA |
+
+Claude Code and Codex both pool their sockets, so the first two rows are pool churn and neither is a fault. They also cost about a third of a 10 MB rotation, and they buried the 25 lines that matter. A client hitting that third row cannot reach the router at all, which is worth reading on the day it happens rather than after `grep -c`.
+
+Each one now gets its own treatment:
+
+| | |
+|---|---|
+| CA distrust | WARNING every time, naming the host and the path to the CA the client needs to trust |
+| Dropped before TLS | Counted, then one INFO line per 5 minutes with the total and the split between resets and handshake timeouts |
+| Failure after the splice starts | WARNING, because `_pipe` swallows all three and `_splice` gathers with `return_exceptions=True`, so this should be unreachable. If it ever fires, that is news |
+
+There is no per-occurrence line for the dropped tunnels, DEBUG included. `configure_logging` puts the root logger at DEBUG, so a debug call would write all 33,557 of them to the same file under a quieter label.
+
 
 #### Do not run the service from your dev checkout
 
