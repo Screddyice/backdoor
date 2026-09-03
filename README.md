@@ -510,6 +510,8 @@ The restart itself is not in the file. It arrives in `RESTART_CMD`, supplied by 
 RESTART_CMD='<restart the router>' scripts/deploy-router.sh <service-checkout-dir> [ref]
 ```
 
+`ref` defaults to **`origin/main`**. It pointed at the deployed feature branch until 2026-09-03, when that branch merged into `main` — and a default aimed at a merged branch is worse than a wrong one, because the branch never advances again and the script correctly reports "already at the target" forever while the router falls further behind.
+
 `DRY_RUN=1` prints the plan and changes nothing. `FORCE=1` skips the quiet wait and accepts that in-flight requests will fail. `QUIET_SECONDS` / `QUIET_TIMEOUT` tune the wait.
 
 The service checkout on this machine is a **detached worktree** sharing one repository with about twenty others, so the script fast-forwards the detached HEAD and never runs `git checkout <branch>` — that collides with whichever worktree holds the branch.
