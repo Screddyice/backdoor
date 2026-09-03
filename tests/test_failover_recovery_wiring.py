@@ -243,9 +243,14 @@ def test_the_ticker_recovers_the_codex_breaker_through_its_service_probe(monkeyp
     )
 
     try:
+        codex.record_failure("ConnectTimeout")
+        # The outage has to have LASTED, not just happened: concurrent requests
+        # make a burst of failures one instant. Wind the first-failure stamp back
+        # rather than sleeping the real min_outage in a unit test.
+        codex._first_failure_at -= settings.codex_failover_min_outage_seconds + 1
         for _ in range(settings.codex_failover_threshold):
             codex.record_failure("ConnectTimeout")
-        assert codex.open, "consecutive transport failures open the Codex breaker"
+        assert codex.open, "a sustained run of transport failures opens it"
 
         reachable[0] = True                      # ChatGPT is back
         # This breaker runs on the real clock (get_codex_breaker takes no
@@ -269,4 +274,41 @@ def test_the_ticker_recovers_the_codex_breaker_through_its_service_probe(monkeyp
         assert not codex.open, "the ticker closed it with no Codex request at all"
         assert released == [codex]
     finally:
+        codex_routes._codex_breaker = None
+
+
+# ── The policy the router actually runs ──────────────────────────────────────
+#
+# FailoverBreaker leaves min_outage and notify_cooldown at zero so the state
+# machine stays a state machine. That makes the wiring the only thing standing
+# between production and a breaker that trips on a millisecond, so it is pinned
+# here rather than left to inspection.
+
+
+def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch):
+    import src.proxy.codex_routes as codex_routes
+
+    settings = Settings()
+    assert settings.failover_min_outage_seconds == 30.0
+    assert settings.failover_notify_cooldown_seconds == 900.0
+    assert settings.codex_failover_min_outage_seconds == 30.0
+    assert settings.codex_failover_notify_cooldown_seconds == 900.0
+
+    monkeypatch.setattr(routes, "_breaker", None)
+    monkeypatch.setattr(codex_routes, "_codex_breaker", None)
+    try:
+        claude = routes.get_breaker(settings)
+        codex = codex_routes.get_codex_breaker(settings)
+        for breaker, min_outage, cooldown in (
+            (claude, settings.failover_min_outage_seconds,
+             settings.failover_notify_cooldown_seconds),
+            (codex, settings.codex_failover_min_outage_seconds,
+             settings.codex_failover_notify_cooldown_seconds),
+        ):
+            assert breaker.min_outage == min_outage, (
+                "a breaker with no duration gate trips on one instant of failures"
+            )
+            assert breaker.notify_cooldown == cooldown
+    finally:
+        routes._breaker = None
         codex_routes._codex_breaker = None

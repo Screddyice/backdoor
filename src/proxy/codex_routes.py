@@ -94,6 +94,8 @@ def get_codex_breaker(settings: Settings) -> FailoverBreaker:
             source="codex",
             upstream_name="ChatGPT Codex",
             require_offline=settings.codex_failover_require_offline,
+            min_outage=settings.codex_failover_min_outage_seconds,
+            notify_cooldown=settings.codex_failover_notify_cooldown_seconds,
             # Reachability of the Codex host itself, which is the only thing
             # this router can ask on its own: it relays the caller's credentials
             # and holds none, so it cannot make an authenticated Codex request

@@ -906,3 +906,142 @@ def test_service_reachable_reports_false_for_an_unparseable_url(monkeypatch):
         lambda *a, **k: pytest.fail("must not dial when there is no host"),
     )
     assert service_reachable("") is False
+
+
+# ── Failing fast is not the same as failing for long ─────────────────────────
+#
+# Requests are concurrent, so a "consecutive failure" count can be satisfied in
+# one instant. Measured 2026-09-03 14:46:18.113: four transport failures in the
+# SAME MILLISECOND, all `[Errno 8] nodename nor servname provided` from one DNS
+# hiccup. Any threshold trips on that, which is why the real guard is elapsed
+# time — see Settings.failover_min_outage_seconds.
+
+
+def test_a_burst_of_failures_in_one_instant_does_not_open_the_breaker():
+    """The 14:46:18.113 shape: four failures, same millisecond, offline probe."""
+    clock = Clock()
+    br, notes = make(clock, threshold=1, min_outage=30.0)
+    for _ in range(4):
+        assert br.record_failure("ConnectError") is False
+    assert not br.open, "one instant of failure is not an outage"
+    assert notes == [], "and nothing to interrupt the human about"
+
+
+def test_the_breaker_opens_once_the_outage_has_lasted():
+    clock = Clock()
+    br, notes = make(clock, threshold=1, min_outage=30.0)
+    assert br.record_failure("ConnectError") is False
+
+    clock.t += 29.0
+    assert br.record_failure("ConnectError") is False, "29s is not yet 30s"
+
+    clock.t += 1.0
+    assert br.record_failure("ConnectError") is True
+    assert br.open
+    assert len(notes) == 1
+
+
+def test_a_recovered_upstream_restarts_the_clock():
+    """A success in the middle means the next outage is measured from scratch."""
+    clock = Clock()
+    br, _ = make(clock, threshold=1, min_outage=30.0)
+    br.record_failure("ConnectError")
+    clock.t += 25.0
+    br.record_success()                      # cloud came back
+
+    br.record_failure("ConnectError")
+    clock.t += 25.0
+    assert br.record_failure("ConnectError") is False, (
+        "the earlier failures must not count toward this outage"
+    )
+    assert not br.open
+
+
+def test_the_duration_gate_runs_before_the_connectivity_probe():
+    """The probe is a TLS handshake; a burst must not fire one per failure."""
+    clock = Clock()
+    probes = []
+    br, _ = make(
+        clock,
+        threshold=1,
+        min_outage=30.0,
+        online_fn=lambda: (probes.append(clock.t), False)[1],
+    )
+    for _ in range(5):
+        br.record_failure("ConnectError")
+    assert probes == [], "nothing worth probing until the outage has lasted"
+
+    clock.t += 30.0
+    br.record_failure("ConnectError")
+    assert len(probes) == 1
+
+
+# ── Rationing the interruption ───────────────────────────────────────────────
+#
+# Sixteen desktop notifications on the evening of 2026-09-02. The log keeps every
+# transition; the popup is for the human, and the recovery ticker makes
+# transitions MORE frequent, so this has to exist for the ticker to be a net win.
+
+
+def test_a_second_outage_inside_the_cooldown_is_silent():
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    assert br.open and len(notes) == 1
+    br.record_success()
+    assert len(notes) == 2, "the first outage announces both ends"
+
+    clock.t += 60.0
+    br.record_failure("ConnectError")
+    assert br.open, "the breaker still opens — only the notification is rationed"
+    br.record_success()
+    assert len(notes) == 2, "a flap inside the cooldown says nothing"
+
+
+def test_a_suppressed_outage_does_not_announce_its_recovery():
+    """An orphan "back to cloud" for an outage you were never told about is worse
+    than silence — it reads as a bug."""
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    br.record_success()
+    notes.clear()
+
+    clock.t += 10.0
+    br.record_failure("ConnectError")
+    br.record_success()
+    assert notes == []
+
+
+def test_an_outage_after_the_cooldown_speaks_again():
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    br.record_success()
+    notes.clear()
+
+    clock.t += 901.0
+    br.record_failure("ConnectError")
+    assert len(notes) == 1
+    br.record_success()
+    assert len(notes) == 2
+
+
+def test_every_transition_is_still_logged_even_when_silent(caplog):
+    """Rationing the popup must not ration the record."""
+    import logging
+
+    clock = Clock()
+    br, notes = make(clock, threshold=1, notify_cooldown=900.0)
+    br.record_failure("ConnectError")
+    br.record_success()
+    notes.clear()
+
+    with caplog.at_level(logging.WARNING, logger="src.proxy.failover"):
+        clock.t += 5.0
+        br.record_failure("ConnectError")
+        br.record_success()
+
+    text = caplog.text
+    assert "failover OPEN" in text and "failover CLOSED" in text
+    assert notes == []

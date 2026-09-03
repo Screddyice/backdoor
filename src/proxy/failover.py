@@ -336,6 +336,17 @@ class FailoverBreaker:
         source: str = "anthropic",
         upstream_name: str = "Anthropic",
         require_offline: bool = True,
+        # Deliberately inert by default, unlike `threshold` above. These two are
+        # policy — how long to tolerate a broken upstream, and how often to
+        # interrupt the human — and the router sets them from
+        # Settings.failover_min_outage_seconds (30s) and
+        # Settings.failover_notify_cooldown_seconds (900s). A zero default keeps
+        # this class a pure state machine that opens the moment its inputs say
+        # to, which is what the mechanics tests are about; the wiring is pinned
+        # separately in tests/test_failover_recovery_wiring.py so a breaker
+        # constructed without the policy cannot reach production unnoticed.
+        min_outage: float = 0.0,
+        notify_cooldown: float = 0.0,
         # Reachability probe for THIS breaker's own upstream, used to reconsider
         # a service-level breaker. Injected like online_fn so the state machine
         # stays testable with no transport. See maybe_recover.
@@ -351,6 +362,12 @@ class FailoverBreaker:
         self.source = source
         self.upstream_name = upstream_name
         self.require_offline = require_offline
+        self.min_outage = min_outage
+        self.notify_cooldown = notify_cooldown
+        self._last_open_notice_at: float | None = None
+        # Whether the CURRENT open episode was announced. A close speaks only if
+        # its open did, so a cooldown never leaves an orphan "back to cloud".
+        self._announced = False
         self._service = service_fn
         # Whether the failure that opened the breaker was a transport error, as
         # opposed to an HTTP status the upstream deliberately returned. Only the
@@ -370,6 +387,25 @@ class FailoverBreaker:
         # Held so closing can hand them back — see note_claim/drain_claims.
         self._claims: set[tuple[str, str]] = set()
         self._publish()
+
+    def _announce(self, now: float, message: str) -> None:
+        """Notify the human, at most once per `notify_cooldown` per breaker.
+
+        Every transition is still logged; this only rations the desktop popup.
+        A flapping link produced sixteen of them on the evening of 2026-09-02,
+        which is noise rather than information — and the recovery ticker makes
+        transitions more frequent, not less, so the rationing has to exist for it
+        to be an improvement.
+        """
+        if (
+            self._last_open_notice_at is not None
+            and (now - self._last_open_notice_at) < self.notify_cooldown
+        ):
+            self._announced = False
+            return
+        self._last_open_notice_at = now
+        self._announced = True
+        self._notify(f"Backdoor {self.source} failover", message)
 
     def _publish(self) -> None:
         """Write breaker state where other local-GPU consumers can read it.
@@ -429,7 +465,8 @@ class FailoverBreaker:
         else:
             self._failures += 1
         self.reason = reason
-        if not self.open and self._failures >= self.threshold:
+        sustained = (now - self._first_failure_at) >= self.min_outage
+        if not self.open and self._failures >= self.threshold and sustained:
             # Anthropic requires a genuine internet outage before it may claim
             # the GPU. Other upstreams can opt into service-level failover for
             # explicit transient statuses such as usage limits.
@@ -444,8 +481,8 @@ class FailoverBreaker:
                     "failover profile",
                     self._failures, reason, self.upstream_name,
                 )
-                self._notify(
-                    f"Backdoor {self.source} failover",
+                self._announce(
+                    now,
                     f"{self.upstream_name} unavailable ({reason}); routing to local model",
                 )
                 self._publish()
@@ -494,7 +531,9 @@ class FailoverBreaker:
         was_open = self.open
         if was_open:
             logger.warning(log_line)
-            self._notify(f"Backdoor {self.source} failover", note)
+            if self._announced:
+                self._notify(f"Backdoor {self.source} failover", note)
+                self._announced = False
         self.open = False
         self.reason = ""
         self._failures = 0

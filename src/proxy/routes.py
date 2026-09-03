@@ -254,6 +254,8 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
             threshold=settings.failover_threshold,
             window=settings.failover_window_seconds,
             probe_interval=settings.failover_probe_seconds,
+            min_outage=settings.failover_min_outage_seconds,
+            notify_cooldown=settings.failover_notify_cooldown_seconds,
         )
     return _breaker
 
