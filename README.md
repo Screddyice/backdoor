@@ -400,7 +400,14 @@ While ChatGPT inference works, Backdoor relays the original request, OAuth heade
 
 The relay accepts request bodies up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must send a larger encoded request.
 
-After three eligible failures inside 120 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+After an eligible failure persists through the 10-second outage gate, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+
+Cloudflare can also lose a valid provider route and return a bare `404` with a
+`cf-ray` header. Backdoor counts that unstructured response as outage evidence
+for both Codex and Claude, even when other internet hosts remain reachable. It
+still relays structured JSON `404` errors, such as an invalid model, so failover
+does not conceal a real client or API error. Claude transport failures keep the
+existing whole-machine connectivity gate.
 
 The visible Codex thread does not change. Qwen receives a fresh internal request containing:
 

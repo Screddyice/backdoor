@@ -447,7 +447,13 @@ class FailoverBreaker:
             return True
         return False
 
-    def record_failure(self, reason: str, *, transport_error: bool = True) -> bool:
+    def record_failure(
+        self,
+        reason: str,
+        *,
+        transport_error: bool = True,
+        confirmed_service_failure: bool = False,
+    ) -> bool:
         """Record a trigger-class upstream failure. Returns True when the
         caller should serve THIS request locally (breaker open, including the
         request whose failure just opened it).
@@ -457,6 +463,12 @@ class FailoverBreaker:
         reachability probe can disprove "I could not reach it" and can never
         disprove "it told me no", so it is what decides whether
         :meth:`maybe_recover` may act on a service-level breaker.
+
+        `confirmed_service_failure=True` is narrower: the response itself proves
+        the provider edge failed, so an otherwise offline-gated breaker may open
+        while the rest of the internet remains reachable. Callers must classify
+        client/API errors first; this flag must never accompany an ambiguous
+        transport failure.
         """
         now = self._now()
         if self._failures == 0 or (now - self._first_failure_at) > self.window:
@@ -467,10 +479,15 @@ class FailoverBreaker:
         self.reason = reason
         sustained = (now - self._first_failure_at) >= self.min_outage
         if not self.open and self._failures >= self.threshold and sustained:
-            # Anthropic requires a genuine internet outage before it may claim
-            # the GPU. Other upstreams can opt into service-level failover for
-            # explicit transient statuses such as usage limits.
-            if not self.require_offline or not self._online():
+            # Anthropic transport failures require a genuine internet outage
+            # before they may claim the GPU. A confirmed provider-edge response
+            # already identifies the broken service, so probing unrelated hosts
+            # cannot disprove it.
+            if (
+                confirmed_service_failure
+                or not self.require_offline
+                or not self._online()
+            ):
                 self.open = True
                 self._opened_on_transport = transport_error
                 self._last_probe_at = now
