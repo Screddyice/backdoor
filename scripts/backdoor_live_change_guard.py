@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-LIVE_PLIST = Path.home() / "Library/LaunchAgents/com.screddy.backdoor-router.plist"
-LIVE_CHECKOUT = Path.home() / "projects/SRC/backdoor-service"
+LIVE_HOME = Path("/Users/screddy")
+LIVE_PLIST = LIVE_HOME / "Library/LaunchAgents/com.screddy.backdoor-router.plist"
+LIVE_CHECKOUT = LIVE_HOME / "projects/SRC/backdoor-service"
 ROUTER_LABEL = "com.screddy.backdoor-router"
 
 FILE_MUTATION_TOOLS = {"write", "edit", "multiedit", "apply_patch"}
@@ -79,8 +80,8 @@ def _tool_input(payload: dict[str, Any]) -> Any:
 
 def _contains_path(text: str, path: Path) -> bool:
     absolute = str(path)
-    home_form = absolute.replace(str(Path.home()), "$HOME", 1)
-    tilde_form = absolute.replace(str(Path.home()), "~", 1)
+    home_form = absolute.replace(str(LIVE_HOME), "$HOME", 1)
+    tilde_form = absolute.replace(str(LIVE_HOME), "~", 1)
     return any(candidate in text for candidate in (absolute, home_form, tilde_form))
 
 
