@@ -312,3 +312,30 @@ def test_both_breakers_are_built_with_the_configured_failover_policy(monkeypatch
     finally:
         routes._breaker = None
         codex_routes._codex_breaker = None
+
+
+def test_the_ticker_announces_the_policy_it_is_running(caplog):
+    """A deploy needs to be confirmable without waiting for an outage.
+
+    The failover policy is otherwise invisible until something breaks, which is
+    the worst moment to discover the restart picked up the old code.
+    """
+    import logging
+
+    breaker = _Breaker(open_=False, recovers=False)
+    settings = Settings()
+
+    async def sleep(_interval):
+        raise _Stop
+
+    async def drive():
+        with pytest.raises(_Stop):
+            await routes.failover_recovery_loop(
+                settings, targets=[(breaker, None)], sleep=sleep
+            )
+
+    with caplog.at_level(logging.INFO, logger="src.proxy.routes"):
+        asyncio.run(drive())
+
+    assert "failover recovery ticker armed" in caplog.text
+    assert f"min-outage {settings.failover_min_outage_seconds:.0f}s" in caplog.text

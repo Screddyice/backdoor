@@ -304,6 +304,17 @@ async def failover_recovery_loop(
         1.0,
         min(settings.failover_probe_seconds, settings.codex_failover_probe_seconds),
     )
+    # Logged once, at INFO, so a deploy can be confirmed from the log rather than
+    # by waiting for an outage: this line and the min-outage value it prints are
+    # the cheapest proof that the new failover policy is the one running.
+    logger.info(
+        "failover recovery ticker armed — every %.0fs, min-outage %.0fs/%.0fs "
+        "(claude/codex), notify cooldown %.0fs",
+        interval,
+        settings.failover_min_outage_seconds,
+        settings.codex_failover_min_outage_seconds,
+        settings.failover_notify_cooldown_seconds,
+    )
     while True:
         await sleep(interval)
         for breaker, release in targets:
