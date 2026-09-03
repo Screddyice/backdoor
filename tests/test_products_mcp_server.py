@@ -28,6 +28,28 @@ EXPECTED_TOOLS = {
 }
 
 
+EXPECTED_ROUTING = {
+    "hypercrawl": {
+        "title": "HyperCrawl",
+        "purpose": "web research",
+        "exclude": "LinkedIn outreach",
+        "owner": "Team Nebula",
+    },
+    "hyperscale": {
+        "title": "HyperScale",
+        "purpose": "LinkedIn prospects",
+        "exclude": "web crawling",
+        "owner": "Team Nebula",
+    },
+    "engagemate": {
+        "title": "EngageMate",
+        "purpose": "Instagram",
+        "exclude": "LinkedIn outreach",
+        "owner": "Shawn Reddy Consulting",
+    },
+}
+
+
 class FakeGateway:
     async def list_tools(self, product: str):
         return [{"name": f"{product}_read", "inputSchema": {"type": "object"}}]
@@ -50,6 +72,27 @@ async def test_server_registers_only_selected_product_tools(
     tools = await server.list_tools()
 
     assert {tool.name for tool in tools} == EXPECTED_TOOLS[product]
+
+
+@pytest.mark.parametrize("product", ["hypercrawl", "hyperscale", "engagemate"])
+def test_server_advertises_product_specific_routing_instructions(
+    monkeypatch, tmp_path, product
+) -> None:
+    monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "https://products.example")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "claude.ai,claude.com")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
+
+    server = build_server(product=product, gateway=FakeGateway())
+    expected = EXPECTED_ROUTING[product]
+
+    assert server.title == expected["title"]
+    assert expected["purpose"] in server.description
+    assert expected["exclude"] in server.instructions
+    assert expected["owner"] in server.instructions
+    assert f"{product}_status" in server.instructions
+    assert f"{product}_list_tools" in server.instructions
+    assert "explicit request" in server.instructions
 
 
 def test_server_requires_product_selection(monkeypatch) -> None:
