@@ -578,6 +578,12 @@ Sixteen desktop popups on the evening of 2026-09-02. Every transition is still l
 
 This is load-bearing rather than politeness: the recovery ticker below makes transitions *more* frequent, so without rationing it would have made the noise worse.
 
+**A cooldown alone still let one outage speak twice.** It rations a single breaker over time, and a dropped link is not a single breaker — it takes every upstream at once. The outages at 22:13 and 23:43 on 2026-09-03 each produced four popups for one Wi-Fi blip: Anthropic open, Codex open, Anthropic closed, Codex closed. So a breaker also stays quiet when a peer on the same router is already open. Whichever gets there first says "routing to local model"; the rest log the transition and say nothing, and their closes stay silent under the same orphan rule. Replaying that night's real transitions turns 10 popups into 4.
+
+A breaker that fails while every peer is healthy still speaks — that is a report about one upstream, not a duplicate. Codex timing out on a working link at 23:57 that same night was the only news there was, and it still announces.
+
+Worth knowing when a burst of these shows up at once: **macOS holds notifications through a Focus or a scheduled summary and releases them in a batch**, stamped with the release time rather than the outage. A stack of popups reading "1m ago" can be a backlog going back days — 74 transitions accumulated between 2026-08-26 and 2026-09-04. Check `~/.backdoor/failover-state.json` for the truth: `failover_active` and an `updated_at` that only moves on a real transition.
+
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `failover_min_outage_seconds` | `10.0` | How long the upstream must stay broken before failover may open |
