@@ -742,6 +742,29 @@ create a second, unbounded copy under `/tmp`.
 
 Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
 
+#### What the proxy log tells you, and what it used to bury
+
+Three things can end an intercepted connection early, and `_intercept` caught all three in one clause and logged them under one message: `TLS interception for api.anthropic.com ended early`. The comment above it blamed a client that does not trust the router CA. Count them over the 8 days ending 2026-09-03 and that story falls apart:
+
+| Exception | Occurrences | What it means |
+|---|---|---|
+| `ConnectionResetError` | 33,092 | The client dropped a pooled tunnel with an RST |
+| `TimeoutError` | 465 | The client took the `200` and never sent a ClientHello |
+| `ssl.SSLError: TLSV1_ALERT_UNKNOWN_CA` | 25 | The client does not trust the router CA |
+
+Claude Code and Codex both pool their sockets, so the first two rows are pool churn and neither is a fault. They also cost about a third of a 10 MB rotation, and they buried the 25 lines that matter. A client hitting that third row cannot reach the router at all, which is worth reading on the day it happens rather than after `grep -c`.
+
+Each one now gets its own treatment:
+
+| | |
+|---|---|
+| CA distrust | WARNING every time, naming the host and the path to the CA the client needs to trust |
+| Dropped before TLS | Counted, then one INFO line per 5 minutes with the total and the split between resets and handshake timeouts |
+| Failure after the splice starts | WARNING, because `_pipe` swallows all three and `_splice` gathers with `return_exceptions=True`, so this should be unreachable. If it ever fires, that is news |
+
+There is no per-occurrence line for the dropped tunnels, DEBUG included. `configure_logging` puts the root logger at DEBUG, so a debug call would write all 33,557 of them to the same file under a quieter label.
+
+
 #### Do not run the service from your dev checkout
 
 Once a launchd job or systemd unit points `WorkingDirectory` at the clone you develop in, the service inherits whatever branch you happen to have checked out. Check out a branch that predates `src/proxy/forward.py` and the next restart silently drops the forward proxy.
