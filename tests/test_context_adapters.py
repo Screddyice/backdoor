@@ -85,7 +85,17 @@ def test_claude_rebuild_expands_a_selected_tool_pair():
 
 def test_claude_adapter_rejects_a_request_without_a_textual_user_instruction():
     request = claude_fixture()
-    request.messages[-1].content = [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}]
+    request.messages = [
+        Message(
+            role="user",
+            content=[
+                {
+                    "type": "image",
+                    "source": {"type": "url", "url": "https://example.com/a.png"},
+                }
+            ],
+        )
+    ]
 
     with pytest.raises(ValueError, match="textual current user instruction"):
         ClaudeContextAdapter().normalize(request)
@@ -101,6 +111,65 @@ def test_claude_adapter_round_trips_an_empty_content_list():
     rebuilt = adapter.rebuild(context, [segment.segment_id for segment in context.segments])
 
     assert rebuilt.model_dump(mode="json") == request.model_dump(mode="json")
+
+
+def test_claude_adapter_uses_text_before_a_terminal_tool_result_as_current_instruction():
+    """A tool result completes the active turn instead of replacing its prompt."""
+    request = claude_fixture()
+    request.messages.pop()
+
+    context = ClaudeContextAdapter().normalize(request)
+
+    current = next(segment for segment in context.segments if segment.segment_id == context.current_segment_id)
+    assert current.searchable_text == "older task"
+
+
+def test_claude_rebuild_keeps_a_multipart_current_user_message_as_one_unit():
+    """Selecting the current instruction must not discard its other content blocks."""
+    request = MessagesRequest.model_validate(
+        {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first instruction clause"},
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                        {"type": "text", "text": "second instruction clause"},
+                    ],
+                }
+            ],
+        }
+    )
+    adapter = ClaudeContextAdapter()
+    context = adapter.normalize(request)
+
+    rebuilt = adapter.rebuild(context, [context.current_segment_id])
+
+    assert rebuilt.model_dump(mode="json")["messages"] == request.model_dump(mode="json")["messages"]
+
+
+def test_repeated_identical_segments_have_distinct_occurrence_ids():
+    """Selecting one repeated turn must not retain another equal turn."""
+    request = MessagesRequest.model_validate(
+        {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "active task"},
+                {"role": "assistant", "content": "same response"},
+                {"role": "assistant", "content": "same response"},
+            ],
+        }
+    )
+    adapter = ClaudeContextAdapter()
+    context = adapter.normalize(request)
+    repeated = [segment for segment in context.segments if segment.searchable_text == "same response"]
+
+    rebuilt = adapter.rebuild(context, [repeated[0].segment_id])
+
+    assert repeated[0].segment_id != repeated[1].segment_id
+    assert repeated[0].content_hash == repeated[1].content_hash
+    assert [message.content for message in rebuilt.messages] == ["same response"]
 
 
 def test_codex_adapter_round_trips_exact_input_items():
