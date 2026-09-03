@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import threading
 
 import httpx
 import pytest
@@ -184,3 +185,204 @@ async def test_relayed_upstream_error_status_reaches_the_log(caplog):
         routes._upstream_client = None
         await upstream.aclose()
     assert any("500" in record.getMessage() for record in caplog.records)
+
+
+# ── The breaker's probe, and what may be replayed ────────────────────────────
+# Two faults with one shape: `record_failure` runs `internet_reachable`, a
+# blocking socket probe, and `_try_upstream` called it straight from the event
+# loop, so every failed turn froze the router for the length of the probe. The
+# same synchronous call also let a slow probe finish AFTER a newer request had
+# succeeded and write its stale verdict over that success.
+#
+# Separately, `_upstream_send` replayed every httpx.TransportError once. A
+# connect or pool failure is safe to replay because nothing reached Anthropic.
+# A read, write or protocol error is not: the request may already be on their
+# side, and replaying it can duplicate a turn.
+
+@pytest.mark.asyncio
+async def test_response_side_transport_failure_is_not_replayed():
+    attempts = []
+
+    def accepted_then_dropped(request: httpx.Request) -> httpx.Response:
+        attempts.append("accepted")
+        raise httpx.ReadError("response dropped", request=request)
+
+    upstream = httpx.AsyncClient(
+        base_url="https://api.anthropic.com",
+        transport=httpx.MockTransport(accepted_then_dropped),
+    )
+    routes._upstream_client = upstream
+
+    try:
+        with pytest.raises(httpx.ReadError):
+            await routes._upstream_send(_request(), b"{}", Settings())
+        assert attempts == ["accepted"], "a possibly accepted request was replayed"
+    finally:
+        routes._upstream_client = None
+        await upstream.aclose()
+
+
+
+
+class _BlockedStreamResponse:
+    status_code = 200
+
+    async def aread(self):
+        return b""
+
+    async def aiter_lines(self):
+        yield 'data: {"choices": []}'
+        yield "data: [DONE]"
+
+
+class _BlockedStreamContext:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def __aenter__(self):
+        self.owner.calls += 1
+        self.owner.first_entered.set()
+        await self.owner.release.wait()
+        return _BlockedStreamResponse()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _BlockedLocalStreamClient:
+    def __init__(self):
+        self.calls = 0
+        self.first_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def stream(self, method, path, json):
+        return _BlockedStreamContext(self)
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_local_provider_serializes_streams_instead_of_flooding_ollama():
+    provider = ProviderClient(Settings(provider_base_url="http://127.0.0.1:11434/v1"))
+    await provider._client.aclose()
+    blocked = _BlockedLocalStreamClient()
+    provider._client = blocked
+
+    first_stream = provider.stream({"messages": []})
+    second_stream = provider.stream({"messages": []})
+    first = asyncio.create_task(anext(first_stream))
+    await blocked.first_entered.wait()
+    second = asyncio.create_task(anext(second_stream))
+    await asyncio.sleep(0)
+
+    assert blocked.calls == 1, "a retry opened another Ollama stream while one was running"
+
+    blocked.release.set()
+    assert await first == {"choices": []}
+    await first_stream.aclose()
+    assert await second == {"choices": []}
+    await second_stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_connectivity_probe_runs_off_the_event_loop(monkeypatch):
+    seen_thread = []
+
+    async def unavailable(request, body, settings):
+        raise httpx.ConnectTimeout("timed out", request=httpx.Request("POST", "https://api.anthropic.com"))
+
+    def offline_probe():
+        seen_thread.append(threading.current_thread())
+        return False
+
+    routes._breaker = routes.FailoverBreaker(threshold=1, online_fn=offline_probe)
+    monkeypatch.setattr(routes, "_upstream_send", unavailable)
+
+    try:
+        assert await routes._try_upstream(_request(), b"{}", Settings()) is None
+        assert len(seen_thread) == 1
+        assert seen_thread[0] is not threading.main_thread()
+    finally:
+        routes._breaker = None
+
+
+@pytest.mark.asyncio
+async def test_success_cannot_be_overwritten_by_an_older_failure_probe(monkeypatch):
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    success_sent = asyncio.Event()
+
+    def offline_probe():
+        probe_started.set()
+        assert release_probe.wait(timeout=1)
+        return False
+
+    async def fail_or_succeed(request, body, settings):
+        if body == b"fail":
+            raise httpx.ConnectTimeout(
+                "timed out",
+                request=httpx.Request("POST", "https://api.anthropic.com"),
+            )
+        success_sent.set()
+        return httpx.Response(
+            200,
+            content=b"ok",
+            request=httpx.Request("POST", "https://api.anthropic.com"),
+        )
+
+    monkeypatch.setattr(routes, "_breaker_failure_lock", asyncio.Lock())
+    routes._breaker = routes.FailoverBreaker(threshold=1, online_fn=offline_probe)
+    monkeypatch.setattr(routes, "_upstream_send", fail_or_succeed)
+
+    try:
+        failure = asyncio.create_task(
+            routes._try_upstream(_request(), b"fail", Settings())
+        )
+        assert await asyncio.to_thread(probe_started.wait, 1)
+
+        success = asyncio.create_task(
+            routes._try_upstream(_request(), b"success", Settings())
+        )
+        await success_sent.wait()
+        await asyncio.sleep(0)
+        release_probe.set()
+
+        assert await failure is None
+        response = await success
+        assert response.status_code == 200
+        assert routes._breaker.open is False
+        assert routes._breaker.reason == ""
+    finally:
+        release_probe.set()
+        routes._breaker = None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_cannot_leave_a_stale_failure_probe(monkeypatch):
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    probe_finished = threading.Event()
+
+    def offline_probe():
+        probe_started.set()
+        assert release_probe.wait(timeout=1)
+        probe_finished.set()
+        return False
+
+    monkeypatch.setattr(routes, "_breaker_failure_lock", asyncio.Lock())
+    breaker = routes.FailoverBreaker(threshold=1, online_fn=offline_probe)
+    failure = asyncio.create_task(routes._record_failure(breaker, "ConnectTimeout"))
+    assert await asyncio.to_thread(probe_started.wait, 1)
+
+    failure.cancel()
+    success = asyncio.create_task(routes._record_success(breaker))
+    await asyncio.sleep(0)
+    release_probe.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await failure
+    await success
+    assert await asyncio.to_thread(probe_finished.wait, 1)
+    assert breaker.open is False
+    assert breaker.reason == ""

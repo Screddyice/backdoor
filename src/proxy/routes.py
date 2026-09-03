@@ -107,6 +107,15 @@ _SKIP_RESP_HEADERS = {"content-length", "transfer-encoding", "connection"}
 # and raise "Error -3 while decompressing data: incorrect header check".
 # content-length is already stripped above; Starlette recomputes it.
 _DECODED_SKIP_HEADERS = _SKIP_RESP_HEADERS | {"content-encoding"}
+# The only transport failures safe to replay. A connect or pool failure means
+# nothing reached Anthropic, so a second attempt cannot duplicate anything. A
+# read, write or protocol error carries no such promise: the request may already
+# be on their side, and replaying it can bill and run the turn twice.
+_RETRYABLE_PRE_SEND_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
 
 
 def _decoded_relay_headers(uresp: httpx.Response) -> dict[str, str]:
@@ -140,7 +149,7 @@ async def _upstream_send(request: Request, body: bytes, settings: Settings) -> h
                 )
             return uresp
         except httpx.TransportError as exc:
-            if attempt:
+            if attempt or not isinstance(exc, _RETRYABLE_PRE_SEND_ERRORS):
                 raise
             if isinstance(exc, httpx.PoolTimeout):
                 poisoned = upstream
@@ -200,7 +209,7 @@ async def _relay_body(uresp: httpx.Response, settings: Settings) -> AsyncIterato
             "headers were already sent, so this turn cannot be failed over",
             uresp.num_bytes_downloaded, type(exc).__name__, exc,
         )
-        get_breaker(settings).record_failure(type(exc).__name__)
+        await _record_failure(get_breaker(settings), type(exc).__name__)
         raise
 
 
@@ -249,7 +258,7 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
         uresp = await _upstream_send(request, body, settings)
     except httpx.TransportError as e:
         logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
-        get_breaker(settings).record_failure(type(e).__name__)
+        await _record_failure(get_breaker(settings), type(e).__name__)
         return None
     return _relay_upstream(uresp, settings)
 
@@ -259,6 +268,45 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
 # built from settings so env overrides apply.
 
 _breaker: FailoverBreaker | None = None
+# Serialises every breaker verdict. See `_record_failure`.
+_breaker_failure_lock = asyncio.Lock()
+
+
+async def _record_failure(
+    br: FailoverBreaker, reason: str, *, transport_error: bool = True
+) -> bool:
+    """Record a failure without freezing the router, and without racing.
+
+    `record_failure` runs `internet_reachable`, a blocking socket probe against
+    a public address. Called straight from a coroutine it runs ON the event
+    loop, so every failed turn stalls every other session for the length of the
+    probe — worst at exactly the moment the router is busiest, an outage.
+
+    The lock is the second half. Off-loop alone, a slow probe can still land
+    after a NEWER request has already succeeded and closed the breaker, writing
+    its stale verdict over that success. Serialising failure against success
+    means the breaker sees them in the order the requests actually resolved.
+
+    Cancellation cannot stop a worker thread, only stop waiting for it. So a
+    cancelled caller holds the lock until the probe it started finishes;
+    releasing early would let that thread mutate the breaker behind whoever
+    took the lock next.
+    """
+    async with _breaker_failure_lock:
+        probe = asyncio.create_task(
+            asyncio.to_thread(br.record_failure, reason, transport_error=transport_error)
+        )
+        try:
+            return await asyncio.shield(probe)
+        except asyncio.CancelledError:
+            await asyncio.shield(probe)
+            raise
+
+
+async def _record_success(br: FailoverBreaker) -> None:
+    """Close the breaker in order with any failure probe still running."""
+    async with _breaker_failure_lock:
+        br.record_success()
 
 
 def get_breaker(settings: Settings) -> FailoverBreaker:
@@ -463,20 +511,20 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         # VPN diagnosis meant correlating banners against a log that never
         # mentioned them. Every transport failure gets a line.
         logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
-        if br.record_failure(type(e).__name__):
+        if await _record_failure(br, type(e).__name__):
             return None
         raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
     if uresp.status_code in FAILOVER_STATUSES:
         err_body = await uresp.aread()  # decoded: content-encoding is undone here
         err_headers = _decoded_relay_headers(uresp)
         await uresp.aclose()
-        if br.record_failure(f"HTTP {uresp.status_code}", transport_error=False):
+        if await _record_failure(br, f"HTTP {uresp.status_code}", transport_error=False):
             return None
         # Below the threshold: relay the error verbatim so the client's own
         # retry/backoff logic still runs (a lone 429 is normal backpressure).
         return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
     was_open = br.open
-    br.record_success()
+    await _record_success(br)
     if was_open:
         # The breaker just closed, so every tier it caused to be loaded is now
         # dead weight — unless a failover response is still generating from one.

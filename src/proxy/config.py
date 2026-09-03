@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .failover import DEFAULT_FAILOVER_THRESHOLD
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -87,7 +89,7 @@ class Settings(BaseSettings):
     # connectivity probe is. A run of failures only opens the breaker if a TCP
     # probe to a public address also fails, so a single transient blip still
     # cannot claim the GPU. The third failure bought latency, not safety.
-    failover_threshold: int = 1
+    failover_threshold: int = DEFAULT_FAILOVER_THRESHOLD
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
     # How long the upstream must stay broken before failover is allowed.
