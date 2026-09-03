@@ -58,7 +58,15 @@ class QwenTokenGate:
             return None
         try:
             completed = subprocess.run(
-                [str(executable), "-m", str(model), "--prompt", rendered],
+                [
+                    str(executable),
+                    "-m",
+                    str(model),
+                    "--prompt",
+                    rendered,
+                    "--show-count",
+                    "--log-disable",
+                ],
                 capture_output=True,
                 check=False,
                 text=True,
