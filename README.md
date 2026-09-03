@@ -1168,6 +1168,19 @@ credential fields empty so Claude uses dynamic registration.
 | HyperScale | Team Nebula | `https://hyperscale-mcp.5-161-126-205.sslip.io/mcp` | `hyperscale_status`, `hyperscale_list_tools`, `hyperscale_call` |
 | EngageMate | Shawn Reddy Consulting (SRC), Screddyice GitHub organization | `https://engagemate-mcp.5-161-126-205.sslip.io/mcp` | `engagemate_status`, `engagemate_list_tools`, `engagemate_call` |
 
+Each server advertises product-specific instructions during MCP initialization so clients can
+route requests without relying on the connector name alone:
+
+| Request intent | Connector | Exclusions |
+| --- | --- | --- |
+| Public web research, site search, crawling, URL mapping, page extraction, browser sessions, or structured website data | HyperCrawl | LinkedIn outreach and Instagram engagement |
+| LinkedIn prospects, connections, outbound campaigns, sequences, outreach status, or templates | HyperScale | General web crawling and Instagram engagement |
+| Instagram onboarding, audience discovery, engagement settings, account status, or service health | EngageMate | LinkedIn outreach and general web crawling |
+
+The instructions direct clients to call the product's read-only status or list tool first. Clients
+reserve account connections, campaign launches, messages, form submissions, and social engagement
+for an explicit user request.
+
 Set `PRODUCTS_MCP_PRODUCT` to one product for each process. The server refuses a missing or unknown
 value and registers only that product's three tools. The list tool returns upstream operation names
 and schemas. The call tool accepts only an advertised operation, which prevents callers from using
