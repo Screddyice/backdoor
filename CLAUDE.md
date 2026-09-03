@@ -1,64 +1,88 @@
 # backdoor
 
-## Project Overview
-<!-- Describe what this project does -->
+## What this is
 
-## Tech Stack
-- Python
+The hybrid proxy that carries this machine's Claude and Codex traffic. The router
+on `:8083` sends `qwen*` model names to local Ollama and passes everything else to
+the real Anthropic API; the forward proxy on `:8084` fronts it. Cloud-to-local
+failover sits in the request path with no opt-in.
 
-## Common Commands
+**The breaker opens on one condition: this host being offline.** 429, 529, 401 and
+403 are HTTP responses that prove the network works, so they get relayed rather
+than failed over.
 
+## Live-control boundary — read before running anything
 
-## Session Startup Protocol
-On every session start:
-1. Working context is auto-injected at session start (features, decisions, failures, rules)
-2. Run `/claude-harness:start` for full context refresh with GitHub sync (optional)
-3. Check `.claude-harness/features/active.json` for current priorities
+This repo is the **source**, and the source is where agents work. You may inspect
+the live router, edit code here, run tests, and open PRs.
 
-## Development Rules
-- Work on ONE feature at a time
-- Always run /claude-harness:checkpoint after completing work
-- Run tests before marking features complete
-- Commit with descriptive messages
-- Leave codebase in clean, working state
+You may **not** touch the live control plane. Shawn operates it himself from an
+independent Terminal session with a rescue path open. Machine PreToolUse hooks
+enforce this, and they will reject a command or a file edit that merely *names* the
+protected artifacts — including this file, which is why the specifics are not
+restated here.
 
-## Testing Requirements
-<!-- Add your test commands -->
-- Build: `npm run build`
-- Lint: `npm run lint`
-- Test: `pytest`
-- Typecheck: `npx tsc --noEmit`
+**Read the exact boundary in `~/.claude/CLAUDE.md`, section
+"Backdoor live-control boundary", before attempting any live operation.**
 
-## Progress Tracking
-See: `.claude-harness/sessions/{session-id}/context.json` and `.claude-harness/features/active.json`
+If a tool call comes back refused with a message about the live control plane, that
+is this guard doing its job. Do not try to route around it; hand the operation to
+Shawn.
 
-## Memory Architecture (v3.0)
-- `sessions/{session-id}/` - Current session context (per-session, gitignored)
-- `memory/episodic/` - Recent decisions (rolling window)
-- `memory/semantic/` - Project knowledge (persistent)
-- `memory/procedural/` - Success/failure patterns (append-only)
-- `memory/learned/` - Rules from user corrections (append-only)
+## Stack
 
+Python `>=3.11`, managed with **uv** (`uv.lock` committed). pytest is configured in
+`pyproject.toml`. No Node toolchain — earlier versions of this file listed
+`npm run build` and `npm test`, neither of which exists.
 
-## Health Stack
+## Commands
 
-- test: uv run pytest
+```bash
+uv sync                       # install
+uv run pytest                 # full suite
+uv run pytest tests/<file>    # one file
+```
 
-## Skill routing
+When you run a test you **expect** to fail, suppress the test names. A red run exits
+0 and gets stored as a success, and test names are declarative sentences that the
+memory distiller inverts into rules:
 
-When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+```bash
+uv run pytest -q --tb=no tests/<file>::<test> 2>&1 | tail -1
+echo "EXPECTED-RED: fails without the fix, as designed"
+```
 
-Key routing rules:
-- Product ideas/brainstorming → invoke /office-hours
-- Strategy/scope → invoke /plan-ceo-review
-- Architecture → invoke /plan-eng-review
-- Design system/plan review → invoke /design-consultation or /plan-design-review
-- Full review pipeline → invoke /autoplan
-- Bugs/errors → invoke /investigate
-- QA/testing site behavior → invoke /qa or /qa-only
-- Code review/diff check → invoke /review
-- Visual polish → invoke /design-review
-- Ship/deploy/PR → invoke /ship or /land-and-deploy
-- Save progress → invoke /context-save
-- Resume context → invoke /context-restore
-- Author a backlog-ready spec/issue → invoke /spec
+The count proves what the names prove and carries no sentence to invert.
+
+## Layout
+
+| Path | What it holds |
+|---|---|
+| `src/proxy/` | Router and proxy implementation, including the model-name to profile map in `config.py` |
+| `profiles/` | One `.env` per route profile (`PROVIDER_MODEL`, `ROUTE_BARE`, `ROUTE_MAX_INPUT_TOKENS`) |
+| `modelfiles/bare/` | Ollama Modelfiles for the bare tags, with the KV sizing notes |
+| `tests/` | pytest suite |
+| `deploy/`, `local/` | Deployment glue |
+
+## Known defect
+
+`config.py` maps `qwen-9b` to profile `local-qwen-9b`, which resolves to
+`qwen3.5:9b-64k`. **That tag is not pulled on this Mac.** The `local-failover-heavy`
+profile points at the same absent tag. Both names resolve, build a route, and then
+fail at the provider, which reads as a broken agent rather than a missing model.
+Either build the tag or drop both mappings.
+
+Build a bare tag from the GGUF tag, never int4/MLX — the MLX engine ignores
+`num_ctx` and loads a 262144 window that grows toward 32 GB. Verify with
+`ollama ps`, not `ollama show --parameters`.
+
+## Rules that apply here
+
+Machine hard rules: `~/.claude/CLAUDE.md`. Workspace rules: `~/projects/CLAUDE.md`
+and `~/projects/AGENTS.md`. Org identity comes from the git `origin` remote.
+
+Durable facts go to **Cognee**, the only memory on this machine. Search it before
+re-deriving a past decision, and write findings back with `cognee-remember`. The
+`.claude-harness/memory/` tree in this repo is scaffolding, not a live memory layer.
+
+Every branch gets a PR, and every PR updates this repo's README.

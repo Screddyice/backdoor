@@ -1,6 +1,6 @@
 import os
 from functools import lru_cache
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -90,6 +90,40 @@ class Settings(BaseSettings):
     failover_threshold: int = 1
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
+    # How long the upstream must stay broken before failover is allowed.
+    #
+    # This is the guard the count was supposed to be and never could be.
+    # Requests are concurrent, so a "consecutive failure" count is satisfied by
+    # a single instant: measured 2026-09-03 14:46:18.113, four transport
+    # failures landed in the SAME MILLISECOND, all of them `[Errno 8] nodename
+    # nor servname provided` from one DNS hiccup. Any threshold — 1, 3, 10 —
+    # trips on that burst, so counting never distinguished a two-second blip
+    # from a real outage. Elapsed time does.
+    #
+    # The cost of getting it wrong was being paid daily. On 2026-09-02 the
+    # breaker opened eight times, several for episodes that were over almost
+    # immediately (the open then lasts up to a further `failover_probe_seconds`
+    # purely because half-open only retries once per interval, which is why
+    # short outages read as long ones in the log). Each one silently moved live
+    # sessions onto a local model and fired a desktop notification.
+    #
+    # TEN seconds, not the thirty this shipped with on 2026-09-03. During the
+    # gate the router hands the client a 502 — the SAME 502 the Codex path
+    # returns, from symmetric code — and that is not free just because Claude
+    # Code retries. Measured on the one real outage after the gate went live:
+    # first failure 17:50:08, breaker open 17:51:08. Sixty seconds of errors.
+    #
+    # The duration histogram across 79 outage bursts in the router logs is what
+    # sets the number. Median 3s. A 10s gate absorbs 64% of bursts; 30s absorbs
+    # 69%. Five points of extra protection for three times the user-visible
+    # error window is a bad trade, and 30% of bursts outlast any gate at all,
+    # where the wait is pure cost.
+    failover_min_outage_seconds: float = 10.0
+    # At most one failover announcement per breaker per cooldown. The log keeps
+    # every transition; the notification is for the human, and a flapping link
+    # produced sixteen of them in one evening. A close only announces if its
+    # open did, so a suppressed outage never produces an orphan "back to cloud".
+    failover_notify_cooldown_seconds: float = 900.0
 
     # Bare mode: strip the Claude Code harness (system prompt, tool definitions,
     # tool results, images) off a failed-over request, keeping only the tools
@@ -147,6 +181,64 @@ class Settings(BaseSettings):
     memory_top_k: int = 6
     memory_char_budget: int = 1200
 
+    # Authoritative local Cognee recall for fresh Codex failover turns. The API
+    # key is optional on a single-user server and must arrive through the process
+    # environment, never a committed profile.
+    cognee_base_url: str = "http://127.0.0.1:8001"
+    cognee_api_key: str = ""
+    codex_cognee_timeout_seconds: float = Field(default=2.0, gt=0)
+    codex_cognee_top_k: int = Field(default=8, ge=1)
+    codex_cognee_char_budget: int = Field(default=8_000, ge=1)
+
+    # Codex Responses failover keeps a hard 32K window on the fresh local
+    # request. Component budgets include the reply reserve, so an invalid
+    # allocation is rejected at startup rather than at inference.
+    codex_context_window: int = Field(default=32_000, ge=1)
+    codex_reply_reserve_tokens: int = Field(default=4_000, ge=1)
+    codex_system_budget_tokens: int = Field(default=1_000, ge=0)
+    codex_memory_budget_tokens: int = Field(default=2_000, ge=0)
+    codex_tools_budget_tokens: int = Field(default=4_000, ge=0)
+    codex_active_turn_budget_tokens: int = Field(default=21_000, ge=1)
+    codex_local_model: str = "qwen3.8:27b-obliterated"
+    codex_local_responses_url: str = "http://127.0.0.1:11434/v1/responses"
+    codex_local_tools: str = "local"
+    codex_failover_to_local: bool = True
+    codex_chatgpt_upstream: str = "https://chatgpt.com/backend-api/codex"
+    codex_max_request_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    codex_failover_threshold: int = Field(default=1, ge=1)
+    codex_failover_window_seconds: float = Field(default=120.0, gt=0)
+    codex_failover_probe_seconds: float = Field(default=60.0, gt=0)
+    # Held at the same 10s as Claude, deliberately, though this one is the harder
+    # call. Codex Desktop does NOT retry: it surfaces the 502, so during the gate
+    # a Codex user sees a hard error where a Claude user sees a retry banner.
+    # PR #91 set this to 0 for exactly that reason, and dropping the Claude gate
+    # to 10s removed the asymmetry's justification rather than its cost — the
+    # gap between the two paths is now 10s of visible errors versus 10s of
+    # retries, not 60s versus none.
+    #
+    # What the 10s buys, on both paths, is not loading a 17GB local tier for a
+    # blip: 48% of measured outage bursts are 2 seconds or shorter. Failing over
+    # on those spends the GPU and evicts the llm-jury council to ride out
+    # something already over. Revert to 0 if Codex 502s prove worse in practice
+    # than that churn; the number is one edit and the reasoning is here.
+    codex_failover_min_outage_seconds: float = Field(default=10.0, ge=0)
+    codex_failover_notify_cooldown_seconds: float = Field(default=900.0, ge=0)
+    codex_failover_statuses: str = "429,500,502,503,504,529"
+    codex_failover_require_offline: bool = False
+
+    @model_validator(mode="after")
+    def validate_codex_context_allocation(self):
+        allocated = (
+            self.codex_reply_reserve_tokens
+            + self.codex_system_budget_tokens
+            + self.codex_memory_budget_tokens
+            + self.codex_tools_budget_tokens
+            + self.codex_active_turn_budget_tokens
+        )
+        if allocated > self.codex_context_window:
+            raise ValueError("Codex context component budgets exceed the context window")
+        return self
+
     # Large pages and attachments fetched by any client are reduced before a
     # local Qwen sees them, then stored in and recalled from Cognee. Local
     # ranking always runs; QWEN_COGNEE=0 disables only network memory for true
@@ -155,6 +247,8 @@ class Settings(BaseSettings):
     external_context_threshold_chars: int = 12000
     external_context_char_budget: int = 6000
     external_context_max_document_chars: int = 500000
+    external_context_max_documents: int = Field(default=4, ge=0)
+    external_context_public_url_prefixes: str = ""
     external_context_top_k: int = 6
     external_context_timeout_seconds: float = 1.5
 
@@ -170,6 +264,14 @@ class Settings(BaseSettings):
     # a route that strips differently from failover would be a second behaviour
     # to keep in sync for no benefit.
     route_bare: bool = False
+
+    # Operator instructions appended to `bare.ROUTE_SYSTEM` on the `/model <name>`
+    # route path. Stripping replaces the WHOLE system prompt, which silently
+    # deleted rules the session is still expected to follow: the qwen wrapper
+    # injects the PR-per-branch rule with `--append-system-prompt`, and ROUTE_BARE
+    # then threw it away, so a routed session never saw it. Relative paths resolve
+    # against the repo cwd, the same way `profiles/` does. Empty disables.
+    route_system_file: str = "prompts/qwen-pr-rules.md"
 
     # Largest post-strip session this tier will accept on an explicit
     # `/model <name>` route. 0 disables the check.
@@ -333,6 +435,24 @@ def pick_failover_profile(est_input_tokens: int) -> str | None:
 def pick_route_profile(est_input_tokens: int) -> str | None:
     """Choose a finite profile for a deliberate local-model route."""
     return _pick_profile(ROUTE_LADDER, est_input_tokens)
+
+
+@lru_cache(maxsize=4)
+def load_route_system_extra(path: str) -> str | None:
+    """Operator instructions appended to ROUTE_SYSTEM, or None.
+
+    A missing or unreadable file is deliberately not fatal — the route still
+    works, it just carries ROUTE_SYSTEM alone. Failing the request over a
+    documentation file would be a worse outcome than losing the rules. Cached
+    because this is consulted per request.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
 
 
 @lru_cache(maxsize=8)

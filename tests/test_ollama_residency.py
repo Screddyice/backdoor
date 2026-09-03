@@ -29,9 +29,10 @@ _seq = iter(range(1_000_000))
 OLLAMA = "http://localhost:11434/v1"
 
 
-def make_breaker():
+def make_breaker(recovery_successes: int = 1):
     return FailoverBreaker(
         threshold=2,
+        recovery_successes=recovery_successes,
         now_fn=lambda: 1000.0,
         notify_fn=lambda *a: None,
         online_fn=lambda: False,
@@ -160,7 +161,8 @@ def test_empty_model_is_not_claimed():
 def test_close_leaves_claims_for_the_caller():
     # record_success deliberately does NOT unload: failover.py stays pure
     # decision logic with no transport, so its state-machine tests need no HTTP.
-    br = make_breaker()
+    # Two successes: this asserts the streak, so it asks for it explicitly.
+    br = make_breaker(recovery_successes=2)
     br.record_failure("ConnectTimeout")
     br.record_failure("ConnectTimeout")
     assert br.open

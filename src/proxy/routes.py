@@ -15,7 +15,7 @@ from starlette.background import BackgroundTask, BackgroundTasks
 
 from .config import (
     MODEL_ROUTES, Settings, get_settings, load_profile_settings,
-    pick_failover_profile, pick_route_profile,
+    load_route_system_extra, pick_failover_profile, pick_route_profile,
     resolve_model_route,
 )
 from .bare import (
@@ -23,6 +23,7 @@ from .bare import (
     apply_outage_tool_policy,
     make_bare,
     parse_keep,
+    route_system,
 )
 from .context_runtime import (
     ContextRuntime,
@@ -37,7 +38,7 @@ from .context_tokenizer import QwenTokenGate
 from .context_window import assemble_working_set
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
-from . import mlx_admin, ollama_admin
+from . import compute_lease, mlx_admin, ollama_admin
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -341,8 +342,82 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
             window=settings.failover_window_seconds,
             probe_interval=settings.failover_probe_seconds,
             recovery_successes=settings.failover_recovery_successes,
+            min_outage=settings.failover_min_outage_seconds,
+            notify_cooldown=settings.failover_notify_cooldown_seconds,
         )
     return _breaker
+
+
+async def failover_recovery_loop(
+    settings: Settings, targets=None, sleep=asyncio.sleep
+) -> None:
+    """Close an open breaker once this host is back online, without a rider.
+
+    The breaker's own half-open path needs an upstream-bound request to carry
+    it, and an outage is exactly what stops those arriving: sessions served by a
+    local tier generate far less traffic, and a user who walks away from a
+    degraded session generates none. On 2026-09-02 that left the breaker open
+    for 77 minutes on a network that had recovered — every routed session
+    silently on qwen — until unrelated traffic finally closed it. This loop is
+    the ticker that outage cannot switch off.
+
+    `targets` is a list of `(breaker, release)` pairs, `release` being an async
+    callable taking the breaker. It defaults to both breakers this router owns:
+    the Claude one here and the Codex one in codex_routes, each with its own
+    tier-release path. Only a breaker that required an offline host to open can
+    actually be closed this way — `maybe_recover` refuses for a service-level
+    breaker — but passing it costs nothing and keeps the wiring honest if that
+    configuration changes.
+
+    Cheap by construction: it does nothing at all while the breakers are closed,
+    which is essentially always. The probe itself is blocking socket work, so it
+    goes to a worker thread rather than stalling the event loop the router is
+    serving requests on.
+    """
+    if targets is None:
+        # Imported here rather than at module scope: codex_routes is a peer that
+        # pulls in the whole Codex relay, and this is the only thing here that
+        # needs it.
+        from .codex_routes import _release_claims as _release_codex_claims
+        from .codex_routes import get_codex_breaker
+
+        targets = [
+            (get_breaker(settings), lambda br: _release_claims(br, settings)),
+            (get_codex_breaker(settings), _release_codex_claims),
+        ]
+
+    # Each breaker rations its own probe by its own interval, so the tick only
+    # has to be fast enough for the shorter of the two.
+    interval = max(
+        1.0,
+        min(settings.failover_probe_seconds, settings.codex_failover_probe_seconds),
+    )
+    # Logged once, at INFO, so a deploy can be confirmed from the log rather than
+    # by waiting for an outage: this line and the min-outage value it prints are
+    # the cheapest proof that the new failover policy is the one running.
+    logger.info(
+        "failover recovery ticker armed — every %.0fs, min-outage %.0fs/%.0fs "
+        "(claude/codex), notify cooldown %.0fs",
+        interval,
+        settings.failover_min_outage_seconds,
+        settings.codex_failover_min_outage_seconds,
+        settings.failover_notify_cooldown_seconds,
+    )
+    while True:
+        await sleep(interval)
+        for breaker, release in targets:
+            if not breaker.open:
+                continue
+            try:
+                closed = await asyncio.to_thread(breaker.maybe_recover)
+            except Exception:  # a failed probe must never kill the ticker
+                logger.exception("failover recovery probe failed")
+                continue
+            if closed:
+                try:
+                    await release(breaker)
+                except Exception:
+                    logger.exception("failover recovery could not release tiers")
 
 
 # Failover responses still being generated, and the tiers whose release is
@@ -469,7 +544,7 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         err_body = await uresp.aread()  # decoded: content-encoding is undone here
         err_headers = _decoded_relay_headers(uresp)
         await uresp.aclose()
-        if br.record_failure(f"HTTP {uresp.status_code}"):
+        if br.record_failure(f"HTTP {uresp.status_code}", transport_error=False):
             return None
         # Below the threshold: relay the error verbatim so the client's own
         # retry/backoff logic still runs (a lone 429 is normal backpressure).
@@ -991,6 +1066,10 @@ async def create_message(
     # Set only when the failover path successfully stripped the harness; it then
     # replaces the parsed request below so the stripped version is what is sent.
     bare_req: MessagesRequest | None = None
+    # `settings` is rebound to the PROFILE's settings further down, and a profile
+    # file does not carry the router's mode. Keep the router's own view so the
+    # profile-mode guard below cannot misread a hybrid request as a direct one.
+    router_settings = settings
     # Large fetched documents are compacted once, before bare mode gets a chance
     # to discard their full text. Kept separately for non-bare Qwen profiles.
     prepared_req: MessagesRequest | None = None
@@ -1134,6 +1213,12 @@ async def create_message(
                 stripped = make_bare(
                     fr,
                     keep=parse_keep(settings.failover_keep_tools),
+                    # NOT the failover text: nothing has failed on this path, and
+                    # the operator rules ride along because the strip above just
+                    # deleted the only copy the session had.
+                    system=route_system(
+                        load_route_system_extra(settings.route_system_file)
+                    ),
                     tool_result_chars=settings.failover_tool_result_chars,
                 )
                 bare_req = stripped  # only on success: make_bare is pure
@@ -1174,6 +1259,43 @@ async def create_message(
         req = prepared_req
     else:
         req = await prepare_external_context(MessagesRequest.model_validate_json(body), settings)
+
+    # Profile mode is a direct path too (`bd switch ...; bd claude`). It bypasses
+    # MODEL_ROUTES entirely, so the hybrid branch above never ran and nothing has
+    # honored this profile's bare contract yet. The `qwen` wrapper launches Claude
+    # Code with --bare, but the server has to stay safe when a caller skips the
+    # wrapper — which is the whole gap this closes.
+    #
+    # Ported from PR #61, which predates `route_system`: the strip must carry the
+    # operator rules for exactly the reason the hybrid path does, since replacing
+    # the system prompt deletes the only copy the session had.
+    #
+    # Both extra conditions were paid for by a regression this port caused and its
+    # tests caught. `router_settings` because `settings` is the PROFILE's by now,
+    # and a profile carries no router mode, so a plain `settings.router_mode`
+    # read "profile" on hybrid requests and fired on every one of them.
+    # `bare_req is None` because failover already stripped with OFFLINE_SYSTEM,
+    # and re-stripping replaced "you have lost your network" with the route text
+    # that says nothing failed — telling an offline model it is online.
+    if (
+        router_settings.router_mode != "hybrid"
+        and settings.route_bare
+        and bare_req is None
+    ):
+        try:
+            req = make_bare(
+                req,
+                keep=parse_keep(settings.failover_keep_tools),
+                system=route_system(
+                    load_route_system_extra(settings.route_system_file)
+                ),
+                tool_result_chars=settings.failover_tool_result_chars,
+            )
+        except Exception:
+            # Same rule as the other two strip sites: stripping never becomes a
+            # new request failure. Unstripped may overflow the window, but that
+            # surfaces as an honest provider error rather than one we invented.
+            logger.exception("profile bare-mode failed; sending unstripped")
 
     fast = _check_optimizations(req, settings)
     if fast:
@@ -1233,6 +1355,15 @@ async def create_message(
             )
             settings = load_profile_settings(served_by)
             client = _get_profile_client(served_by, settings)
+
+    # The lease is about which tier is about to be loaded, so it is claimed on
+    # both payload paths — virtualized or not.
+    if settings.provider_model == "qwen3.8:27b-obliterated":
+        compute_lease.claim_exclusive_model(
+            settings.provider_model,
+            source="claude-failover" if failed_over else "claude-explicit",
+            ttl_seconds=600,
+        )
 
     if prepared_failover is not None:
         payload = dict(prepared_failover.payload)

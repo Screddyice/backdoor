@@ -143,6 +143,24 @@ async def test_explicit_route_externalizes_large_fetched_page(routed_app):
     assert "Z" * 10_000 not in sent
 
 
+async def test_explicit_route_externalizes_large_fetched_page(routed_app):
+    """The GUI may vary; the provider request crossing Backdoor is the seam."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True)
+    body = _harness_request()
+    body["messages"][1]["content"][0]["name"] = "WebFetch"
+    body["messages"][1]["content"][0]["input"] = {"url": "https://example.com/report"}
+    body["messages"].append({"role": "user", "content": "What does the report say?"})
+
+    resp = await _post(app, body)
+
+    assert resp.status_code == 200
+    sent = json.dumps(recorder.payload)
+    assert "<qwen-external-context" in sent
+    assert "https://example.com/report" in sent
+    assert "Z" * 10_000 not in sent
+
+
 async def test_the_users_actual_question_survives(routed_app):
     """Stripping is only correct if the session still makes sense afterwards."""
     app, recorder, monkeypatch = routed_app
@@ -191,3 +209,147 @@ def test_qwen_route_targets_a_profile_that_declares_route_bare():
         f"MODEL_ROUTES['qwen'] -> {profile}, which does not set ROUTE_BARE. "
         "A full harness session will overflow its 32K window."
     )
+
+
+# --- the replacement system prompt --------------------------------------
+#
+# Stripping is only half the job: something has to stand in for the prompt that
+# was removed. The route path shipped using the FAILOVER text, which told a
+# perfectly healthy session it had "lost its network connection" — and took the
+# operator rules with it, because make_bare replaces `system` wholesale and the
+# qwen wrapper's `--append-system-prompt` copy lived there.
+
+
+async def test_route_is_not_told_it_is_in_an_outage(routed_app):
+    """A `/model qwen` switch is a choice, not a failure. Saying otherwise makes
+    the model hedge and decline work it can actually do."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True, route_system_file="")
+
+    await _post(app, _harness_request())
+
+    sent = json.dumps(recorder.payload)
+    assert "lost its network connection" not in sent, "route path got the FAILOVER prompt"
+    assert "chosen on purpose" in sent, sent[:400]
+
+
+async def test_operator_rules_survive_the_strip(routed_app, tmp_path):
+    """The rules the wrapper injects must reach the model on this path too."""
+    app, recorder, monkeypatch = routed_app
+    rules = tmp_path / "rules.md"
+    rules.write_text("EVERY BRANCH GETS A PR.\n", encoding="utf-8")
+    _pin(monkeypatch, route_bare=True, route_system_file=str(rules))
+
+    await _post(app, _harness_request())
+
+    assert "EVERY BRANCH GETS A PR." in json.dumps(recorder.payload)
+
+
+async def test_missing_rules_file_still_routes(routed_app, tmp_path):
+    """A documentation file must never be able to fail a request."""
+    app, recorder, monkeypatch = routed_app
+    _pin(monkeypatch, route_bare=True, route_system_file=str(tmp_path / "nope.md"))
+
+    resp = await _post(app, _harness_request())
+
+    assert resp.status_code == 200
+    assert "chosen on purpose" in json.dumps(recorder.payload)
+
+
+def test_failover_keeps_the_outage_prompt():
+    """The route change must not leak into failover, where the text IS true."""
+    from src.proxy.bare import OFFLINE_SYSTEM, ROUTE_SYSTEM, make_bare
+    from src.proxy.models import MessagesRequest
+
+    req = MessagesRequest.model_validate({
+        "model": "claude-opus-5",
+        "system": "harness",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    # The failover branch in routes.py passes OFFLINE_SYSTEM explicitly; the
+    # route path passes its own. Neither text leaks into the other.
+    assert make_bare(req, system=OFFLINE_SYSTEM).system == OFFLINE_SYSTEM
+    assert "lost its network connection" in OFFLINE_SYSTEM
+    assert "lost its network connection" not in ROUTE_SYSTEM
+
+
+# ── Profile mode: the direct path the wrapper is supposed to guard ───────────
+#
+# `bd switch ...; bd claude` runs the router in profile mode, which bypasses
+# MODEL_ROUTES entirely — so the hybrid branch above never executes and nothing
+# had honored the profile's bare contract. The `qwen` wrapper launches Claude
+# Code with --bare, but a caller who skips the wrapper reached the local tier
+# with the full harness attached. Ported from PR #61.
+
+
+@pytest.fixture
+def profile_app(monkeypatch):
+    """Profile mode: every request translates to the single active profile."""
+    recorder = RecordingClient()
+    monkeypatch.setattr(routes, "get_provider_client", lambda: recorder)
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        route_bare=True,
+        provider_base_url="http://localhost:11434/v1",
+        provider_model="qwen3.8:27b-obliterated",
+        qwen_cognee=False,
+    )
+    try:
+        yield app, recorder
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_profile_mode_strips_the_harness_when_route_bare_is_on(profile_app):
+    app, recorder = profile_app
+    resp = await _post(app, _harness_request(model="claude-opus-4-1"))
+    assert resp.status_code == 200
+
+    sent = json.dumps(recorder.payload)
+    assert HARNESS_SYSTEM[:200] not in sent, (
+        "profile mode bypasses MODEL_ROUTES, so nothing else strips this path"
+    )
+    assert len(sent) < 80_000, "the 80KB tool result must have been truncated too"
+
+
+async def test_profile_mode_keeps_the_operator_rules_it_strips(profile_app):
+    """The strip replaces the whole system prompt, so the rules must ride along.
+
+    This is the half PR #61 could not have had: it predates `route_system`, and
+    porting its plain make_bare call verbatim would have reintroduced the exact
+    bug that work fixed on the hybrid path — the session losing rules it is still
+    expected to follow because stripping deleted the only copy.
+    """
+    app, recorder = profile_app
+    resp = await _post(app, _harness_request(model="claude-opus-4-1"))
+    assert resp.status_code == 200
+
+    sent = json.dumps(recorder.payload)
+    assert "Nothing has failed and the network is up" in sent, (
+        "the replacement prompt must be ROUTE_SYSTEM: nothing failed on this path"
+    )
+    assert "lost its network connection" not in sent, (
+        "OFFLINE_SYSTEM here would tell a perfectly online model it is offline"
+    )
+
+
+async def test_profile_mode_leaves_the_harness_alone_when_route_bare_is_off(monkeypatch):
+    """route_bare is opt-in per profile; a wide tier keeps its harness."""
+    recorder = RecordingClient()
+    monkeypatch.setattr(routes, "get_provider_client", lambda: recorder)
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        route_bare=False,
+        provider_base_url="http://localhost:11434/v1",
+        provider_model="qwen3.8:27b-obliterated",
+        qwen_cognee=False,
+    )
+    try:
+        resp = await _post(app, _harness_request(model="claude-opus-4-1"))
+        assert resp.status_code == 200
+        assert HARNESS_SYSTEM[:200] in json.dumps(recorder.payload)
+    finally:
+        app.dependency_overrides.clear()
