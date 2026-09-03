@@ -1348,3 +1348,28 @@ credential fields empty so Claude uses dynamic registration.
 **Star this if you think the best coding agent should work with any model.**
 
 </div>
+
+## Working in this repo
+
+Python `>=3.11`, managed with **uv** (`uv.lock` is committed). pytest is configured
+in `pyproject.toml`. There is no Node toolchain here.
+
+```bash
+uv sync                       # install
+uv run pytest                 # full suite
+uv run pytest tests/<file>    # one file
+```
+
+Running a test you **expect** to fail? Suppress the test names. A red run exits 0 and
+gets recorded as a success, and test names are declarative sentences that the memory
+distiller inverts into architectural "rules":
+
+```bash
+uv run pytest -q --tb=no tests/<file>::<test> 2>&1 | tail -1
+echo "EXPECTED-RED: fails without the fix, as designed"
+```
+
+This repo is the **source**. The live control plane is operated by hand from an
+independent Terminal session, and machine hooks reject agent attempts to touch it —
+see `~/.claude/CLAUDE.md`, section "Backdoor live-control boundary". Agent
+instructions live in `CLAUDE.md`.
