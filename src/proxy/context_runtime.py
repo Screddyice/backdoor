@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import hashlib
 import time
@@ -34,6 +35,12 @@ class _StreamFlight:
     events: list[str] = field(default_factory=list)
     subscribers: set[asyncio.Queue[object]] = field(default_factory=set)
     task: asyncio.Task[None] | None = None
+
+
+@dataclass
+class _StreamLockState:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 def normalized_request_hash(client_kind: str, payload: Any) -> str:
@@ -69,7 +76,7 @@ class ContextRuntime:
         self._archive_task: asyncio.Task[None] | None = None
         self._complete_flights: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._stream_flights: dict[str, _StreamFlight] = {}
-        self._stream_locks: dict[str, asyncio.Lock] = {}
+        self._stream_locks: dict[str, _StreamLockState] = {}
         self._stream_subscriber_queue_size = stream_subscriber_queue_size
         self.archive_dropped = 0
         self._closed = False
@@ -149,7 +156,7 @@ class ContextRuntime:
         """Share a live stream and replay completed streams only after their terminal event."""
         cached: list[str] | None = None
         queue: asyncio.Queue[object] | None = None
-        async with self._stream_lock(key):
+        async with self._locked_stream(key):
             flight = self._stream_flights.get(key)
             if flight is None:
                 cached = await self._cached_stream(key)
@@ -370,7 +377,7 @@ class ContextRuntime:
     async def _publish_stream_event(
         self, key: str, flight: _StreamFlight, event: str
     ) -> None:
-        async with self._stream_lock(key):
+        async with self._locked_stream(key):
             if self._stream_flights.get(key) is not flight:
                 return
             flight.events.append(event)
@@ -380,7 +387,7 @@ class ContextRuntime:
     async def _finish_stream(
         self, key: str, flight: _StreamFlight, terminal: object
     ) -> None:
-        async with self._stream_lock(key):
+        async with self._locked_stream(key):
             if self._stream_flights.get(key) is not flight:
                 return
             for queue in tuple(flight.subscribers):
@@ -394,12 +401,24 @@ class ContextRuntime:
         except (asyncio.CancelledError, Exception):
             pass
 
-    def _stream_lock(self, key: str) -> asyncio.Lock:
-        lock = self._stream_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._stream_locks[key] = lock
-        return lock
+    @asynccontextmanager
+    async def _locked_stream(self, key: str) -> AsyncIterator[None]:
+        state = self._stream_locks.get(key)
+        if state is None:
+            state = _StreamLockState()
+            self._stream_locks[key] = state
+        state.users += 1
+        try:
+            async with state.lock:
+                yield
+        finally:
+            state.users -= 1
+            if (
+                state.users == 0
+                and key not in self._stream_flights
+                and self._stream_locks.get(key) is state
+            ):
+                self._stream_locks.pop(key, None)
 
     @staticmethod
     def _publish_to_subscriber(

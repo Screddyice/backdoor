@@ -229,3 +229,24 @@ async def test_slow_stream_subscriber_is_terminated_without_blocking_active_subs
     assert await active == ["one", "two", "three", "four"]
     with pytest.raises(RuntimeError, match="fell behind"):
         await anext(stalled)
+
+
+@pytest.mark.asyncio
+async def test_completed_streams_release_key_locks_without_breaking_same_key_replay(runtime):
+    calls = 0
+
+    async def factory():
+        nonlocal calls
+        calls += 1
+        yield "event"
+
+    results = await asyncio.gather(
+        *(collect(runtime.stream_once(f"key-{index}", factory)) for index in range(20))
+    )
+    first = await collect(runtime.stream_once("same", factory))
+    retry = await collect(runtime.stream_once("same", factory))
+
+    assert results == [["event"]] * 20
+    assert first == retry == ["event"]
+    assert calls == 21
+    assert runtime._stream_locks == {}
