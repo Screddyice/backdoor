@@ -1272,6 +1272,14 @@ The backend must also return usable summary text. On 2026-08-28 the action-tuned
 
 A short window works only when durable facts live outside the prompt. Backdoor reads the local claude-mem SQLite replica before each local turn and injects a bounded result as background context. This adds no MCP schema and still works when the network is down. `QWEN_MEMORY=0` disables recall.
 
+Automatic Qwen context compaction is specified for both Claude Messages and Codex Responses.
+When either client switches a mature task to Qwen, Backdoor will archive the exact transcript
+locally and send the 32K model a bounded 18K–22K working set. Cloud requests keep the full client
+history. Cognee remains an optional durable-memory layer rather than an outage dependency. See
+[`docs/superpowers/specs/2026-09-04-automatic-qwen-context-compaction-design.md`](docs/superpowers/specs/2026-09-04-automatic-qwen-context-compaction-design.md).
+
+A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
+
 Large fetched pages also bypass the model window at the proxy layer. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted to the local claude-mem worker. Browser-session tools never persist their output.
 
 Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Unapproved, authenticated, intranet, and client sources remain ephemeral. Approved source text is marked as untrusted data, high-confidence credential-shaped documents are not written, and stored source URLs exclude user information, query strings, and fragments. Individual documents are capped at 500,000 characters before ranking, and each request can enqueue at most four documents. Worker calls time out after 1.5 seconds and fail open, while the local 6,000-character reduction still protects Qwen's window.
