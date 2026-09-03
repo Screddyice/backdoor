@@ -35,7 +35,13 @@
 set -euo pipefail
 
 SVC="${1:-}"
-REF="${2:-origin/fix/codex-active-turn-budget}"
+# Trunk, since 2026-09-03: main now contains the deployed line (merged as
+# 6e10eaf), so it is the branch that actually advances. This defaulted to
+# origin/fix/codex-active-turn-budget while that was the live line; that branch
+# is merged and will not move again, so leaving it here would have quietly
+# pinned every future deploy to a frozen commit and reported "already at the
+# target" forever.
+REF="${2:-origin/main}"
 
 if [ -z "$SVC" ]; then
   echo "usage: RESTART_CMD='...' $0 <service-checkout-dir> [ref]" >&2
