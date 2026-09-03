@@ -21,6 +21,7 @@ class BytesStream(httpx.AsyncByteStream):
 @pytest.mark.asyncio
 async def test_claude_cloud_request_above_local_budget_stays_byte_faithful(
     monkeypatch,
+    tmp_path,
 ):
     payload = {
         "model": "claude-opus-5",
@@ -54,9 +55,14 @@ async def test_claude_cloud_request_above_local_budget_stays_byte_faithful(
     monkeypatch.setattr(routes, "load_profile_settings", local_path_must_not_run)
 
     settings = Settings(
+        _env_file=None,
         router_mode="hybrid",
         failover_to_local=True,
         route_max_input_tokens=28_000,
+        context_virtualization=True,
+        context_archive_path=str(tmp_path / "context" / "transcripts.sqlite3"),
+        context_tokenizer_executable="/missing/llama-tokenize",
+        context_tokenizer_model_path="/missing/model.gguf",
     )
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: settings
