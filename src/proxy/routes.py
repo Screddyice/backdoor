@@ -124,7 +124,21 @@ async def _upstream_send(request: Request, body: bytes, settings: Settings) -> h
     for attempt in range(2):
         ureq = upstream.build_request(request.method, url, content=body, headers=headers)
         try:
-            return await upstream.send(ureq, stream=True)
+            uresp = await upstream.send(ureq, stream=True)
+            if uresp.status_code >= 400:
+                # The relay is byte-faithful, and the call sites log only that a
+                # passthrough happened — so a 500 Anthropic returned looked
+                # exactly like a 200 in the log. On 2026-09-03 21:24 a session
+                # showed `API Error: 500 Internal server error` and the router
+                # had logged `→ passthrough [claude-opus-5] /v1/messages` for
+                # it, indistinguishable from the 2,000 turns that worked. One
+                # WARNING here makes every relayed error greppable, whichever
+                # handler relayed it, without adding a line per healthy turn.
+                logger.warning(
+                    "upstream %s %s → %d (relayed verbatim)",
+                    request.method, url, uresp.status_code,
+                )
+            return uresp
         except httpx.TransportError as exc:
             if attempt:
                 raise
@@ -795,6 +809,25 @@ async def create_message(
     except ProviderError as e:
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)
+    except httpx.TransportError as e:
+        # `except ProviderError` covers only a status the provider actually
+        # returned. A transport failure against the LOCAL provider matched
+        # nothing and escaped to uvicorn, whose only answer is a bare 500 —
+        # rendered by Claude Code as `API Error: 500 Internal server error`,
+        # with no line in the router log naming the tier or the timeout. It
+        # fired 62 times between 2026-08-26 and 2026-09-02, almost all of them
+        # `ReadTimeout` on a tier still prefilling past the 600s read budget.
+        #
+        # 504 for a timeout, 502 otherwise: both are truthful about a gateway
+        # that could not reach its backend, and both keep the client's own
+        # retry logic running instead of surfacing a server-side mystery.
+        status = 504 if isinstance(e, httpx.TimeoutException) else 502
+        logger.warning(
+            "Provider transport failure on %s (%s): %s", provider, type(e).__name__, e,
+        )
+        raise HTTPException(
+            status_code=status, detail=f"local provider {provider} unreachable: {e}"
+        ) from e
 
     result = nim_response_to_anthropic(
         resp, req, msg_id, settings.provider_strip_inline_thinking
@@ -850,6 +883,19 @@ async def _stream(
     except ProviderError as e:
         logger.error("Provider stream error %s: %s", e.status_code, e.message)
         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':e.message}})}\n\n"
+    except httpx.TransportError as e:
+        # The streaming twin of the `client.complete` gap below. Headers went
+        # out with the first heartbeat, so there is no status left to send —
+        # but an error EVENT still fits the SSE conversation, and letting the
+        # exception escape the generator instead makes uvicorn tear the
+        # connection down (`The response stopped arriving`) with the tier and
+        # the timeout named nowhere.
+        logger.warning(
+            "Provider stream transport failure on %s (%s): %s",
+            provider, type(e).__name__, e,
+        )
+        message = f"local provider {provider} unreachable: {e}"
+        yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':message}})}\n\n"
     finally:
         if pending is not None:
             pending.cancel()

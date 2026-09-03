@@ -611,6 +611,23 @@ A dead stream still runs the connectivity probe before anything opens. If Anthro
 Hanging up yourself does not count. `CancelledError` and `GeneratorExit` are not `httpx.TransportError`, so pressing Ctrl-C never pushes the breaker toward claiming the GPU.
 
 
+### A local tier that stops answering
+
+`API Error: 500 Internal server error` is what Claude Code shows you when a server breaks, and until now Backdoor could write one itself.
+
+Both local-provider call sites caught `ProviderError`, which covers a status Ollama returned and nothing else. A transport failure matched neither clause. In practice that meant `httpx.ReadTimeout` against a tier still prefilling past the 600s read budget: the exception escaped to uvicorn, uvicorn answered `500`, and the router log named neither the tier nor the timeout. It fired 62 times between 2026-08-26 16:19 and 2026-09-02 23:56, the last stretch of them every ten minutes on a scheduled caller.
+
+Both paths now answer for themselves:
+
+| | |
+|---|---|
+| Completion | `504` on a timeout and `502` on anything else, with the tier name in the body, so your client keeps its own retry and backoff |
+| Stream | An SSE `error` event, because the headers left with the first heartbeat and no status remains to send |
+| Either | One `Provider transport failure on <tier>` line carrying the exception name |
+
+The cloud side had the quieter half of the same problem. A relayed upstream error carried no status into the log, so a `500` from Anthropic and a turn that worked both printed `→ passthrough [claude-opus-5] /v1/messages` and nothing more. One session hit that on 2026-09-03 at 21:24, and the log could not tell you which side wrote the error. Backdoor now logs `upstream POST /v1/messages → 500 (relayed verbatim)` at WARNING for every relayed status at or above 400. Healthy turns still cost one line each.
+
+
 ### Forward-proxy mode: failover *and* Remote Control
 
 Setting `ANTHROPIC_BASE_URL` to the router costs you Claude Code's Remote Control. Claude Code only offers it when that variable is unset or points at `api.anthropic.com`:
