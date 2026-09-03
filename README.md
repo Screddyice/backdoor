@@ -833,6 +833,10 @@ The failover path is untouched and keeps `DEFAULT_SYSTEM`; `test_failover_keeps_
 
 #### Stripping bounds the prompt, not the transcript
 
+**Profile mode strips too, and did not until 2026-09-03.** `bd switch ...; bd claude` runs the router in profile mode, which translates every request to the single active profile and never enters the `MODEL_ROUTES` branch at all — so nothing had honored `ROUTE_BARE` on that path. The `qwen` wrapper launches Claude Code with `--bare`, which hid the gap: a caller who skipped the wrapper reached the local tier with the full harness attached, at a 32K window.
+
+It strips with `ROUTE_SYSTEM` and the operator rules, exactly like the `/model` path, and only when nothing has already stripped the request — failover replaces the prompt with `OFFLINE_SYSTEM`, and re-stripping there would tell an offline model the network is fine.
+
 `ROUTE_BARE` fixes the *prompt* and leaves the *conversation* alone, and the conversation is the half that grows. A long-lived `qwen` session therefore walks past its own window with nothing to stop it — and because `MODEL_ROUTES` is a static dict, it never consults `FAILOVER_LADDER`, which is the one place that would have handed it to a wider tier.
 
 Observed 2026-08-12: a `qwen` session sent **143,490 tokens at the 27B's 32K window, 87 times over ~17 hours**, failing and retrying every 5–10 minutes and loading 23GB of a 36GB host on every attempt. The window was configured correctly. There was simply no route from "too big for this tier" to "use the wider one".
