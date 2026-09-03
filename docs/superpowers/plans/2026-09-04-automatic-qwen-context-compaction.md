@@ -126,7 +126,7 @@ git commit -m "feat(context): define bounded Qwen route policy"
 
 - Produces: `ContextSegment(segment_id: str, role: str, kind: str, exact_json: str, searchable_text: str, pair_id: str | None)`
 - Produces: `NormalizedContext(client_kind: Literal["claude", "codex"], model: str, segments: tuple[ContextSegment, ...], current_segment_id: str, native: dict[str, Any])`
-- Produces: `ContextAdapter` protocol with `normalize(payload: Any) -> NormalizedContext` and `rebuild(context: NormalizedContext, selected_ids: Collection[str], recalled: Sequence[StoredSegment] = ()) -> Any`
+- Produces: `ContextAdapter` protocol with `normalize(payload: Any) -> NormalizedContext` and `rebuild(context: NormalizedContext, selected_ids: Collection[str], historical_text: str | None = None) -> Any`
 - Produces: `ClaudeContextAdapter.normalize(req: MessagesRequest) -> NormalizedContext`
 - Produces: `ClaudeContextAdapter.rebuild(context: NormalizedContext, selected_ids: Collection[str]) -> MessagesRequest`
 - Produces: `CodexContextAdapter.normalize(payload: dict[str, Any]) -> NormalizedContext`
@@ -199,7 +199,7 @@ class ContextAdapter(Protocol):
         self,
         context: NormalizedContext,
         selected_ids: Collection[str],
-        recalled: Sequence[StoredSegment] = (),
+        historical_text: str | None = None,
     ) -> Any: ...
 ```
 
@@ -368,7 +368,7 @@ Keep current instruction, active pair, recent turns, active paths/errors, and FT
 
 - [ ] **Step 5: Implement exact tokenizer with conservative fallback**
 
-Render the provider JSON in the same message/tool order used by the Ollama client. Invoke `llama-tokenize` with the configured local GGUF and a 12-second timeout. If the executable or model is unavailable, use UTF-8 byte length divided by two as a conservative upper bound. Raise `ContextLimitError` unless one method proves the payload fits.
+Render the provider JSON in the same message/tool order used by the Ollama client. Invoke `llama-tokenize` with the configured local GGUF and a 12-second timeout. If the executable or model is unavailable, use the full UTF-8 byte length as a conservative token upper bound. Raise `ContextLimitError` unless one method proves the payload fits.
 
 - [ ] **Step 6: Run selector and tokenizer tests**
 
@@ -571,7 +571,7 @@ git commit -m "feat(context): compact Claude tasks on Qwen routes"
 - [ ] **Step 1: Write a failing 142K Codex local-route test**
 
 ```python
-async def test_codex_qwen_route_compacts_142k_history(app, ollama):
+async def test_codex_qwen_route_compacts_142k_history(app, ollama, open_codex_breaker):
     payload = codex_payload_with_history(tokens=142_000)
     response = await app.post("/backend-api/codex/responses", json=payload)
     assert response.status_code == 200
