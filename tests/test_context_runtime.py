@@ -103,3 +103,129 @@ async def test_identical_stream_retries_share_one_generation(runtime):
 
     assert left == right == ["one", "two"]
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_replays_existing_flight_after_a_stale_cache_miss(runtime, monkeypatch):
+    factory_started = asyncio.Event()
+    release_factory = asyncio.Event()
+    cache_reads = 0
+    calls = 0
+
+    async def stale_cache_read(_key):
+        nonlocal cache_reads
+        cache_reads += 1
+        if cache_reads == 2:
+            await asyncio.Event().wait()
+        return None
+
+    async def factory():
+        nonlocal calls
+        calls += 1
+        yield "one"
+        factory_started.set()
+        await release_factory.wait()
+        yield "two"
+
+    monkeypatch.setattr(runtime, "_cached_stream", stale_cache_read)
+    first = asyncio.create_task(collect(runtime.stream_once("same", factory)))
+    await factory_started.wait()
+    second = asyncio.create_task(collect(runtime.stream_once("same", factory)))
+    release_factory.set()
+
+    assert await asyncio.wait_for(first, timeout=1) == ["one", "two"]
+    assert await asyncio.wait_for(second, timeout=1) == ["one", "two"]
+    assert calls == 1
+    assert cache_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_cancellation_during_cache_persistence_notifies_subscribers(runtime, monkeypatch):
+    persistence_started = asyncio.Event()
+
+    async def wait_to_persist(_key, _events):
+        persistence_started.set()
+        await asyncio.Event().wait()
+
+    async def factory():
+        yield "one"
+
+    monkeypatch.setattr(runtime, "_store_stream", wait_to_persist)
+    consumer = asyncio.create_task(collect(runtime.stream_once("same", factory)))
+    await persistence_started.wait()
+
+    runtime.close()
+
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+
+@pytest.mark.asyncio
+async def test_prepare_local_fallback_keeps_optional_tail_below_target(runtime, adapter):
+    fallback_context = adapter.normalize(
+        MessagesRequest.model_validate(
+            {
+                "model": "qwen",
+                "messages": [
+                    {"role": "user", "content": "old optional history " * 150},
+                    {"role": "user", "content": "current-marker " + "x" * 16_000},
+                ],
+            }
+        )
+    )
+    runtime.store.archive = Mock(side_effect=ContextStoreUnavailable())
+
+    prepared = await runtime.prepare_local(
+        fallback_context,
+        adapter,
+        Settings(
+            _env_file=None,
+            context_virtualization=True,
+            context_target_input_tokens=18_000,
+            context_hard_input_tokens=22_000,
+        ),
+    )
+
+    assert prepared.token_count <= 18_000
+    assert "current-marker" in prepared.payload.model_dump_json()
+    assert "old optional history" not in prepared.payload.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_prepare_local_prunes_after_successful_archive(runtime, adapter, context):
+    runtime.store.prune_if_needed = Mock(return_value=0)
+
+    await runtime.prepare_local(context, adapter, Settings(_env_file=None, context_virtualization=True))
+
+    runtime.store.prune_if_needed.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_slow_stream_subscriber_is_terminated_without_blocking_active_subscribers(
+    tmp_path,
+):
+    settings = Settings(_env_file=None, context_response_cache_seconds=0)
+    runtime = ContextRuntime(
+        ContextStore(tmp_path / "private" / "transcripts.sqlite3"),
+        QwenTokenGate(executable="/missing/llama-tokenize", model_path="/missing/model.gguf"),
+        settings,
+        stream_subscriber_queue_size=1,
+    )
+    release_factory = asyncio.Event()
+
+    async def factory():
+        yield "one"
+        await release_factory.wait()
+        for event in ("two", "three", "four"):
+            yield event
+            await asyncio.sleep(0)
+
+    stalled = runtime.stream_once("same", factory)
+    assert await anext(stalled) == "one"
+    active = asyncio.create_task(collect(runtime.stream_once("same", factory)))
+    await asyncio.sleep(0)
+    release_factory.set()
+
+    assert await active == ["one", "two", "three", "four"]
+    with pytest.raises(RuntimeError, match="fell behind"):
+        await anext(stalled)

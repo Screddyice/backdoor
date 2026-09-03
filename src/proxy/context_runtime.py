@@ -54,8 +54,11 @@ class ContextRuntime:
         settings: Settings | None = None,
         *,
         archive_queue_size: int = 64,
+        stream_subscriber_queue_size: int = 64,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        if stream_subscriber_queue_size <= 0:
+            raise ValueError("stream_subscriber_queue_size must be positive")
         self.store = store
         self.token_gate = token_gate
         self.settings = settings or Settings(_env_file=None)
@@ -66,6 +69,8 @@ class ContextRuntime:
         self._archive_task: asyncio.Task[None] | None = None
         self._complete_flights: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._stream_flights: dict[str, _StreamFlight] = {}
+        self._stream_locks: dict[str, asyncio.Lock] = {}
+        self._stream_subscriber_queue_size = stream_subscriber_queue_size
         self.archive_dropped = 0
         self._closed = False
 
@@ -91,6 +96,11 @@ class ContextRuntime:
         try:
             async with asyncio.timeout(settings.context_archive_timeout_seconds):
                 lineage = await asyncio.to_thread(self.store.archive, context)
+            try:
+                async with asyncio.timeout(settings.context_archive_timeout_seconds):
+                    await asyncio.to_thread(self.store.prune_if_needed, self._clock())
+            except (ContextStoreUnavailable, TimeoutError):
+                pass
             async with asyncio.timeout(settings.context_assembly_timeout_seconds):
                 selected_ids, retrieved = await asyncio.to_thread(
                     self._select_from_store, context, adapter, lineage, settings
@@ -137,22 +147,31 @@ class ContextRuntime:
         factory: Callable[[], AsyncIterator[str]],
     ) -> AsyncIterator[str]:
         """Share a live stream and replay completed streams only after their terminal event."""
-        cached = await self._cached_stream(key)
+        cached: list[str] | None = None
+        queue: asyncio.Queue[object] | None = None
+        async with self._stream_lock(key):
+            flight = self._stream_flights.get(key)
+            if flight is None:
+                cached = await self._cached_stream(key)
+                if cached is None:
+                    flight = _StreamFlight()
+                    self._stream_flights[key] = flight
+            if flight is not None:
+                queue = asyncio.Queue(maxsize=self._stream_subscriber_queue_size)
+                for event in flight.events:
+                    self._publish_to_subscriber(flight, queue, event)
+                flight.subscribers.add(queue)
+                if flight.task is None:
+                    flight.task = asyncio.create_task(self._produce_stream(key, flight, factory))
+                    flight.task.add_done_callback(self._consume_task_result)
+
         if cached is not None:
             for event in cached:
                 yield event
             return
 
-        flight = self._stream_flights.get(key)
-        queue: asyncio.Queue[object] = asyncio.Queue()
-        if flight is None:
-            flight = _StreamFlight()
-            self._stream_flights[key] = flight
-        for event in flight.events:
-            queue.put_nowait(event)
-        flight.subscribers.add(queue)
-        if flight.task is None:
-            flight.task = asyncio.create_task(self._produce_stream(key, flight, factory))
+        if flight is None or queue is None:  # Defensive: either a cache or a flight exists above.
+            raise RuntimeError("stream runtime could not establish a replay source")
 
         try:
             while True:
@@ -176,7 +195,6 @@ class ContextRuntime:
             if task is not None:
                 task.cancel()
         self._complete_flights.clear()
-        self._stream_flights.clear()
 
     def _start_archive_worker(self) -> None:
         if self._archive_task is not None and not self._archive_task.done():
@@ -230,15 +248,31 @@ class ContextRuntime:
         adapter: ContextAdapter,
         settings: Settings,
     ) -> tuple[str, ...]:
+        current = next(
+            segment for segment in context.segments if segment.segment_id == context.current_segment_id
+        )
         selected = selected_with_pairs(context.segments, {context.current_segment_id})
+        for segment in context.segments:
+            if segment.ordinal <= current.ordinal or segment.pair_id is None:
+                continue
+            candidate = selected_with_pairs(context.segments, selected | {segment.segment_id})
+            payload = adapter.rebuild(context, candidate)
+            if (
+                self.token_gate.count(self._provider_payload(payload)).tokens
+                > settings.context_hard_input_tokens
+            ):
+                raise ContextLimitError("active_pair_over_limit")
+            selected = candidate
         for segment in reversed(context.segments):
+            if segment.segment_id in selected:
+                continue
             candidate = selected_with_pairs(
                 context.segments, selected | {segment.segment_id}
             )
             payload = adapter.rebuild(context, candidate)
             if (
                 self.token_gate.count(self._provider_payload(payload)).tokens
-                <= settings.context_hard_input_tokens
+                <= settings.context_target_input_tokens
             ):
                 selected = candidate
         return tuple(
@@ -309,31 +343,75 @@ class ContextRuntime:
         flight: _StreamFlight,
         factory: Callable[[], AsyncIterator[str]],
     ) -> None:
+        terminal: object = _STREAM_DONE
         try:
             async for event in factory():
-                flight.events.append(event)
-                for queue in tuple(flight.subscribers):
-                    queue.put_nowait(event)
+                await self._publish_stream_event(key, flight, event)
+            await self._store_stream(key, flight.events)
         except BaseException as exc:
-            for queue in tuple(flight.subscribers):
-                queue.put_nowait(exc)
+            terminal = exc
             raise
-        else:
-            if self.settings.context_response_cache_seconds:
-                try:
-                    await asyncio.to_thread(
-                        self.store.put_cached_response,
-                        f"stream:{key}",
-                        {_STREAM_CACHE_FIELD: flight.events},
-                        self._clock() + self.settings.context_response_cache_seconds,
-                    )
-                except ContextStoreUnavailable:
-                    pass
-            for queue in tuple(flight.subscribers):
-                queue.put_nowait(_STREAM_DONE)
         finally:
-            if self._stream_flights.get(key) is flight:
-                self._stream_flights.pop(key, None)
+            await asyncio.shield(self._finish_stream(key, flight, terminal))
+
+    async def _store_stream(self, key: str, events: list[str]) -> None:
+        if not self.settings.context_response_cache_seconds:
+            return
+        try:
+            await asyncio.to_thread(
+                self.store.put_cached_response,
+                f"stream:{key}",
+                {_STREAM_CACHE_FIELD: events},
+                self._clock() + self.settings.context_response_cache_seconds,
+            )
+        except ContextStoreUnavailable:
+            pass
+
+    async def _publish_stream_event(
+        self, key: str, flight: _StreamFlight, event: str
+    ) -> None:
+        async with self._stream_lock(key):
+            if self._stream_flights.get(key) is not flight:
+                return
+            flight.events.append(event)
+            for queue in tuple(flight.subscribers):
+                self._publish_to_subscriber(flight, queue, event)
+
+    async def _finish_stream(
+        self, key: str, flight: _StreamFlight, terminal: object
+    ) -> None:
+        async with self._stream_lock(key):
+            if self._stream_flights.get(key) is not flight:
+                return
+            for queue in tuple(flight.subscribers):
+                self._publish_to_subscriber(flight, queue, terminal)
+            self._stream_flights.pop(key, None)
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _stream_lock(self, key: str) -> asyncio.Lock:
+        lock = self._stream_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._stream_locks[key] = lock
+        return lock
+
+    @staticmethod
+    def _publish_to_subscriber(
+        flight: _StreamFlight, queue: asyncio.Queue[object], item: object
+    ) -> None:
+        if queue.full():
+            while not queue.empty():
+                queue.get_nowait()
+            queue.put_nowait(RuntimeError("stream subscriber fell behind"))
+            flight.subscribers.discard(queue)
+            return
+        queue.put_nowait(item)
 
     @staticmethod
     def _provider_payload(payload: Any) -> dict[str, Any]:
