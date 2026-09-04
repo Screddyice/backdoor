@@ -46,7 +46,7 @@ import hashlib
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .tokens import count_messages
 
@@ -190,3 +190,44 @@ def _remember(key: str, start: int) -> None:
     _boundaries.move_to_end(key)
     while len(_boundaries) > _MAX_TRACKED:
         _boundaries.popitem(last=False)
+
+
+def sticky_start(
+    units: list[Any],
+    count_fn: Callable[[list[Any]], int],
+    *,
+    key: str,
+    target: int,
+    ceiling: int,
+) -> tuple[int, bool]:
+    """Shape-agnostic version of `bound`: returns `(start_index, rebuilt)`.
+
+    `bound` speaks Anthropic Messages. Codex speaks Responses items, which are
+    plain dicts with a different notion of a turn, but the property both need is
+    the same one and it is worth having exactly once: a boundary that is chosen
+    when the ceiling is crossed and then REUSED, so the model keeps seeing a
+    prefix it has already processed.
+
+    The caller supplies `count_fn` because only it knows how its own payload is
+    serialized, and pairing rules (a tool result without its call) are the
+    caller's to enforce on the returned index.
+    """
+    if not units:
+        return 0, False
+    if count_fn(units) <= ceiling:
+        _remember(key, 0)
+        return 0, False
+
+    remembered = _boundaries.get(key)
+    if remembered is not None and 0 < remembered < len(units):
+        if count_fn(units[remembered:]) <= ceiling:
+            _remember(key, remembered)
+            return remembered, False
+
+    start = len(units)
+    while start > 0:
+        if count_fn(units[start - 1:]) > target:
+            break
+        start -= 1
+    _remember(key, start)
+    return start, True
