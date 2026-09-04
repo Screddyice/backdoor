@@ -401,6 +401,20 @@ class FailoverBreaker:
         which is noise rather than information — and the recovery ticker makes
         transitions more frequent, not less, so the rationing has to exist for it
         to be an improvement.
+
+        Rationed on two axes, because there are two ways to say the same thing
+        twice. The cooldown covers one breaker flapping over time. The peer check
+        covers one outage hitting several breakers at once: a dropped link takes
+        every upstream with it, and each breaker used to announce that
+        separately — the outages at 22:13 and 23:43 on 2026-09-03 produced four
+        popups each for one Wi-Fi blip. A per-breaker cooldown cannot collapse
+        those, because they are different breakers. "You are on the local model"
+        is one fact about this machine, so it is said once, by whichever breaker
+        got there first.
+
+        A breaker failing while every peer is healthy still speaks — that is a
+        report about that upstream, not a duplicate. Codex timing out on a
+        working link at 23:57 that same night was the only news there was.
         """
         if (
             self._last_open_notice_at is not None
@@ -408,9 +422,22 @@ class FailoverBreaker:
         ):
             self._announced = False
             return
+        if self._peer_open():
+            self._announced = False
+            return
         self._last_open_notice_at = now
         self._announced = True
         self._notify(f"Backdoor {self.source} failover", message)
+
+    def _peer_open(self) -> bool:
+        """Is another breaker on this router already serving from the local tier?
+
+        Reads the same registry :meth:`_publish` maintains, and is called before
+        this breaker publishes its own open — so it sees peers only. Missing key
+        means no peer has ever opened, which is the answer a fresh router gives.
+        """
+        active = _ACTIVE_BREAKERS.get(self._state_path)
+        return any(source != self.source for source in (active or ()))
 
     def _publish(self) -> None:
         """Write breaker state where other local-GPU consumers can read it.
