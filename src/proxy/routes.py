@@ -18,6 +18,7 @@ from .config import (
 from .bare import OFFLINE_SYSTEM, make_bare, parse_keep, route_system
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
+from .provider_errors import is_provider_edge_404
 from . import compute_lease, mlx_admin, ollama_admin, tier_lock, working_set
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
@@ -273,7 +274,11 @@ _breaker_failure_lock = asyncio.Lock()
 
 
 async def _record_failure(
-    br: FailoverBreaker, reason: str, *, transport_error: bool = True
+    br: FailoverBreaker,
+    reason: str,
+    *,
+    transport_error: bool = True,
+    confirmed_service_failure: bool = False,
 ) -> bool:
     """Record a failure without freezing the router, and without racing.
 
@@ -294,7 +299,12 @@ async def _record_failure(
     """
     async with _breaker_failure_lock:
         probe = asyncio.create_task(
-            asyncio.to_thread(br.record_failure, reason, transport_error=transport_error)
+            asyncio.to_thread(
+                br.record_failure,
+                reason,
+                transport_error=transport_error,
+                confirmed_service_failure=confirmed_service_failure,
+            )
         )
         try:
             return await asyncio.shield(probe)
@@ -641,14 +651,32 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         if await _record_failure(br, type(e).__name__):
             return None
         raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
-    if uresp.status_code in FAILOVER_STATUSES:
+    if uresp.status_code in FAILOVER_STATUSES or uresp.status_code == 404:
         err_body = await uresp.aread()  # decoded: content-encoding is undone here
         err_headers = _decoded_relay_headers(uresp)
         await uresp.aclose()
-        if await _record_failure(br, f"HTTP {uresp.status_code}", transport_error=False):
-            return None
-        # Below the threshold: relay the error verbatim so the client's own
-        # retry/backoff logic still runs (a lone 429 is normal backpressure).
+        edge_404 = is_provider_edge_404(uresp.status_code, uresp.headers, err_body)
+        if uresp.status_code in FAILOVER_STATUSES or edge_404:
+            reason = "HTTP 404 provider edge" if edge_404 else f"HTTP {uresp.status_code}"
+            if edge_404:
+                logger.warning(
+                    "Anthropic provider edge returned an unstructured 404; "
+                    "counting it as outage evidence"
+                )
+            if await _record_failure(
+                br, reason, transport_error=False, confirmed_service_failure=edge_404
+            ):
+                return None
+            # Below the threshold: relay the error verbatim so the client's own
+            # retry/backoff logic still runs (a lone 429 is normal backpressure).
+            return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
+
+        # A structured API 404 is a valid response (for example, an invalid
+        # model). Keep it visible and let it close a half-open breaker.
+        was_open = br.open
+        await _record_success(br)
+        if was_open:
+            await _release_claims(br, settings)
         return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
     was_open = br.open
     await _record_success(br)

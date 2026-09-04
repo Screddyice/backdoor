@@ -29,6 +29,7 @@ from .external_context import (
 from .memory_recall import recall_context
 from .config import Settings, get_settings
 from .failover import FailoverBreaker, service_reachable
+from .provider_errors import is_provider_edge_404
 from . import compute_lease, mlx_admin, ollama_admin, tier_lock
 
 logger = logging.getLogger(__name__)
@@ -775,7 +776,10 @@ async def codex_responses(
             return await _serve_local(payload, settings, breaker, correlation_id, started)
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable") from exc
 
-    if failover_enabled and response.status_code in _failover_statuses(settings):
+    if failover_enabled and (
+        response.status_code in _failover_statuses(settings)
+        or response.status_code == 404
+    ):
         decoded = await response.aread()
         headers = {
             key: value
@@ -783,11 +787,35 @@ async def codex_responses(
             if key.lower() not in _DECODED_SKIP_RESPONSE_HEADERS
         }
         await response.aclose()
-        if breaker.record_failure(
-            f"HTTP {response.status_code}", transport_error=False
-        ):
-            payload = _decode_local_payload(body, request, settings)
-            return await _serve_local(payload, settings, breaker, correlation_id, started)
+        edge_404 = is_provider_edge_404(
+            response.status_code, response.headers, decoded
+        )
+        if response.status_code in _failover_statuses(settings) or edge_404:
+            reason = (
+                "HTTP 404 provider edge"
+                if edge_404
+                else f"HTTP {response.status_code}"
+            )
+            if edge_404:
+                logger.warning(
+                    "ChatGPT Codex provider edge returned an unstructured 404; "
+                    "counting it as outage evidence id=%s",
+                    correlation_id,
+                )
+            if breaker.record_failure(reason, transport_error=False):
+                payload = _decode_local_payload(body, request, settings)
+                return await _serve_local(
+                    payload, settings, breaker, correlation_id, started
+                )
+            return Response(
+                content=decoded,
+                status_code=response.status_code,
+                headers=headers,
+            )
+
+        # A structured API 404 proves that the endpoint is reachable. Preserve
+        # the provider's error instead of hiding an invalid model or request.
+        breaker.record_success()
         return Response(content=decoded, status_code=response.status_code, headers=headers)
 
     logger.info(

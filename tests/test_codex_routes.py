@@ -689,8 +689,6 @@ async def test_disabling_local_failover_always_relays_trigger_statuses(
 
 
 class _GateClock:
-    """Fake monotonic clock so a duration gate needs no real sleeping."""
-
     def __init__(self):
         self.t = 1000.0
 
@@ -703,20 +701,7 @@ class _GateClock:
 async def test_trigger_failure_uses_qwen_once_the_gate_elapses(
     codex_app, monkeypatch, failure
 ):
-    """Production policy: relay while the gate holds, then serve from Qwen.
-
-    Asserted immediate failover when PR #91 wrote it, on the reasoning that
-    Codex Desktop surfaces a 502 rather than retrying, so any hold-down is a
-    visible error. On 2026-09-03 the Claude gate came down from 30s to 10s and
-    Codex was aligned to it: the gap between the paths became 10s of visible
-    errors against 10s of retried ones rather than 60s against none, and the
-    gate buys both paths the same thing — not loading a 17GB local tier for a
-    blip, when 48% of measured outage bursts are under two seconds.
-
-    Both halves are asserted here, because the failure mode this replaces is
-    real: if the gate ever stops elapsing, this must fail rather than quietly
-    relay forever.
-    """
+    """Codex relays failures for 20 seconds, then serves through Qwen."""
     app, settings, breaker = codex_app
     local_calls = 0
 
@@ -758,15 +743,13 @@ async def test_trigger_failure_uses_qwen_once_the_gate_elapses(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
     ) as client:
-        # While the gate holds, the failure is relayed rather than failed over.
         first = await client.post(
             "/backend-api/codex/responses", content=FIXTURE.read_bytes()
         )
-        assert first.status_code != 200, "the gate must not serve locally yet"
+        assert first.status_code != 200
         assert local_calls == 0
         assert not breaker.open
 
-        # Once it has elapsed, the next trigger-class failure goes to Qwen.
         clock.t += settings.codex_failover_min_outage_seconds + 1
         response = await client.post(
             "/backend-api/codex/responses", content=FIXTURE.read_bytes()
