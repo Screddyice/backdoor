@@ -370,13 +370,15 @@ def quiet_inflight():
     """Reset the module-level in-flight bookkeeping around each test."""
     from src.proxy import routes
 
-    routes._failover_inflight = 0
+    routes._local_inflight = 0
     routes._deferred_unloads = set()
+    routes._deferred_evictions = set()
     try:
         yield routes
     finally:
-        routes._failover_inflight = 0
+        routes._local_inflight = 0
         routes._deferred_unloads = set()
+        routes._deferred_evictions = set()
         routes._breaker = None
 
 
@@ -395,7 +397,7 @@ async def test_close_defers_release_while_a_failover_stream_is_open(
     assert br.open
     br.note_claim(OLLAMA, "qwen3.5:4b-256k")
 
-    routes._failover_stream_started()  # a response is mid-generation on that tier
+    routes._local_stream_started()  # a response is mid-generation on that tier
     br.record_success()
     await routes._release_claims(br, Settings(router_mode="hybrid"))
 
@@ -412,16 +414,16 @@ async def test_last_stream_out_releases_the_deferred_tier(quiet_inflight, fake_h
     br.note_claim(OLLAMA, "qwen3.5:4b-256k")
     settings = Settings(router_mode="hybrid")
 
-    routes._failover_stream_started()
-    routes._failover_stream_started()  # two sessions failed over onto one tier
+    routes._local_stream_started()
+    routes._local_stream_started()  # two sessions failed over onto one tier
     br.record_success()
     await routes._release_claims(br, settings)
 
-    due = routes._failover_stream_ended()
+    due = routes._local_stream_ended()
     assert due == set(), "released while the second stream was still generating"
     assert _unloads(fake_http) == []
 
-    due = routes._failover_stream_ended()
+    due = routes._local_stream_ended()
     assert due == {(OLLAMA, "qwen3.5:4b-256k")}
     routes._breaker = br  # _release_deferred re-checks the live breaker
     await routes._release_deferred(due, settings)
@@ -442,7 +444,7 @@ async def test_a_fresh_outage_keeps_the_tier_resident(quiet_inflight, fake_http)
     br.note_claim(OLLAMA, "qwen3.5:4b-256k")
     settings = Settings(router_mode="hybrid")
 
-    routes._failover_stream_started()
+    routes._local_stream_started()
     br.record_success()
     await routes._release_claims(br, settings)
 
@@ -450,7 +452,7 @@ async def test_a_fresh_outage_keeps_the_tier_resident(quiet_inflight, fake_http)
     br.record_failure("ConnectError")
     assert br.open
 
-    due = routes._failover_stream_ended()
+    due = routes._local_stream_ended()
     routes._breaker = br
     await routes._release_deferred(due, settings)
     assert _unloads(fake_http) == []
@@ -470,9 +472,102 @@ async def test_tracked_stream_clears_its_slot_on_error(quiet_inflight):
         yield "event: ping\n\n"
         raise httpx.ReadTimeout("upstream went away")
 
-    tracked = routes._tracked_failover_stream(boom(), Settings(router_mode="hybrid"))
+    tracked = routes._tracked_local_stream(boom(), Settings(router_mode="hybrid"))
     assert await tracked.__anext__() == "event: ping\n\n"
-    assert routes._failover_inflight == 1
+    assert routes._local_inflight == 1
     with pytest.raises(httpx.ReadTimeout):
         await tracked.__anext__()
-    assert routes._failover_inflight == 0
+    assert routes._local_inflight == 0
+
+
+# --------------------------------------------------------------------------
+# Escalation frees the tier it leaves
+# --------------------------------------------------------------------------
+# A `/model qwen` session that outgrows the 27B escalates to the 256K 4B, and
+# until 2026-09-05 nothing freed the 27B: a route holds no breaker claim, so no
+# close would ever release it, and Ollama keeps it for OLLAMA_KEEP_ALIVE.
+#
+# Measured 2026-09-05 with the 27B alone resident: 22.0 GB wired of a ~27 GB
+# ceiling on a 36 GB host. The 256K 4B wants ~13 GB more, so the two do not fit
+# and Ollama is free to try holding both (OLLAMA_MAX_LOADED_MODELS=3). The MLX
+# side of the same collision has been guarded since 2026-08-24; this is the
+# Ollama-to-Ollama half.
+
+HEAVY = "qwen3.8:27b-obliterated"
+
+
+@pytest.mark.asyncio
+async def test_escalation_evicts_the_tier_it_left(quiet_inflight, fake_http):
+    routes = quiet_inflight
+
+    await routes._evict_outgoing_tier(OLLAMA, HEAVY)
+
+    assert _unloads(fake_http) == [HEAVY], "the outgoing tier stayed resident"
+    assert routes._deferred_evictions == set()
+
+
+@pytest.mark.asyncio
+async def test_escalation_waits_for_a_live_local_response(quiet_inflight, fake_http):
+    """The 2026-08-26 stall, reached through the escalation door instead."""
+    routes = quiet_inflight
+    routes._local_stream_started()  # another session is generating on that tier
+
+    await routes._evict_outgoing_tier(OLLAMA, HEAVY)
+
+    assert _unloads(fake_http) == [], "evicted a tier a live response was using"
+    assert routes._deferred_evictions == {(OLLAMA, HEAVY)}
+
+
+@pytest.mark.asyncio
+async def test_last_response_out_evicts_the_deferred_tier(quiet_inflight, fake_http):
+    routes = quiet_inflight
+    routes._local_stream_started()
+    await routes._evict_outgoing_tier(OLLAMA, HEAVY)
+    assert _unloads(fake_http) == []
+
+    routes._local_stream_ended()
+    await routes._drain_deferred_evictions()
+
+    assert _unloads(fake_http) == [HEAVY]
+    assert routes._deferred_evictions == set()
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_eviction_holds_while_any_response_is_open(
+    quiet_inflight, fake_http
+):
+    """Two concurrent responses: the first one out must not free the tier."""
+    routes = quiet_inflight
+    routes._local_stream_started()
+    routes._local_stream_started()
+    await routes._evict_outgoing_tier(OLLAMA, HEAVY)
+
+    routes._local_stream_ended()
+    await routes._drain_deferred_evictions()
+    assert _unloads(fake_http) == [], "freed the tier with one response still open"
+
+    routes._local_stream_ended()
+    await routes._drain_deferred_evictions()
+    assert _unloads(fake_http) == [HEAVY]
+
+
+@pytest.mark.asyncio
+async def test_a_route_response_defers_a_breaker_release_too(quiet_inflight, fake_http):
+    """The in-flight count covers routes, not just failover.
+
+    Before 2026-09-05 only failover streams were counted, so a breaker closing
+    during a deliberate `/model qwen` response would unload the tier that
+    response was generating on.
+    """
+    routes = quiet_inflight
+    br = make_breaker()
+    br.record_failure("ConnectError")
+    br.record_failure("ConnectError")
+    br.note_claim(OLLAMA, "qwen3.5:4b-256k")
+
+    routes._local_stream_started()  # a ROUTE response, holding no claim
+    br.record_success()
+    await routes._release_claims(br, Settings(router_mode="hybrid"))
+
+    assert _unloads(fake_http) == []
+    assert routes._deferred_unloads == {(OLLAMA, "qwen3.5:4b-256k")}

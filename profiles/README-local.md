@@ -255,9 +255,10 @@ continues with local tools. The environment form remains available for scripts:
 ## Full harness is the default (lean is the speed escape hatch)
 
 On the 32B, prompt size made full mode unusable (minutes/turn), so lean was the
-default. With the billing-header cache fix and MCP off, full mode on the 9B @ 64K
-is ~40s first turn / ~8s warm turns — so the full harness (hooks, auto-memory,
-briefing, loop) is the default.
+default. With the billing-header cache fix and MCP off, full mode measured ~40s first
+turn / ~8s warm turns on the 9B @ 64K — so the full harness (hooks, auto-memory,
+briefing, loop) is the default. That tier is gone; `qwen full` now resolves to
+the 4B @ 64K, which is the only tier whose window holds the full harness.
 
 `qwen lean` still launches with:
 
@@ -332,7 +333,10 @@ the Claude Fable 5 prompt from the public `system_prompts_leaks` repo,
 stored at `prompts/claude-fable-5-system.md` (43,112 tokens measured).
 
 Coverage (one Modelfile per tag in `modelfiles/`):
-- All six qwen3.5 tags: `4b`, `9b`, `4b-64k`, `9b-64k`, `9b-128k`, `9b-256k`.
+- The qwen3.5 4B variant tags: `4b-64k`, `4b-128k`, `4b-256k`, `4b-mem`. The
+  bare `qwen3.5:4b` is skipped on purpose — it has no suffix, so building it
+  would clobber the upstream registry tag. The four 9B tags went with the 9B
+  routes on 2026-08-31 (#70).
 - Persona variants of the council models: `llama3.1:8b-fable` and
   `gemma3:12b-fable` (num_ctx 65536 so the prompt fits).
 

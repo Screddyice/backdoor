@@ -268,6 +268,29 @@ class Settings(BaseSettings):
     # request escalates through that ladder instead of failing.
     route_max_input_tokens: int = 0
 
+    # Bound the transcript itself, and keep the boundary STICKY once chosen.
+    #
+    # Escalating a huge session to a wider tier keeps every token but pays for
+    # it in one long stall: measured 2026-09-05, `qwen3.5:4b-256k` prefills
+    # 103,277 tokens in 391 s, and the 2026-09-04 session that looked frozen
+    # was ~142K. Trimming the same session to 18K and staying on the 27B costs
+    # about 70 s, once. So bounding is tried first and the ladder becomes the
+    # fallback for a request that cannot be trimmed under the ceiling.
+    #
+    # The stickiness matters more than either number. Ollama reuses the KV
+    # cache for a shared prefix — an append costs 5-10 s where the same
+    # transcript cold costs 26-136 s — so a window recomputed every request
+    # would destroy the reuse it is meant to protect. See working_set.py.
+    local_working_set: bool = True
+    local_working_set_target_tokens: int = 18_000
+    local_working_set_max_tokens: int = 22_000
+
+    # One local inference at a time per tier. Two sessions interleaving on one
+    # model evict each other's KV cache: measured 105.8 s and 116.3 s per turn
+    # against 0.7 s for a single session repeating. Waiting past this timeout
+    # proceeds unlocked rather than failing the request. 0 disables queueing.
+    local_tier_lock_timeout_seconds: float = 900.0
+
     # Optional runtime identity for profiles whose server lifecycle must be
     # supervised before a request can load weights. Unlike the hybrid router's
     # local `profile` variable, this survives `bd switch` into profile mode.
