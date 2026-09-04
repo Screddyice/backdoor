@@ -61,6 +61,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .resolver import system_getaddrinfo
+
 logger = logging.getLogger(__name__)
 
 # One router process can carry independent upstream breakers while sharing one
@@ -303,7 +305,8 @@ def _resolves(name: str, timeout: float) -> bool:
 
     def _lookup() -> None:
         try:
-            socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)
+            # Uncached on purpose — see resolver.system_getaddrinfo.
+            system_getaddrinfo()(name, 443, proto=socket.IPPROTO_TCP)
             answered.append(True)
         except OSError:
             answered.append(False)
