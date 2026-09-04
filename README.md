@@ -1174,7 +1174,11 @@ Every other local tier is an Ollama tag that loads on first request and gets evi
 ```
 
 The 4B fast tier loads through Ollama on demand and leaves enough memory
-headroom for recovery after an MLX startup failure.
+headroom for recovery after an MLX startup failure. It took over from
+`local-failover-heavy`, the 9B profile removed on 2026-08-31 (#70); the comment
+in `profiles/local-qwen38-action.env` still named that dead profile until
+2026-09-05, which is the kind of drift that makes an operator expect a fallback
+tier this host cannot load.
 
 Ollama cannot evict this server either, so `qwen38 stop` before an `llmjury solve` run rather than letting a 19GB server and a 21GB council fight over a 36GB host.
 
