@@ -27,7 +27,15 @@ from .registry import Profile
 logger = logging.getLogger(__name__)
 
 STATES = frozenset(
-    {"ok", "stopped", "unconfigured", "control_only", "unreachable", "unauthorized"}
+    {
+        "ok",
+        "stopped",
+        "unconfigured",
+        "control_only",
+        "delegate_only",
+        "unreachable",
+        "unauthorized",
+    }
 )
 
 #: Stands in for the gateway key wherever a gateway echoed it back to us. Fixed

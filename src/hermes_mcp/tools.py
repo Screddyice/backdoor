@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 
 from .client import GatewayClient, MissingKey, state
-from .registry import Profile
+from .registry import Profile, TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +66,20 @@ def check_tier(profile: Profile, tool: str) -> dict | None:
             ),
             next="use a profile registered as full, or change the tier deliberately",
         )
-    if profile.tier not in ("full", "control_only", "unconfigured"):
+    if profile.tier == "delegate_only" and tool not in CHAT_TOOLS:
+        return state(
+            profile.name,
+            "delegate_only",
+            reason=f"{tool} is outside the delegate_only tool ceiling",
+            next="use chat, run status, run approval, or run stop only",
+        )
+    if profile.tier not in TIERS:
         return state(
             profile.name, "unconfigured",
-            reason=f"unrecognised tier {profile.tier!r}; valid tiers are 'full', 'control_only', 'unconfigured'",
+            reason=(
+                f"unrecognised tier {profile.tier!r}; valid tiers are "
+                f"{', '.join(repr(tier) for tier in sorted(TIERS))}"
+            ),
             next="check the profile tier, or update the profile definition",
         )
     return None
@@ -198,10 +208,12 @@ def register_tools(
     async def hermes_chat(profile: str, message: str, session_id: str | None = None) -> dict:
         """Send a prompt to an agent and return its reply.
 
-        Refused for control_only profiles. Hermes applies its own approval
-        layer; approvals raised inside the resulting run are answerable with
-        hermes_run_approve, but approvals from chat-platform-initiated turns
-        still surface on that platform, not here.
+        Refused for control_only profiles. delegate_only profiles may use this
+        run-scoped surface but cannot inspect sessions, configuration, logs, or
+        lifecycle controls. Hermes applies its own approval layer; approvals
+        raised inside the resulting run are answerable with hermes_run_approve,
+        but approvals from chat-platform-initiated turns still surface on that
+        platform, not here.
         """
         body: dict = {"input": message}
         if session_id:
