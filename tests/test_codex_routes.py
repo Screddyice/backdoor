@@ -515,7 +515,7 @@ async def test_eligible_cloud_failure_uses_fresh_memory_backed_qwen_request(
 
     async def recall(query, recall_settings):
         assert query == "active task"
-        return ["Cognee continuity marker"]
+        return ["Replica continuity marker"]
 
     external_memory = "external " * 50
     settings.codex_memory_budget_tokens = count_text(external_memory.strip())
@@ -558,7 +558,7 @@ async def test_eligible_cloud_failure_uses_fresh_memory_backed_qwen_request(
     rendered = json.dumps(local_payload)
     assert local_payload["model"] == "qwen3.8:27b-obliterated"
     assert "active task" in rendered
-    assert "Cognee continuity marker" in rendered
+    assert "Replica continuity marker" in rendered
     assert "bounded result" in rendered
     assert "older task" not in rendered
     assert "prompt_cache_key" not in rendered
@@ -794,7 +794,7 @@ async def test_empty_memory_recall_still_serves_current_task_from_qwen(
 
     assert response.status_code == 200
     assert "active task" in json.dumps(local_payloads[0])
-    assert "Relevant context recalled from local Cognee" not in json.dumps(local_payloads[0])
+    assert "Relevant context recalled from local memory" not in json.dumps(local_payloads[0])
 
 
 @pytest.mark.asyncio
@@ -1611,7 +1611,7 @@ async def test_local_route_skips_all_memory_recall_when_disabled(
         return payload
 
     async def forbidden_recall(*_args):
-        raise AssertionError("Cognee recall must stay off")
+        raise AssertionError("memory recall must stay off")
 
     async def send_local(_payload, _settings):
         return httpx.Response(200, stream=BytesStream(SSE))
@@ -1653,7 +1653,7 @@ async def test_oversized_local_instruction_is_rejected_before_memory(
 
     async def forbidden(*_args):
         calls.append("called")
-        raise AssertionError("oversized instructions must not reach Cognee")
+        raise AssertionError("oversized instructions must not reach memory recall")
 
     monkeypatch.setattr(codex_routes.mlx_admin, "resolve_profile", resolve)
     monkeypatch.setattr(codex_routes, "prepare_codex_external_context", forbidden)

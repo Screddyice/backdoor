@@ -81,8 +81,8 @@ Build a bare tag from the GGUF tag, never int4/MLX — the MLX engine ignores
 Machine hard rules: `~/.claude/CLAUDE.md`. Workspace rules: `~/projects/CLAUDE.md`
 and `~/projects/AGENTS.md`. Org identity comes from the git `origin` remote.
 
-Durable facts go to **Cognee**, the only memory on this machine. Search it before
-re-deriving a past decision, and write findings back with `cognee-remember`. The
-`.claude-harness/memory/` tree in this repo is scaffolding, not a live memory layer.
+Durable facts go to **claude-mem**, the only memory on this machine. Search it
+before re-deriving a past decision. The `.claude-harness/memory/` tree in this
+repo is scaffolding, not a live memory layer.
 
 Every branch gets a PR, and every PR updates this repo's README.

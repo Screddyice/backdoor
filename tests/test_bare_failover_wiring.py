@@ -91,8 +91,8 @@ def _harness_request() -> dict:
         "tools": [
             {"name": "Bash", "description": "run a command", "input_schema": {}},
             {"name": "Read", "description": "read a file", "input_schema": {}},
-            {"name": "mcp__plugin_mem0_mem0__search_memories",
-             "description": "recall", "input_schema": {}},
+            {"name": "mcp__example__crm_lookup",
+             "description": "lookup", "input_schema": {}},
         ],
         "messages": [
             {"role": "user", "content": "did the router ever fail over?"},
@@ -419,8 +419,7 @@ def test_memory_injected_for_local_provider(monkeypatch):
 
 
 def test_memory_not_injected_for_cloud_provider(monkeypatch):
-    """Cloud sessions already get Mem0 from the UserPromptSubmit hook; injecting
-    again would spend the context twice on the same text."""
+    """Cloud sessions get claude-mem through hooks, so proxy injection would duplicate it."""
     from src.proxy import translate
     import src.proxy.memory as memory
     monkeypatch.setattr(memory, "recall", lambda *a, **k: ["should not appear"])
