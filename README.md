@@ -1499,3 +1499,17 @@ This repo is the **source**. The live control plane is operated by hand from an
 independent Terminal session, and machine hooks reject agent attempts to touch it —
 see `~/.claude/CLAUDE.md`, section "Backdoor live-control boundary". Agent
 instructions live in `CLAUDE.md`.
+
+## CI (2026-09-05)
+
+`.github/workflows/ci.yml` runs the suite on every pull request and on pushes to `main`.
+
+This repo had no CI at all. Shawn's QA Assist reviewed its pull requests and then declined to
+merge them, reporting "this repo has no gate I can trust" and asking whether it should merge on
+review alone. That was the right refusal: a review with nothing runnable behind it is an opinion,
+and this repo is the router every local model session goes through.
+
+The suite is the gate — 703 tests covering failover, memory recall, the context budget and the
+provider edges. Nothing here needs a secret, so the workflow runs with `contents: read` and no
+environment.
+
