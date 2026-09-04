@@ -314,10 +314,8 @@ def _hoist_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
 def _is_local_provider(settings) -> bool:
     """Is this request headed for a model running on this machine?
 
-    Cloud sessions already receive Mem0 through the `UserPromptSubmit` hook, so
-    injecting for them would duplicate the same text and spend context twice.
-    Local sessions launched with `--bare` get no hooks at all, which is the gap
-    this fills.
+    Cloud sessions receive memory through claude-mem's lifecycle hooks. Local
+    sessions launched with `--bare` get no hooks, so Backdoor fills that gap.
     """
     url = (getattr(settings, "provider_base_url", "") or "").lower()
     return "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url
@@ -342,9 +340,9 @@ def _inject_memory(messages: list[dict[str, Any]], settings) -> list[dict[str, A
     """Prepend durable-memory recall to the system block for local models.
 
     Local sessions started by the `qwen` wrapper run with `--bare`, which
-    disables every hook — including the one that normally injects Mem0. Without
+    disables every hook, including claude-mem's memory injection. Without
     this, the default local tier is the only one in the stack with no durable
-    memory. Recall is read from the offline SQLite mirror so it survives the
+    memory. Recall comes from the local SQLite replica so it survives the
     outage that failover exists to cover.
 
     Fail-open: a recall problem returns the messages untouched.

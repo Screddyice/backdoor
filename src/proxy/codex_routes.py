@@ -26,7 +26,7 @@ from .external_context import (
     prepare_codex_external_context,
     recall_codex_external_context,
 )
-from .cognee_recall import recall_context
+from .memory_recall import recall_context
 from .config import Settings, get_settings
 from .failover import FailoverBreaker, service_reachable
 from . import compute_lease, mlx_admin, ollama_admin
@@ -591,7 +591,7 @@ async def _serve_local(
                 cloud_payload, settings.codex_active_turn_budget_tokens
             )
             local_source = await prepare_codex_external_context(cloud_payload, settings)
-            if settings.qwen_cognee:
+            if settings.qwen_memory:
                 external_memories, agent_memories = await asyncio.gather(
                     recall_codex_external_context(cloud_payload, settings),
                     recall_context(query, settings),

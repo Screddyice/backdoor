@@ -246,10 +246,10 @@ qwen mcp composio-tmn,atlassian
 ```
 
 The wrapper validates names against `~/.claude.json` and enables the selected
-servers only when its certificate-verifying internet probe succeeds. The
-compact Cognee memory shim stays attached when Cognee is enabled. Missing
-names fail before Qwen starts. An offline Mac skips the MCP connection and
-continues with local tools. The environment form remains available for scripts:
+servers only when its certificate-verifying internet probe succeeds. Memory
+comes from Backdoor's local claude-mem replica and does not need an MCP server.
+Missing names fail before Qwen starts. An offline Mac skips the MCP connection
+and continues with local tools. The environment form remains available for scripts:
 `QWEN_MCP=1 QWEN_MCP_SERVERS=a,b qwen`.
 
 ## Full harness is the default (lean is the speed escape hatch)
