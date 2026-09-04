@@ -18,7 +18,7 @@ from .config import (
 from .bare import OFFLINE_SYSTEM, make_bare, parse_keep, route_system
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
-from . import compute_lease, mlx_admin, ollama_admin
+from . import compute_lease, mlx_admin, ollama_admin, tier_lock, working_set
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -480,6 +480,53 @@ def _local_stream_ended() -> set[tuple[str, str]]:
     return claims
 
 
+_TRIM_NOTE = (
+    " Earlier turns of this conversation were omitted to fit the local window; "
+    "the client still holds the full transcript and the cloud model still sees it."
+)
+
+
+def _bound_working_set(req, profile: str, settings: Settings):
+    """Trim the transcript to a sticky local window. Returns (request, tokens).
+
+    Returns the request unchanged when it already fits, when bounding is off,
+    or when even the tail is over the ceiling — that last case is what the
+    ladder is still for. See working_set.py for the measurements.
+    """
+    est = count_messages(req.messages, req.system, req.tools)
+    if not settings.local_working_set:
+        return req, est
+    res = working_set.bound(
+        req.messages,
+        req.system,
+        req.tools,
+        profile=profile,
+        target=settings.local_working_set_target_tokens,
+        ceiling=settings.local_working_set_max_tokens,
+    )
+    if res.keep_from == 0 or res.overflow:
+        if res.overflow:
+            logger.warning(
+                "working set for %s cannot reach %s tokens (tail alone is %s) — "
+                "leaving it to the ladder",
+                profile, settings.local_working_set_max_tokens, res.tokens,
+            )
+        return req, est
+    trimmed = req.model_copy(deep=False)
+    trimmed.messages = res.messages
+    # Appended to the system prompt rather than injected as a message: the note
+    # has to be identical on every turn or it moves the prefix it is meant to
+    # keep still, and the system block is already rebuilt verbatim each time.
+    if isinstance(trimmed.system, str) and _TRIM_NOTE not in trimmed.system:
+        trimmed.system = trimmed.system + _TRIM_NOTE
+    logger.warning(
+        "⇢ WORKING SET [%s] kept %d/%d messages in≈%s (%s)",
+        profile, len(res.messages), len(req.messages), res.tokens,
+        "rebuilt" if res.rebuilt else "stable",
+    )
+    return trimmed, res.tokens
+
+
 async def _evict_outgoing_tier(base_url: str, model: str) -> None:
     """Free the tier a route escalation just stopped using.
 
@@ -536,7 +583,11 @@ async def _release_deferred(
 
 
 async def _tracked_local_stream(
-    inner: AsyncIterator[str], settings: Settings
+    inner: AsyncIterator[str],
+    settings: Settings,
+    *,
+    tier: tuple[str, str] | None = None,
+    lock_timeout: float = 0.0,
 ) -> AsyncIterator[str]:
     """Hold a local response's tier open for as long as it generates.
 
@@ -544,11 +595,22 @@ async def _tracked_local_stream(
     A failover stream additionally holds a breaker CLAIM; a route stream holds
     only the in-flight count, which is enough to stop an escalation evicting
     the model underneath it.
+
+    `tier` also takes the serialization lock, acquired HERE rather than in the
+    handler: a client that hangs up before the first chunk never starts this
+    generator, and a lock taken in the handler would then be released by
+    nobody. Acquiring inside means the lock's lifetime is exactly the
+    generator's.
     """
     _local_stream_started()
     try:
-        async for event in inner:
-            yield event
+        if tier is not None:
+            async with tier_lock.hold(tier[0], tier[1], timeout=lock_timeout):
+                async for event in inner:
+                    yield event
+        else:
+            async for event in inner:
+                yield event
     finally:
         due = _local_stream_ended()
         try:
@@ -663,6 +725,9 @@ async def create_message(
     # `/model qwen`. Decides whether the tier this request loads is one the
     # router may clamp and later evict on its own — see ollama_admin.
     failed_over = False
+    # Set by the two early bounding sites so the backstop below does not bound
+    # the same request twice — harmless but it would log twice and re-count.
+    bounded = False
 
     if settings.router_mode == "hybrid":
         model = _model_from_body(body)
@@ -690,10 +755,10 @@ async def create_message(
                 fr = MessagesRequest.model_validate_json(body)
                 raw_est = count_messages(fr.messages, fr.system, fr.tools)
                 context_settings = load_profile_settings(profile)
-                # The router-level QWEN_COGNEE=0 escape hatch must survive the
+                # The router-level QWEN_MEMORY=0 escape hatch must survive the
                 # profile load, including true offline failover.
-                if not settings.qwen_cognee:
-                    context_settings.qwen_cognee = False
+                if not settings.qwen_memory:
+                    context_settings.qwen_memory = False
                 prepared_req = await prepare_external_context(fr, context_settings)
                 fr = prepared_req
                 if settings.failover_bare:
@@ -705,7 +770,19 @@ async def create_message(
                     )
                     bare_req = stripped  # only on success: make_bare is pure
                     fr = stripped
-                est = count_messages(fr.messages, fr.system, fr.tools)
+                # Bound before sizing: a session trimmed to the working set
+                # usually fits the strong tier, and picking the tier from the
+                # untrimmed count would send it to the wide 4B for tokens the
+                # local model is never going to be shown.
+                fr, est = _bound_working_set(fr, profile, settings)
+                bounded = True
+                # Write the bound result back to whichever object the dispatch
+                # below actually sends: bare mode's copy when stripping ran,
+                # the external-context copy when it did not.
+                if bare_req is not None:
+                    bare_req = fr
+                else:
+                    prepared_req = fr
                 profile = pick_failover_profile(est)
             except Exception:
                 # Never let stripping break the failover itself — an unstripped
@@ -741,8 +818,9 @@ async def create_message(
                     ),
                     tool_result_chars=settings.failover_tool_result_chars,
                 )
+                stripped, est = _bound_working_set(stripped, profile, settings)
+                bounded = True
                 bare_req = stripped  # only on success: make_bare is pure
-                est = count_messages(stripped.messages, stripped.system, stripped.tools)
 
                 # Size the tier AFTER stripping, the same ordering and the same
                 # ladder the failover branch uses. Stripping bounds the prompt but
@@ -832,12 +910,27 @@ async def create_message(
             # surfaces as an honest provider error rather than one we invented.
             logger.exception("profile bare-mode failed; sending unstripped")
 
+
     fast = _check_optimizations(req, settings)
     if fast:
         return fast
 
     if client is None:
         client = get_provider_client()
+
+    # Backstop for every local path the two early call sites do not cover —
+    # profile mode (which is what the `qwen` wrapper runs, so it is the common
+    # case in daily use) and any profile whose ROUTE_BARE is off. Gated on the
+    # provider being a local Ollama tier: the ceiling is a property of this
+    # machine's GPU, and applying it to a hosted provider would throw away
+    # context for nothing.
+    if not bounded and ollama_admin.is_ollama(settings.provider_base_url):
+        try:
+            req, _ = _bound_working_set(
+                req, settings.provider_model or "profile", settings
+            )
+        except Exception:
+            logger.exception("working set failed; sending the request untrimmed")
 
     est_in = count_messages(req.messages, req.system, req.tools)
 
@@ -921,13 +1014,24 @@ async def create_message(
         # would leave the real 13 GB tier resident.
         br = get_breaker(get_settings())
         br.note_claim(settings.provider_base_url, provider)
-        # Re-clamped per request because Ollama resets the timer to the global
-        # OLLAMA_KEEP_ALIVE on every inference call; setting it once at load
-        # would be undone by the second request of the outage.
-        if settings.provider_keep_alive:
-            await ollama_admin.set_keep_alive(
-                settings.provider_base_url, provider, settings.provider_keep_alive
-            )
+
+
+    # Residency is clamped for EVERY local tier that declares it, not only the
+    # failover ones. Re-clamped per request because Ollama resets the timer to
+    # the global OLLAMA_KEEP_ALIVE on every inference call, so setting it once
+    # at load would be undone by the next turn.
+    #
+    # A failover tier uses this to be released EARLY (45s: nobody asked for it).
+    # A route tier uses it for the opposite reason. The working set keeps a
+    # session's prefix byte-stable so each turn is a 5-10s append, but that
+    # only holds while Ollama still has the cache — and the global timer is 5
+    # minutes, so any think-time longer than that silently re-imposes a cold
+    # prefill of 70-100s at 18K. Extending residency past ordinary think-time
+    # is what makes the stable prefix worth having.
+    if settings.provider_keep_alive and ollama_admin.is_ollama(settings.provider_base_url):
+        await ollama_admin.set_keep_alive(
+            settings.provider_base_url, provider, settings.provider_keep_alive
+        )
 
     if req.stream:
         input_tokens = est_in
@@ -938,7 +1042,16 @@ async def create_message(
         # a tier it never claimed — but it does hold the GPU, and an escalation
         # on a second session must not evict the model this one is generating
         # on. The claim and the in-flight count answer different questions.
-        body = _tracked_local_stream(body, get_settings())
+        body = _tracked_local_stream(
+            body,
+            get_settings(),
+            tier=(
+                (settings.provider_base_url, provider)
+                if ollama_admin.is_ollama(settings.provider_base_url)
+                else None
+            ),
+            lock_timeout=settings.local_tier_lock_timeout_seconds,
+        )
         return StreamingResponse(
             body,
             media_type="text/event-stream",
@@ -950,7 +1063,15 @@ async def create_message(
     # would like to evict the model it is prefilling on.
     _local_stream_started()
     try:
-        resp = await client.complete(payload)
+        if ollama_admin.is_ollama(settings.provider_base_url):
+            async with tier_lock.hold(
+                settings.provider_base_url,
+                provider,
+                timeout=settings.local_tier_lock_timeout_seconds,
+            ):
+                resp = await client.complete(payload)
+        else:
+            resp = await client.complete(payload)
     except ProviderError as e:
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)

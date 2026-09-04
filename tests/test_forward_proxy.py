@@ -11,7 +11,7 @@ Two behaviours carry the whole design and are tested here:
    `/model qwen` routing and offline failover keep working.
 
 2. **Everything else is tunnelled blind.** A single `claude` session also talks
-   to Composio, mem0, Neon, PostHog, npm and — critically — the Remote Control
+   to Composio, Neon, PostHog, npm and, most importantly, the Remote Control
    bridge on claude.ai. Intercepting any of those would break certificate
    pinning at best and silently reroute traffic at worst. They must pass through
    as opaque bytes.

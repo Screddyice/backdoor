@@ -65,7 +65,7 @@ def test_decode_codex_body_rejects_unsupported_or_malformed_requests(
     assert caught.value.status_code == status
 
 
-def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
+def test_build_local_payload_starts_at_active_user_and_injects_memory_context():
     cloud = load_request()
     local, budget = build_local_payload(
         cloud,
@@ -77,7 +77,7 @@ def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
 
     assert local["model"] == "qwen3.8:27b-obliterated"
     assert local["stream"] is True
-    assert "Relevant context recalled from local Cognee" in text
+    assert "Relevant context recalled from local memory" in text
     assert "decision one" in text
     assert "active task" in text
     assert "bounded result" in rendered
@@ -90,7 +90,7 @@ def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
     assert local["input"][0]["role"] == "developer"
     assert "decision one" not in json.dumps(local["input"][0])
     assert local["input"][1]["role"] == "user"
-    assert "Relevant context recalled from local Cognee" in json.dumps(
+    assert "Relevant context recalled from local memory" in json.dumps(
         local["input"][1]
     )
 

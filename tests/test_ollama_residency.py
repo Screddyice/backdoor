@@ -180,12 +180,32 @@ def test_failover_only_tiers_clamp_keep_alive():
         assert load_profile_settings(profile).provider_keep_alive == "45s", profile
 
 
-def test_route_reachable_tiers_do_not_clamp():
-    # A deliberate `/model qwen` session that thinks for longer than the clamp
-    # would evict its own 17 GB model and reload it next turn — slower, and more
-    # memory churn than leaving it resident. Only unrequested tiers get clamped.
-    for profile in set(MODEL_ROUTES.values()):
-        assert load_profile_settings(profile).provider_keep_alive == "", profile
+def test_a_route_tier_is_held_longer_than_the_global_timer():
+    """The reverse of the rule this replaces, and for the reason it gave.
+
+    The old rule was "never clamp a MODEL_ROUTES tier", because a session that
+    thinks for longer than the clamp would evict its own 17 GB model. That is
+    an argument against a SHORT clamp, and it is equally an argument for a long
+    one: the global OLLAMA_KEEP_ALIVE is 5m, and the working set only pays
+    while Ollama still holds the prefix, so a pause past five minutes costs a
+    70-100s cold prefill at 18K (measured 2026-09-05).
+    """
+    keep = load_profile_settings("local-qwen38-obliterated").provider_keep_alive
+    assert keep, "the default route tier must outlive the global 5m idle timer"
+    assert keep.endswith("m"), f"expected minutes, got {keep!r}"
+    assert int(keep.rstrip("m")) > 5, (
+        f"{keep} is not longer than the 5m global; the clamp would shorten "
+        "residency rather than extend it"
+    )
+    assert int(keep.rstrip("m")) <= 15, (
+        f"{keep} keeps 17 GB resident long enough to collide with llmjury solve"
+    )
+
+
+def test_failover_only_tiers_still_release_early():
+    """The other job the same setting does: nobody asked for these."""
+    for profile in ("local-failover-256k", "local-failover-128k"):
+        assert load_profile_settings(profile).provider_keep_alive == "45s", profile
 
 
 # --------------------------------------------------------------------------
@@ -343,7 +363,12 @@ async def test_deliberate_model_route_is_never_claimed(monkeypatch, fake_http):
         resp = await _post(app, {"model": "qwen",
                                  "messages": [{"role": "user", "content": "hi"}]})
         assert resp.status_code == 200
-        assert fake_http.calls == [], "a deliberate route must not be administered"
+        # A route tier may be CLAMPED — that is what keeps its prefix resident
+        # across think-time — but it must never be CLAIMED, because a claim is
+        # released when someone else's outage ends.
+        assert all(body["keep_alive"] != 0 for _, body in fake_http.calls), (
+            "an unrelated outage unloaded a tier the user asked for"
+        )
         assert routes._breaker.drain_claims() == set()
     finally:
         app.dependency_overrides.clear()

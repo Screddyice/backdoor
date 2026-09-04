@@ -1827,7 +1827,7 @@ Expected: the new USAGE line appears
 
 - [ ] **Step 3: Add the `qwen` branch**
 
-In `qwen`, alongside the existing `QWEN_MEM0` and `QWEN_MCP` branches, add a branch that runs when `QWEN_HERMES=1`. It writes `~/.cache/backdoor/qwen-hermes-mcp.json` with mode 600, expanding `HERMES_MCP_URL` and `HERMES_MCP_KEY` into the file because Claude Code may not expand `${ENV}` in MCP config, and regenerating it every launch so key rotations carry over:
+In `qwen`, alongside the existing `QWEN_MCP` branch, add a branch that runs when `QWEN_HERMES=1`. It writes `~/.cache/backdoor/qwen-hermes-mcp.json` with mode 600, expanding `HERMES_MCP_URL` and `HERMES_MCP_KEY` into the file because Claude Code may not expand `${ENV}` in MCP config, and regenerating it every launch so key rotations carry over:
 
 ```bash
 if [ "${QWEN_HERMES:-0}" = "1" ]; then

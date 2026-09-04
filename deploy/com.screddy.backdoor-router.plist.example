@@ -52,10 +52,10 @@
         <string>qwen3.8:27b-obliterated</string>
         <key>CODEX_LOCAL_TOOLS</key>
         <string>local</string>
-        <key>COGNEE_BASE_URL</key>
-        <string>http://127.0.0.1:8001</string>
-        <!-- Cognee auth stays in ~/.cognee/.env or its existing local key
-             cache. Do not duplicate the key into this plist. -->
+        <key>MEMORY_DB_PATH</key>
+        <string>/Users/you/.claude-mem/claude-mem.db</string>
+        <key>MEMORY_WORKER_URL</key>
+        <string>http://127.0.0.1:37701</string>
     </dict>
 
     <!-- Each CONNECT tunnel consumes two descriptors. Intercepted Anthropic
