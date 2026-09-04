@@ -1125,6 +1125,55 @@ Both escalation sites now unload the outgoing model. The safety rule is the same
 
 Everything here is best-effort. A router that cannot reach Ollama's admin endpoint must still route, and the cost of failing is late release, which is the old behaviour rather than an outage.
 
+### The prefix is the budget, not the window
+
+Measured on this host, 2026-09-05, against `qwen3.8:27b-obliterated` at its 32K window:
+
+| | |
+|---|---|
+| Cold prefill 6,840 tokens | 26.3s (260 tok/s) |
+| Cold prefill 12,815 tokens | 49.1s (261 tok/s) |
+| Cold prefill 27,008 tokens | 135.6s (199 tok/s) |
+| Append ~800 tokens to a transcript the model just saw | **5–10s** |
+| Byte-identical repeat | 0.7s |
+| Decode | 8.9 tok/s |
+
+And against `qwen3.5:4b-256k` (8.8 GB resident at `num_ctx 262144`, not the ~13 GB estimated before it was measured):
+
+| Cold prefill 73,150 tokens | 181.9s |
+|---|---|
+| Cold prefill 103,277 tokens | 391.2s |
+| Append after either | 1.6–2.4s |
+
+The expensive event is not the size of a conversation. It is showing the model a prompt whose prefix it has not already processed. Ollama reuses the KV cache for a shared prefix, so an ordinary turn costs seconds while the same transcript presented cold costs minutes. Everything below follows from that one fact.
+
+**Trimming beats escalating.** The 2026-09-04 session that showed 100% context and appeared frozen was about 142K tokens on the 256K tier — roughly nine minutes of prefill on the curve above. Bounding the same session to 18K and keeping the 27B costs about 70 seconds, once, and leaves the stronger model answering. `LOCAL_WORKING_SET` is therefore tried before `FAILOVER_LADDER`, and the ladder becomes the fallback for a request that cannot be trimmed under the ceiling — one message larger than the ceiling has nothing to drop.
+
+**The boundary is sticky, and that is the whole design.** A window recomputed on every request moves the prefix on every request, which converts a 5–10s append into a 40–50s cold prefill — a context manager that costs five times what it saves. So the boundary is chosen when `LOCAL_WORKING_SET_MAX_TOKENS` is crossed and then reused unchanged for as long as the conversation keeps fitting under it. One turn per cycle pays a rebuild; every other turn appends.
+
+**Model-written compaction was rejected on the same numbers.** At 8.9 tok/s a 1,500-token summary costs 169s and a 2,500-token one 281s, and the turn after it is a cold prefill of whatever was produced — 3.5 to 5.5 minutes per compaction, recurring every 6–15 turns at typical tool-result sizes. Deterministic selection costs no model call at all. Claude Code's own auto-compaction still runs client-side against the window the launcher declares; nothing here replaces it, and bounding makes it fire later by sending less.
+
+**One local inference at a time per tier.** Two ~45,600-token sessions alternating on one model measured 105.8s and 116.3s per turn, against 0.7s for a single session repeating: each request evicted the other's KV cache, so every turn became a cold prefill. `OLLAMA_NUM_PARALLEL=2` provides two slots but not two retained prefixes at these sizes. Interleaving costs both sides roughly 100x while queueing costs the second session one turn of waiting, so local inference is serialized per `(base_url, model)`. Different tiers still run together. Waiting past `LOCAL_TIER_LOCK_TIMEOUT_SECONDS` proceeds unlocked rather than failing the request.
+
+Measured end to end on 2026-09-05, driving a dev router on port 8099 against the real 27B with a 205,400-token, 260-message session:
+
+```
+⇢ WORKING SET [qwen3.8:27b-obliterated] kept 21/260 messages in≈17734 (rebuilt)
+⇢ WORKING SET [qwen3.8:27b-obliterated] kept 23/262 messages in≈17771 (stable)
+⇢ WORKING SET [qwen3.8:27b-obliterated] kept 25/264 messages in≈17808 (stable)
+```
+
+First answer in 116s, the turn after it 143s — the second cold prefill, since the first request after a model load leaves no reusable cache — then 10.6s, 13.3s and 13.8s as the boundary held and each turn appended. The same session before this change escalated to the 256K 4B and prefilled all 205K tokens, which on the measured curve is about thirteen minutes to first answer, on a weaker model, every time the session was resumed.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `LOCAL_WORKING_SET` | `true` | Bound the transcript for local tiers |
+| `LOCAL_WORKING_SET_TARGET_TOKENS` | `18000` | What a rebuild aims for |
+| `LOCAL_WORKING_SET_MAX_TOKENS` | `22000` | What triggers one |
+| `LOCAL_TIER_LOCK_TIMEOUT_SECONDS` | `900` | How long a second session waits before proceeding unlocked |
+
+Bounding applies only where the provider is a local Ollama tier. The ceiling is a property of this machine's GPU, so applying it to a hosted provider would discard context for nothing. The client keeps its full transcript either way — this decides what is forwarded, exactly as bare mode decides how much of each message is forwarded.
+
 ### Sizing the failover tier
 
 Ollama caps residency by model count, never by bytes, and Metal allocations are wired and cannot be paged out. Over-commit and this host panics instead of raising OOM. Measure with `ollama ps`, which reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
