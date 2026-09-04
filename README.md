@@ -1515,6 +1515,8 @@ over its summaries, observations and prompts (read-only, 1.5 s timeout, fail-ope
 `external_context.remember_document` posts fetched documents to the local worker on
 `127.0.0.1:37701` as verbatim prompts, which the worker queues durably and syncs to the
 cmem.ai hub. Cognee and Mem0 are gone: no tunnel, no API key, no HTTP recall.
+The superseded Cognee failover design and implementation plan were removed from `docs/` so no
+operator can mistake them for a supported recovery path; Git history retains the old design.
 
 Settings renamed with it: `codex_memory_timeout_seconds`, `codex_memory_top_k`,
 `codex_memory_char_budget`, `qwen_memory` (env `QWEN_MEMORY`), plus
