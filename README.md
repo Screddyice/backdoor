@@ -1519,3 +1519,25 @@ registers the server as `cmem`.
 The store is a synced replica of every device, so a failed-over local session recalls
 what Hermes on src or r2h learned, with the network gone. That is the property the
 Mem0 mirror was meant to provide and the Cognee tunnel could not.
+
+### Recall's budget skips, it does not stop (2026-09-04)
+
+`memory.recall()` fills a character budget from the best-ranked memories. The loop used to
+`break` on the first memory that did not fit, which threw away everything ranked behind it.
+That is not a corner case: claude-mem session summaries routinely run past the 1200-character
+default, so the usual outcome was an empty list from a store full of usable memories. Measured
+against the real store on this machine, three ordinary queries returned **nothing at all**; the
+same queries return a memory each with the loop fixed.
+
+Nothing surfaced it because recall is fail-open by design — an empty list from a broken filter
+and an empty list from a store with nothing to say are the same value.
+
+The loop now skips an oversized memory and keeps going. Truncation is the last resort, used only
+when no candidate fits whole, because a complete memory is worth more than a fragment; a budget
+too small to hold anything meaningful still returns nothing rather than a scrap.
+
+**Left alone deliberately:** `_SOURCES` still includes `user_prompts_fts`, and prompts now
+dominate what comes back — one 1171-character prompt fills the entire 1200-character budget on
+its own, leaving no room for a distilled summary. Whether the router should recall verbatim
+prompts at all is a product decision, not a bug, so it is unchanged here.
+

@@ -83,6 +83,10 @@ def _db_path(cache: Path | None) -> Path:
     return Path(override) if override else (cache or DEFAULT_DB)
 
 
+# Below this, a truncated memory is a fragment rather than a fact.
+_MIN_USEFUL_CHARS = 80
+
+
 def recall(query: str, k: int = 6, char_budget: int = 1200, cache: Path | None = None) -> list[str]:
     """Return up to `k` memories relevant to `query`, best-ranked first. Never raises."""
     path = _db_path(cache)
@@ -127,13 +131,23 @@ def recall(query: str, k: int = 6, char_budget: int = 1200, cache: Path | None =
     for _, text in ranked:
         if text in seen:
             continue
+        # Skip past an oversized memory rather than stopping at it. `break` here
+        # meant one long memory discarded every shorter one ranked behind it,
+        # and because claude-mem summaries routinely run past a 1200-char budget
+        # the usual result was no memory at all — indistinguishable from a store
+        # with nothing to say.
         if used + len(text) > char_budget:
-            break
+            continue
         out.append(text)
         seen.add(text)
         used += len(text)
         if len(out) >= k:
             break
+
+    # Whole memories are worth more than a fragment, so truncation is the last
+    # resort: only when every candidate was too big to fit intact.
+    if not out and ranked and char_budget > _MIN_USEFUL_CHARS:
+        out.append(ranked[0][1][:char_budget].rstrip() + "…")
     return out
 
 
