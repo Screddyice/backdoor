@@ -266,6 +266,64 @@ GPU and routes a live session to a local model while the cloud was fine. If veri
 misbehaves on a network this was not tested against, it can be switched off without a deploy.
 Leaving it set re-opens the hole.
 
+### The probe also asks whether DNS answers
+
+`internet_usable` is what the offline-gated breaker calls, and it asks two questions in order: does
+a link probe verify a peer, and does `name_resolution_works` get an address back for
+`one.one.one.one` or `dns.google`. Either half missing means offline. Resolution goes second, so the
+common outage still costs one TCP probe and no lookup, and a dead link never gets logged as a DNS
+fault.
+
+The literal-IP probes left DNS unmeasured, and that was its own silent hole. On 2026-09-04 between
+23:36:32 and 23:39:41 every upstream request failed with `[Errno 8] nodename nor servname provided`
+while the link stayed up. `internet_reachable` verified a peer on the first probe each time, so the
+Anthropic breaker read the host as online, logged `Anthropic failing (ConnectError) but this host is
+online`, and handed roughly 200 requests a `502` apiece across three and a half minutes. The Codex
+breaker never consults connectivity, opened at 23:36:39, and served the same outage from the local
+model. One host, one outage, opposite outcomes.
+
+`getaddrinfo` takes no timeout and `socket.setdefaulttimeout` does not reach it, so the lookup runs
+on a daemon thread the router stops waiting for after `RESOLUTION_TIMEOUT` (8 s, the same patient
+budget the ambiguous handshake gets). A resolver that accepts queries and never replies reads as
+broken without stalling the turn, and the abandoned thread cannot block a restart.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RESOLUTION_PROBE_NAMES` | probe cert names | Names tried; any one answering proves the resolver works |
+| `RESOLUTION_TIMEOUT` | `CONNECTIVITY_TIMEOUT × CONNECTIVITY_SLOW_FACTOR` | How long a lookup gets before DNS reads as broken |
+
+### Last-known-good DNS
+
+`src/proxy/resolver.py` wraps `socket.getaddrinfo` for the router process. A
+successful lookup is remembered for six hours; a lookup that fails with a resolver
+error is answered from that memory rather than raised. `install()` runs first thing
+in the app lifespan, before any client exists.
+
+This machine has one resolver, the LAN gateway DHCP hands out, and 722 of the 731
+upstream transport failures in the router log are `[Errno 8] nodename nor servname
+provided`. The link was up for all of them. An address the router already knows is
+enough to get those requests through.
+
+Serving an old address costs nothing in safety: the connection still verifies TLS
+against the hostname that was asked for, so an address that has moved on to someone
+else fails the handshake instead of being trusted. If it is simply dead, the request
+fails as it would have anyway and the breaker takes over.
+
+**This layer exists so the breaker does not have to fire.** Opening it loads a 17 GB
+tier into the Ollama server the llm-jury council needs, which `failover.py` allows
+only when local is the one way a session survives. A cached address that connects
+means it was not, so the session stays on the cloud model and the GPU stays free.
+
+The failover DNS probe is deliberately exempt. `name_resolution_works` calls
+`resolver.system_getaddrinfo()` to reach the stdlib directly, because a probe asking
+whether DNS answers cannot be answered from a cache of the times it did.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `BACKDOOR_DNS_CACHE` | unset | Set to `0` to disable and leave `socket.getaddrinfo` alone |
+| `CACHE_TTL` | 6 h | How long a remembered address stays usable |
+| `CACHE_MAX` | 256 | Entries kept before the oldest is dropped |
+
 ## Troubleshooting
 
 **`500 ... "system message must be at the beginning"`**
@@ -491,7 +549,7 @@ What each route does now when upstream will not answer:
 | `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage |
 | `/{path:path}` | `502` |
 
-Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+Recording a failure never opens the breaker on its own. `internet_usable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
 
 ### Deploying: scripts/deploy-router.sh
 
