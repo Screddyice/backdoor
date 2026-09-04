@@ -486,7 +486,7 @@ async def _post_local_failover(
 
 
 @pytest.mark.asyncio
-async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
+async def test_eligible_cloud_failure_uses_fresh_memory_backed_qwen_request(
     codex_app, monkeypatch, tmp_path
 ):
     app, settings, _ = codex_app
@@ -779,7 +779,7 @@ async def test_trigger_failure_uses_qwen_once_the_gate_elapses(
 
 
 @pytest.mark.asyncio
-async def test_empty_cognee_recall_still_serves_current_task_from_qwen(
+async def test_empty_memory_recall_still_serves_current_task_from_qwen(
     codex_app, monkeypatch, tmp_path
 ):
     local_payloads = []
@@ -1596,11 +1596,11 @@ async def test_local_request_reserves_qwen_before_its_stream_is_iterated(
 
 
 @pytest.mark.asyncio
-async def test_local_route_skips_all_cognee_recall_when_disabled(
+async def test_local_route_skips_all_memory_recall_when_disabled(
     codex_app, monkeypatch, tmp_path
 ):
     _, settings, _ = codex_app
-    settings.qwen_cognee = False
+    settings.qwen_memory = False
     breaker = one_shot_breaker(tmp_path)
     assert breaker.record_failure("HTTP 503") is True
 
@@ -1638,7 +1638,7 @@ async def test_local_route_skips_all_cognee_recall_when_disabled(
 
 
 @pytest.mark.asyncio
-async def test_oversized_local_instruction_is_rejected_before_cognee(
+async def test_oversized_local_instruction_is_rejected_before_memory(
     codex_app, monkeypatch, tmp_path
 ):
     _, settings, _ = codex_app

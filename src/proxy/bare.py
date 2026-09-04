@@ -73,8 +73,8 @@ from .models import MessagesRequest, Message
 # removes nearly all of the cost and nearly none of the offline capability.
 #
 # Mem0 is the interesting case and it belongs on the dropped side. Its MCP tools
-# call mcp.mem0.ai and cannot work offline, but local Mem0 recall still reaches
-# the model anyway: the hook reads ~/.mem0-local/cache.db client-side and
+# call cmem.ai and cannot work offline, but local memory recall still reaches
+# the model anyway: the proxy reads ~/.claude-mem/claude-mem.db itself and
 # injects memories into the prompt BEFORE the request is sent, which bare mode
 # preserves as ordinary text.
 #

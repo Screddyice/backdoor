@@ -627,8 +627,8 @@ async def create_message(
                 context_settings = load_profile_settings(profile)
                 # The router-level QWEN_COGNEE=0 escape hatch must survive the
                 # profile load, including true offline failover.
-                if not settings.qwen_cognee:
-                    context_settings.qwen_cognee = False
+                if not settings.qwen_memory:
+                    context_settings.qwen_memory = False
                 prepared_req = await prepare_external_context(fr, context_settings)
                 fr = prepared_req
                 if settings.failover_bare:

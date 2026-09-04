@@ -1499,3 +1499,23 @@ This repo is the **source**. The live control plane is operated by hand from an
 independent Terminal session, and machine hooks reject agent attempts to touch it —
 see `~/.claude/CLAUDE.md`, section "Backdoor live-control boundary". Agent
 instructions live in `CLAUDE.md`.
+
+## Memory: claude-mem replica (since 2026-09-04)
+
+Every memory path in the router now reads the local claude-mem store,
+`~/.claude-mem/claude-mem.db`, and nothing else. `src/proxy/memory.py` runs FTS5 queries
+over its summaries, observations and prompts (read-only, 1.5 s timeout, fail-open),
+`src/proxy/memory_recall.py` wraps that for Codex failover turns, and
+`external_context.remember_document` posts fetched documents to the local worker on
+`127.0.0.1:37701` as verbatim prompts, which the worker queues durably and syncs to the
+cmem.ai hub. Cognee and Mem0 are gone: no tunnel, no API key, no HTTP recall.
+
+Settings renamed with it: `codex_memory_timeout_seconds`, `codex_memory_top_k`,
+`codex_memory_char_budget`, `qwen_memory` (env `QWEN_MEMORY`; `QWEN_COGNEE` is still
+accepted as an alias so an older wrapper keeps working), plus `memory_db_path` and
+`memory_worker_url`. The qwen MCP builder's `--cognee-shim` is now `--memory-shim` and
+registers the server as `cmem`.
+
+The store is a synced replica of every device, so a failed-over local session recalls
+what Hermes on src or r2h learned, with the network gone. That is the property the
+Mem0 mirror was meant to provide and the Cognee tunnel could not.

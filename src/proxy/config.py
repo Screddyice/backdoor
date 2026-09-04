@@ -1,6 +1,6 @@
 import os
 from functools import lru_cache
-from pydantic import Field, model_validator
+from pydantic import Field, model_validator, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .failover import DEFAULT_FAILOVER_THRESHOLD
@@ -143,7 +143,7 @@ class Settings(BaseSettings):
     failover_tool_result_chars: int = 2000
 
     # Durable-memory recall injected into LOCAL model prompts, read from the
-    # offline mirror at ~/.mem0-local/cache.db. See src/proxy/memory.py.
+    # offline replica at ~/.claude-mem/claude-mem.db. See src/proxy/memory.py.
     #
     # On by default because the tier that needs it most is the one that had
     # nothing: the `qwen` wrapper's lean/fast modes pass `--bare`, which disables
@@ -158,14 +158,14 @@ class Settings(BaseSettings):
     memory_top_k: int = 6
     memory_char_budget: int = 1200
 
-    # Authoritative local Cognee recall for fresh Codex failover turns. The API
+    # Local claude-mem replica recall for fresh Codex failover turns. The API
     # key is optional on a single-user server and must arrive through the process
     # environment, never a committed profile.
-    cognee_base_url: str = "http://127.0.0.1:8001"
-    cognee_api_key: str = ""
-    codex_cognee_timeout_seconds: float = Field(default=2.0, gt=0)
-    codex_cognee_top_k: int = Field(default=8, ge=1)
-    codex_cognee_char_budget: int = Field(default=8_000, ge=1)
+    memory_db_path: str = "~/.claude-mem/claude-mem.db"
+    memory_worker_url: str = "http://127.0.0.1:37701"
+    codex_memory_timeout_seconds: float = Field(default=2.0, gt=0)
+    codex_memory_top_k: int = Field(default=8, ge=1)
+    codex_memory_char_budget: int = Field(default=8_000, ge=1)
 
     # Codex Responses failover keeps a hard 32K window on the fresh local
     # request. Component budgets include the reply reserve, so an invalid
@@ -217,10 +217,10 @@ class Settings(BaseSettings):
         return self
 
     # Large pages and attachments fetched by any client are reduced before a
-    # local Qwen sees them, then stored in and recalled from Cognee. Local
-    # ranking always runs; QWEN_COGNEE=0 disables only network memory for true
-    # offline use. Every Cognee call is bounded and fail-open.
-    qwen_cognee: bool = True
+    # local Qwen sees them, then stored in and recalled from claude-mem. Local
+    # ranking always runs; QWEN_MEMORY=0 disables only memory recall for true
+    # offline use. Every memory call is bounded and fail-open.
+    qwen_memory: bool = Field(default=True, validation_alias=AliasChoices("QWEN_MEMORY", "QWEN_COGNEE", "qwen_memory"))
     external_context_threshold_chars: int = 12000
     external_context_char_budget: int = 6000
     external_context_max_document_chars: int = 500000
