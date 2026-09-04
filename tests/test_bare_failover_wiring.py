@@ -330,16 +330,50 @@ async def test_profile_mode_runs_the_runtime_interlock_before_provider_call(monk
     assert seen[-1] == "local-fast"
 
 
-async def test_oversized_route_session_escalates_to_the_wide_tier(route_app):
-    """The bug. A transcript that overflows the 27B's window has to reach the
-    256K tier, exactly as the failover path would route it. Before this fix the
-    static MODEL_ROUTES entry won and the request failed forever."""
-    app, _recorder, seen = route_app
+async def test_oversized_route_session_is_trimmed_and_keeps_the_strong_tier(route_app):
+    """A transcript that overflows the 27B's window is bounded, not exiled.
+
+    This assertion is the reverse of the one it replaces, and the reversal was
+    bought with measurements taken 2026-09-05 on this host. Escalating keeps
+    every token and pays for it once, enormously: `qwen3.5:4b-256k` prefills
+    103,277 tokens in 391 s, and the 2026-09-04 session that appeared frozen
+    was about 142K. Trimming the same session to 18K and staying on the 27B
+    costs roughly 70 s and leaves the stronger model answering.
+
+    The ladder is still the fallback — see the next test — but it is no longer
+    the first answer to a big transcript.
+    """
+    app, recorder, seen = route_app
     resp = await _post(app, _route_request(turns=20))
 
     assert resp.status_code == 200
+    assert "local-failover-256k" not in seen, (
+        "a trimmable session was sent to the wide 4B tier; bounding it keeps "
+        "the 27B, which is both stronger and faster to prefill at this size"
+    )
+    sent = recorder.payload["messages"]
+    assert len(sent) < 20, "the transcript was not bounded at all"
+
+
+async def test_a_session_that_cannot_be_trimmed_still_escalates(route_app):
+    """One message larger than the ceiling: nothing to drop, so the ladder runs.
+
+    Bounding removes whole turns. When the newest turn alone is over the
+    ceiling there is no smaller working set to build, and the wide tier is the
+    only thing that can answer at all.
+    """
+    app, _recorder, seen = route_app
+    huge = "Read this build log and explain the failure. " * 12_000
+    resp = await _post(app, {
+        "model": "qwen",
+        "system": HARNESS_SYSTEM,
+        "messages": [{"role": "user", "content": huge}],
+    })
+
+    assert resp.status_code == 200
     assert seen[-1] == "local-failover-256k", (
-        f"oversized /model qwen session stayed on {seen[-1]}; it must escalate"
+        f"un-trimmable session stayed on {seen[-1]}; the ladder is still the "
+        "fallback when there is nothing to trim"
     )
 
 
@@ -462,3 +496,138 @@ def test_recall_survives_punctuation_that_breaks_fts5():
     """Raw prompts contain quotes and operators; FTS5 treats them as syntax."""
     from src.proxy.memory import recall
     assert recall("what's the 27B's window? (AND OR NOT) -- ;", k=3) == [] or True
+
+
+@pytest.mark.asyncio
+async def test_tier_escalation_frees_the_tier_it_left(monkeypatch):
+    """Escalating must hand back the GPU, not stack a second tier beside it.
+
+    The 27B holds 17 GB (22.0 GB wired, measured 2026-09-05 on a 36 GB host
+    with a ~27 GB ceiling) and the 256K 4B wants ~13 GB more. Escalating
+    without freeing the outgoing tier asks Ollama for both, and
+    OLLAMA_MAX_LOADED_MODELS=3 lets it try.
+    """
+    recorder = RecordingClient()
+    monkeypatch.setattr(routes, "_get_profile_client", lambda p, s: recorder)
+    routes.set_provider_client(recorder)
+    monkeypatch.setattr(routes, "_local_inflight", 0)
+
+    evicted: list[str] = []
+
+    async def _unload(base_url, model):
+        evicted.append(model)
+        return True
+
+    monkeypatch.setattr(routes.ollama_admin, "unload", _unload)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_model="qwen3.5:4b-64k",
+        route_max_input_tokens=28_000,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=20))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert evicted == ["qwen3.5:4b-64k"], (
+        f"escalation left {evicted or 'the outgoing tier'} resident; the tier it "
+        "stopped using must be released before the wider one loads beside it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_stays_put_frees_nothing(monkeypatch):
+    """No escalation, no eviction — the tier serving the request is not a leak."""
+    recorder = RecordingClient()
+    monkeypatch.setattr(routes, "_get_profile_client", lambda p, s: recorder)
+    routes.set_provider_client(recorder)
+    monkeypatch.setattr(routes, "_local_inflight", 0)
+
+    evicted: list[str] = []
+
+    async def _unload(base_url, model):
+        evicted.append(model)
+        return True
+
+    monkeypatch.setattr(routes.ollama_admin, "unload", _unload)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_model="qwen3.5:4b-64k",
+        route_max_input_tokens=28_000,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=1))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert evicted == [], f"unloaded {evicted} for a session that never escalated"
+
+
+@pytest.mark.asyncio
+async def test_profile_mode_bounds_a_local_tier(monkeypatch):
+    """The `qwen` wrapper runs profile mode, so this is the common local path.
+
+    The backstop is gated on the provider being a local Ollama tier, which is
+    what every `profiles/local-*.env` points at.
+    """
+    from src.proxy import working_set
+    working_set.reset()
+    recorder = RecordingClient()
+    routes.set_provider_client(recorder)
+    monkeypatch.setattr(routes, "_get_profile_client", lambda p, s: recorder)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_base_url="http://localhost:11434/v1",
+        provider_model="qwen3.8:27b-obliterated",
+        # Every profiles/local-*.env that reaches the 27B sets this. Without it
+        # the untouched harness system prompt alone is ~20K of the ceiling, and
+        # dropping turns cannot buy that back.
+        route_bare=True,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=20))
+    finally:
+        app.dependency_overrides.clear()
+        working_set.reset()
+
+    assert resp.status_code == 200
+    assert len(recorder.payload["messages"]) < 20, (
+        "a profile-mode session reached the local tier untrimmed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_provider_is_never_bounded(monkeypatch):
+    """The ceiling is this machine's GPU, not a property of the conversation."""
+    from src.proxy import working_set
+    working_set.reset()
+    recorder = RecordingClient()
+    routes.set_provider_client(recorder)
+    monkeypatch.setattr(routes, "_get_profile_client", lambda p, s: recorder)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_base_url="https://integrate.api.nvidia.com/v1",
+        provider_model="some-hosted-model",
+    )
+    try:
+        resp = await _post(app, _route_request(turns=20))
+    finally:
+        app.dependency_overrides.clear()
+        working_set.reset()
+
+    assert resp.status_code == 200
+    # 21, not 20: the translation layer hoists the system prompt into the
+    # message list. The point is that no TURN was dropped.
+    assert len(recorder.payload["messages"]) == 21, (
+        "trimmed a hosted provider's request for a local window it does not have"
+    )
