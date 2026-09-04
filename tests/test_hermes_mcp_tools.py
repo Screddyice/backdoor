@@ -15,6 +15,7 @@ from src.hermes_mcp.tools import register_tools
 FULL = Profile(name="alpha", tier="full", port=9001, key_env="A", unit="a.service")
 LOCKED = Profile(name="prod", tier="control_only", port=9002, key_env="B", unit="b.service")
 GHOST = Profile(name="ghost", tier="unconfigured")
+DELEGATE = Profile(name="screddy", tier="delegate_only", port=9003, key_env="C")
 REGISTRY = {"alpha": FULL, "prod": LOCKED, "ghost": GHOST}
 
 
@@ -64,6 +65,31 @@ async def test_list_returns_every_profile_with_its_tier(tools):
     assert set(by_name) == {"alpha", "prod", "ghost"}
     assert by_name["prod"]["tier"] == "control_only"
     assert by_name["ghost"]["tier"] == "unconfigured"
+
+
+async def test_delegate_only_list_entry_is_health_safe():
+    FakeClient.behaviour = {
+        "screddy": {
+            "profile": "screddy",
+            "state": "ok",
+            "reason": None,
+            "next": None,
+        }
+    }
+    mcp = FakeMCP()
+    register_tools(mcp, {"screddy": DELEGATE}, client_factory=FakeClient)
+    got = await mcp.tools["hermes_list"]()
+    assert got == {
+        "profiles": [
+            {
+                "profile": "screddy",
+                "state": "ok",
+                "reason": None,
+                "next": None,
+                "tier": "delegate_only",
+            }
+        ]
+    }
 
 
 async def test_one_dead_gateway_does_not_fail_the_listing(tools):

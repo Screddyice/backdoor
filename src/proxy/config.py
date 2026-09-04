@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .failover import DEFAULT_FAILOVER_THRESHOLD
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -87,7 +89,7 @@ class Settings(BaseSettings):
     # connectivity probe is. A run of failures only opens the breaker if a TCP
     # probe to a public address also fails, so a single transient blip still
     # cannot claim the GPU. The third failure bought latency, not safety.
-    failover_threshold: int = 1
+    failover_threshold: int = DEFAULT_FAILOVER_THRESHOLD
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
     # How long the upstream must stay broken before failover is allowed.
@@ -132,7 +134,7 @@ class Settings(BaseSettings):
     failover_tool_result_chars: int = 2000
 
     # Durable-memory recall injected into LOCAL model prompts, read from the
-    # offline mirror at ~/.mem0-local/cache.db. See src/proxy/memory.py.
+    # offline replica at ~/.claude-mem/claude-mem.db. See src/proxy/memory.py.
     #
     # On by default because the tier that needs it most is the one that had
     # nothing: the `qwen` wrapper's lean/fast modes pass `--bare`, which disables
@@ -147,14 +149,14 @@ class Settings(BaseSettings):
     memory_top_k: int = 6
     memory_char_budget: int = 1200
 
-    # Authoritative local Cognee recall for fresh Codex failover turns. The API
+    # Local claude-mem replica recall for fresh Codex failover turns. The API
     # key is optional on a single-user server and must arrive through the process
     # environment, never a committed profile.
-    cognee_base_url: str = "http://127.0.0.1:8001"
-    cognee_api_key: str = ""
-    codex_cognee_timeout_seconds: float = Field(default=2.0, gt=0)
-    codex_cognee_top_k: int = Field(default=8, ge=1)
-    codex_cognee_char_budget: int = Field(default=8_000, ge=1)
+    memory_db_path: str = "~/.claude-mem/claude-mem.db"
+    memory_worker_url: str = "http://127.0.0.1:37701"
+    codex_memory_timeout_seconds: float = Field(default=2.0, gt=0)
+    codex_memory_top_k: int = Field(default=8, ge=1)
+    codex_memory_char_budget: int = Field(default=8_000, ge=1)
 
     # Codex Responses failover keeps a hard 32K window on the fresh local
     # request. Component budgets include the reply reserve, so an invalid
@@ -165,6 +167,12 @@ class Settings(BaseSettings):
     codex_memory_budget_tokens: int = Field(default=2_000, ge=0)
     codex_tools_budget_tokens: int = Field(default=4_000, ge=0)
     codex_active_turn_budget_tokens: int = Field(default=21_000, ge=1)
+
+    # Stable history sent ahead of the active turn so the local tier can reuse a
+    # KV prefix. Deliberately NOT part of validate_codex_context_allocation: it
+    # spends only what the active turn left unused, so it can never push the
+    # allocation past the window. 0 restores the active-turn-only behaviour.
+    codex_history_budget_tokens: int = Field(default=12_000, ge=0)
     codex_local_model: str = "qwen3.8:27b-obliterated"
     codex_local_responses_url: str = "http://127.0.0.1:11434/v1/responses"
     codex_local_tools: str = "local"
@@ -194,10 +202,10 @@ class Settings(BaseSettings):
         return self
 
     # Large pages and attachments fetched by any client are reduced before a
-    # local Qwen sees them, then stored in and recalled from Cognee. Local
-    # ranking always runs; QWEN_COGNEE=0 disables only network memory for true
-    # offline use. Every Cognee call is bounded and fail-open.
-    qwen_cognee: bool = True
+    # local Qwen sees them, then stored in and recalled from claude-mem. Local
+    # ranking always runs; QWEN_MEMORY=0 disables only memory recall for true
+    # offline use. Every memory call is bounded and fail-open.
+    qwen_memory: bool = True
     external_context_threshold_chars: int = 12000
     external_context_char_budget: int = 6000
     external_context_max_document_chars: int = 500000
@@ -244,6 +252,29 @@ class Settings(BaseSettings):
     # deliberate route and a failover size the tier identically. Over it, the
     # request escalates through that ladder instead of failing.
     route_max_input_tokens: int = 0
+
+    # Bound the transcript itself, and keep the boundary STICKY once chosen.
+    #
+    # Escalating a huge session to a wider tier keeps every token but pays for
+    # it in one long stall: measured 2026-09-05, `qwen3.5:4b-256k` prefills
+    # 103,277 tokens in 391 s, and the 2026-09-04 session that looked frozen
+    # was ~142K. Trimming the same session to 18K and staying on the 27B costs
+    # about 70 s, once. So bounding is tried first and the ladder becomes the
+    # fallback for a request that cannot be trimmed under the ceiling.
+    #
+    # The stickiness matters more than either number. Ollama reuses the KV
+    # cache for a shared prefix — an append costs 5-10 s where the same
+    # transcript cold costs 26-136 s — so a window recomputed every request
+    # would destroy the reuse it is meant to protect. See working_set.py.
+    local_working_set: bool = True
+    local_working_set_target_tokens: int = 18_000
+    local_working_set_max_tokens: int = 22_000
+
+    # One local inference at a time per tier. Two sessions interleaving on one
+    # model evict each other's KV cache: measured 105.8 s and 116.3 s per turn
+    # against 0.7 s for a single session repeating. Waiting past this timeout
+    # proceeds unlocked rather than failing the request. 0 disables queueing.
+    local_tier_lock_timeout_seconds: float = 900.0
 
     # Optional runtime identity for profiles whose server lifecycle must be
     # supervised before a request can load weights. Unlike the hybrid router's

@@ -20,7 +20,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-TIERS = frozenset({"full", "control_only", "unconfigured"})
+TIERS = frozenset({"full", "control_only", "delegate_only", "unconfigured"})
 
 
 class RegistryError(ValueError):
@@ -73,7 +73,7 @@ def load_registry(path: str | Path | None = None) -> dict[str, Profile]:
 
         port = body.get("port")
         key_env = body.get("key_env")
-        if tier in {"full", "control_only"}:
+        if tier in {"full", "control_only", "delegate_only"}:
             if port is None:
                 raise RegistryError(f"profile {name!r} is {tier} but declares no port")
             if key_env is None:

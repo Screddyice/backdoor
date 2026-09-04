@@ -26,11 +26,11 @@ from .external_context import (
     prepare_codex_external_context,
     recall_codex_external_context,
 )
-from .cognee_recall import recall_context
+from .memory_recall import recall_context
 from .config import Settings, get_settings
 from .failover import FailoverBreaker, service_reachable
 from .provider_errors import is_provider_edge_404
-from . import compute_lease, mlx_admin, ollama_admin
+from . import compute_lease, mlx_admin, ollama_admin, tier_lock
 
 logger = logging.getLogger(__name__)
 codex_router = APIRouter(prefix="/backend-api/codex")
@@ -544,7 +544,12 @@ def _local_body(
 
 
 async def _release_local_slot(breaker: FailoverBreaker) -> None:
-    global _local_inflight, _deferred_claims
+    global _local_inflight, _deferred_claims, _held_tier
+    # Hand the tier back first: the unloads below can await, and a queued turn
+    # waiting on this lock should not sit behind housekeeping.
+    if _held_tier is not None:
+        tier_lock.release(*_held_tier)
+        _held_tier = None
     async with _local_state_lock:
         _local_inflight = max(0, _local_inflight - 1)
         if not _local_inflight and _deferred_claims and not breaker.open:
@@ -553,10 +558,31 @@ async def _release_local_slot(breaker: FailoverBreaker) -> None:
                 await ollama_admin.unload(base_url, model)
 
 
+# The tier this path currently holds, or None. Module-level because reserve and
+# release live in different functions; see tier_lock.acquire for why the Codex
+# path cannot use the context manager the Claude path uses.
+_held_tier: tuple[str, str] | None = None
+
+
 async def _reserve_local_slot() -> None:
     global _local_inflight
     async with _local_state_lock:
         _local_inflight += 1
+
+
+async def _hold_tier(settings: Settings) -> None:
+    """Serialize this Codex turn against every other local turn on the tier.
+
+    Measured 2026-09-05: two sessions alternating on one model cost 105.8s and
+    116.3s per turn against 0.7s for one session repeating, because each
+    request evicts the other's KV cache. A Codex turn and a Claude turn on the
+    same 27B do that to each other exactly as two Claude turns do, so both
+    paths take the same lock.
+    """
+    global _held_tier
+    tier = (_ollama_openai_base(settings), settings.codex_local_model)
+    if await tier_lock.acquire(*tier, timeout=settings.local_tier_lock_timeout_seconds):
+        _held_tier = tier
 
 
 async def _serve_local(
@@ -571,6 +597,7 @@ async def _serve_local(
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable")
 
     await _reserve_local_slot()
+    await _hold_tier(settings)
     response: httpx.Response | None = None
     try:
         resolved = await mlx_admin.resolve_profile("local-qwen38-obliterated")
@@ -592,7 +619,7 @@ async def _serve_local(
                 cloud_payload, settings.codex_active_turn_budget_tokens
             )
             local_source = await prepare_codex_external_context(cloud_payload, settings)
-            if settings.qwen_cognee:
+            if settings.qwen_memory:
                 external_memories, agent_memories = await asyncio.gather(
                     recall_codex_external_context(cloud_payload, settings),
                     recall_context(query, settings),

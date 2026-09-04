@@ -15,20 +15,20 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-OPERATOR_HOME = Path("/Users/screddy")
+CANONICAL_HOME = Path("/Users/screddy")
 LIVE_PLISTS = tuple(
     dict.fromkeys(
         [
+            CANONICAL_HOME / "Library/LaunchAgents/com.screddy.backdoor-router.plist",
             Path.home() / "Library/LaunchAgents/com.screddy.backdoor-router.plist",
-            OPERATOR_HOME / "Library/LaunchAgents/com.screddy.backdoor-router.plist",
         ]
     )
 )
 LIVE_CHECKOUTS = tuple(
     dict.fromkeys(
         [
+            CANONICAL_HOME / "projects/SRC/backdoor-service",
             Path.home() / "projects/SRC/backdoor-service",
-            OPERATOR_HOME / "projects/SRC/backdoor-service",
         ]
     )
 )
@@ -122,10 +122,8 @@ def _is_protected_file(path_text: str) -> bool:
         resolved = expanded.resolve(strict=False)
     except OSError:
         resolved = expanded
-    protected = (*LIVE_PLISTS, *LIVE_CHECKOUTS)
-    return any(
-        resolved == path or (path in resolved.parents if path in LIVE_CHECKOUTS else False)
-        for path in protected
+    return any(resolved == path for path in LIVE_PLISTS) or any(
+        resolved == checkout or checkout in resolved.parents for checkout in LIVE_CHECKOUTS
     )
 
 
@@ -141,15 +139,17 @@ def evaluate(payload: dict[str, Any]) -> str | None:
             return BLOCK_REASON
         if tool_name.endswith("apply_patch"):
             patch_text = "\n".join(_strings(tool_input))
-            if _contains_any_path(patch_text, (*LIVE_PLISTS, *LIVE_CHECKOUTS)):
+            if _contains_any_path(patch_text, LIVE_PLISTS) or _contains_any_path(
+                patch_text, LIVE_CHECKOUTS
+            ):
                 return BLOCK_REASON
 
     text = "\n".join(_strings(tool_input))
     if not text:
         return None
 
-    if "apply_patch" in text and _contains_any_path(
-        text, (*LIVE_PLISTS, *LIVE_CHECKOUTS)
+    if "apply_patch" in text and (
+        _contains_any_path(text, LIVE_PLISTS) or _contains_any_path(text, LIVE_CHECKOUTS)
     ):
         return BLOCK_REASON
 
