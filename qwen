@@ -287,7 +287,7 @@ else
   # umask 077 so the file is created 600 from its first byte (see the Mem0
   # branch above for why the chmod below stays as a backstop, not a duplicate).
   COGNEE_BUILD_ARGS=()
-  [ -n "$COGNEE_SHIM" ] && COGNEE_BUILD_ARGS=(--cognee-shim "$COGNEE_SHIM")
+  [ -n "$COGNEE_SHIM" ] && COGNEE_BUILD_ARGS=(--memory-shim "$COGNEE_SHIM")
   python3 "$QWEN_MCP_HELPER" build --servers "${QWEN_MCP_SERVERS:-}" \
     --output "$MCP_CONF" ${COGNEE_BUILD_ARGS[@]+"${COGNEE_BUILD_ARGS[@]}"}
   chmod 600 "$MCP_CONF"
