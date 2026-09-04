@@ -143,24 +143,6 @@ async def test_explicit_route_externalizes_large_fetched_page(routed_app):
     assert "Z" * 10_000 not in sent
 
 
-async def test_explicit_route_externalizes_large_fetched_page(routed_app):
-    """The GUI may vary; the provider request crossing Backdoor is the seam."""
-    app, recorder, monkeypatch = routed_app
-    _pin(monkeypatch, route_bare=True)
-    body = _harness_request()
-    body["messages"][1]["content"][0]["name"] = "WebFetch"
-    body["messages"][1]["content"][0]["input"] = {"url": "https://example.com/report"}
-    body["messages"].append({"role": "user", "content": "What does the report say?"})
-
-    resp = await _post(app, body)
-
-    assert resp.status_code == 200
-    sent = json.dumps(recorder.payload)
-    assert "<qwen-external-context" in sent
-    assert "https://example.com/report" in sent
-    assert "Z" * 10_000 not in sent
-
-
 async def test_the_users_actual_question_survives(routed_app):
     """Stripping is only correct if the session still makes sense afterwards."""
     app, recorder, monkeypatch = routed_app

@@ -1,4 +1,3 @@
-import pytest
 """Shared test isolation.
 
 The failover breaker publishes its state to a real path (`~/.backdoor/

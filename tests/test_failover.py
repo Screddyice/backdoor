@@ -20,6 +20,7 @@ from src.proxy.failover import (
     internet_reachable,
     service_reachable,
 )
+from src.proxy.config import FAILOVER_LADDER, pick_failover_profile
 
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="backdoor-failover-state-"))
 _state_seq = iter(range(1_000_000))
@@ -517,7 +518,6 @@ def test_unwritable_state_path_does_not_break_the_breaker():
 
 
 # ── Failover ladder (size → local tier) ──────────────────────────────────────
-from src.proxy.config import pick_failover_profile, FAILOVER_LADDER
 
 
 def test_ladder_normal_session_gets_the_strong_tool_capable_tier():

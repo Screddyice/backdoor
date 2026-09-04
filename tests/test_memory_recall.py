@@ -23,7 +23,8 @@ def _store(path: Path) -> Path:
         INSERT INTO user_prompts_fts(rowid, prompt_text) SELECT id, prompt_text FROM user_prompts;
         """
     )
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     return path
 
 
@@ -115,7 +116,8 @@ def test_a_budget_too_small_to_say_anything_returns_nothing_and_says_so(tmp_path
 
 def test_recall_fails_open_on_missing_or_corrupt_store(tmp_path, caplog):
     assert memory.recall("anything", cache=tmp_path / "missing.db") == []
-    bad = tmp_path / "bad.db"; bad.write_bytes(b"not a database")
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"not a database")
     with caplog.at_level(logging.WARNING):
         assert memory.recall("anything", cache=bad) == []
 

@@ -1,6 +1,5 @@
 """Bare mode: stripping the Claude Code harness off a failed-over request."""
 
-import pytest
 
 from src.proxy.bare import (
     DEFAULT_KEEP_TOOLS,
