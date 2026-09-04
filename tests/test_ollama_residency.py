@@ -14,13 +14,17 @@ Two independent guards, tested separately because either alone leaves a hole:
     sessions abandoned and no successful upstream call to close the breaker.
 """
 
+import json
 import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
 
+import src.proxy.routes as routes
 from src.proxy import ollama_admin
-from src.proxy.config import MODEL_ROUTES, load_profile_settings
+from src.proxy.app import create_app
+from src.proxy.config import Settings, get_settings, load_profile_settings
 from src.proxy.failover import FailoverBreaker
 
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="backdoor-residency-state-"))
@@ -216,15 +220,6 @@ def test_failover_only_tiers_still_release_early():
 # closed" and "tier released". So assert on what Ollama's admin endpoint
 # ACTUALLY RECEIVES across a full outage-and-recovery cycle.
 # --------------------------------------------------------------------------
-
-import json
-
-import httpx
-
-import src.proxy.routes as routes
-from src.proxy.app import create_app
-from src.proxy.config import Settings, get_settings
-
 
 class Recorder:
     async def complete(self, payload):
