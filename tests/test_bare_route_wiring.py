@@ -77,8 +77,8 @@ def _harness_request(model: str = "qwen") -> dict:
             {"name": "Read", "description": "read a file", "input_schema": {}},
             {"name": "WebSearch", "description": "search the web", "input_schema": {}},
             {"name": "WebFetch", "description": "fetch a URL", "input_schema": {}},
-            {"name": "mcp__plugin_mem0_mem0__search_memories",
-             "description": "recall", "input_schema": {}},
+            {"name": "mcp__example__crm_lookup",
+             "description": "lookup", "input_schema": {}},
         ],
         "messages": [
             {"role": "user", "content": "why is qwen still the 4b?"},

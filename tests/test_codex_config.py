@@ -18,7 +18,7 @@ def test_codex_runtime_settings_accept_operator_environment(monkeypatch):
     monkeypatch.setenv("CODEX_CHATGPT_UPSTREAM", "https://cloud.test/backend-api/codex")
     monkeypatch.setenv("CODEX_LOCAL_RESPONSES_URL", "http://127.0.0.1:11434/v1/responses")
     monkeypatch.setenv("CODEX_LOCAL_MODEL", "qwen3.8:27b-obliterated")
-    monkeypatch.setenv("COGNEE_BASE_URL", "http://127.0.0.1:8001")
+    monkeypatch.setenv("MEMORY_WORKER_URL", "http://127.0.0.1:37701")
     monkeypatch.setenv("CODEX_CONTEXT_WINDOW", "32000")
     monkeypatch.setenv("CODEX_FAILOVER_THRESHOLD", "3")
     monkeypatch.setenv("CODEX_FAILOVER_STATUSES", "429,503,401")

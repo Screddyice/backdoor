@@ -755,7 +755,7 @@ async def create_message(
                 fr = MessagesRequest.model_validate_json(body)
                 raw_est = count_messages(fr.messages, fr.system, fr.tools)
                 context_settings = load_profile_settings(profile)
-                # The router-level QWEN_COGNEE=0 escape hatch must survive the
+                # The router-level QWEN_MEMORY=0 escape hatch must survive the
                 # profile load, including true offline failover.
                 if not settings.qwen_memory:
                     context_settings.qwen_memory = False

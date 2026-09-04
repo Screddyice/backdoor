@@ -1,6 +1,6 @@
 import os
 from functools import lru_cache
-from pydantic import Field, model_validator, AliasChoices
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .failover import DEFAULT_FAILOVER_THRESHOLD
@@ -220,7 +220,7 @@ class Settings(BaseSettings):
     # local Qwen sees them, then stored in and recalled from claude-mem. Local
     # ranking always runs; QWEN_MEMORY=0 disables only memory recall for true
     # offline use. Every memory call is bounded and fail-open.
-    qwen_memory: bool = Field(default=True, validation_alias=AliasChoices("QWEN_MEMORY", "QWEN_COGNEE", "qwen_memory"))
+    qwen_memory: bool = True
     external_context_threshold_chars: int = 12000
     external_context_char_budget: int = 6000
     external_context_max_document_chars: int = 500000

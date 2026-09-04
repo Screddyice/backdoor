@@ -408,11 +408,9 @@ The visible Codex thread does not change. Qwen receives a fresh internal request
 - a bounded recall from the local claude-mem replica when `QWEN_MEMORY` is enabled;
 - local Code Mode tools converted from Codex's Responses Lite namespace format.
 
-It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Cognee can provide continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads agent recall through `POST /api/v1/recall`. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_COGNEE=0` to suppress every Cognee read and write on the local path.
+It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Backdoor reads the synced local replica at `~/.claude-mem/claude-mem.db`, so recall works without a network call or memory tunnel. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_MEMORY=0` to suppress memory reads and writes on the local path.
 
 Backdoor sets `reasoning.effort=none` on the local Responses request so Ollama answers with a plain assistant message. Ollama's own reasoning items carry `encrypted_content` signed locally, which ChatGPT cannot verify once the breaker closes; a thread carrying them cannot go back to cloud inference. Keeping them out of Codex history is what lets the same task return to cloud.
-
-Cognee authentication resolves from the running process, `~/.cognee/.env`, then the existing `~/.cognee-plugin/api_key.json` cache when its server URL matches. The key is not copied into the Backdoor LaunchAgent.
 
 The breaker permits one ChatGPT probe every 60 seconds while open. A probe closes it the moment ChatGPT returns response headers, the same point the Anthropic path uses: a status line proves this host can still reach the upstream, and reachability is the only question the breaker asks. Later turns return to cloud immediately. Qwen is released separately, once a relayed stream finishes, because a probe whose body dies mid-flight is about to be retried and unloading the tier that will serve that retry only buys a reload.
 
@@ -882,9 +880,7 @@ qwen mcp screddy-hermes -p "check the requested conversation"
 qwen mcp composio-tmn,atlassian
 ```
 
-`qwen mcp NAME` validates each name against `~/.claude.json`, runs the same certificate-verifying internet probe as the hybrid router, and writes a private session config under `~/.cache/backdoor/`. Only the named servers start, alongside the compact Cognee memory shim when Cognee is enabled. If the Mac is offline, Qwen skips the requested MCP connection and keeps working with local tools. `QWEN_MCP_ASSUME_ONLINE=1` bypasses the probe on a network that blocks its public endpoints while allowing the selected MCP.
-
-Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai` and cannot work offline, but local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
+`qwen mcp NAME` validates each name against `~/.claude.json`, runs the same certificate-verifying internet probe as the hybrid router, and writes a private session config under `~/.cache/backdoor/`. Only the named servers start. Memory stays independent of this switch because Backdoor reads the local claude-mem replica. If the Mac is offline, Qwen skips the requested MCP connection and keeps working with local tools. `QWEN_MCP_ASSUME_ONLINE=1` bypasses the probe on a network that blocks its public endpoints while allowing the selected MCP.
 
 **The tier must accept tool definitions.** This is a hard pairing, not a preference. `deepseek-r1` at any runnable size does not: Ollama answers a request carrying tools with `does not support tools`, HTTP 400, killing the session failover exists to save. If you swap the tier for a model without tool support, set `failover_keep_tools=""` at the same time.
 
@@ -1002,17 +998,11 @@ The backend must also return usable summary text. On 2026-08-28 the action-tuned
 
 #### Memory is the other half of a small window
 
-A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
+A short window works only when durable facts live outside the prompt. Backdoor reads the local claude-mem SQLite replica before each local turn and injects a bounded result as background context. This adds no MCP schema and still works when the network is down. `QWEN_MEMORY=0` disables recall.
 
-This is the one documented exception to the MCP-off rule, and the token arithmetic is why it survives that rule. The global MCP set costs about 142K tokens of schema. The shim exposes `cognee_search` and `cognee_remember` and nothing else, so it costs hundreds. Against a 32K window the first is impossible and the second is affordable.
+Large fetched pages also bypass the model window at the proxy layer. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted to the local claude-mem worker. Browser-session tools never persist their output.
 
-Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
-
-Large fetched pages also bypass the model window at the proxy layer, making the behavior independent of GUI plugins. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted with its URL and content hash to the dedicated `qwen_external_context` Cognee dataset. Browser-session tools never persist their output. Later Qwen turns search that dataset and inject only a bounded set of recalled passages. The first turn does not wait for Cognee indexing: local ranking supplies its excerpts while Cognee processes an approved durable copy in the background.
-
-This boundary is client-independent because every local Qwen request crosses Backdoor. Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Unapproved, authenticated, intranet, and client sources remain ephemeral even when their content looks harmless. Approved source text is marked as untrusted data, high-confidence credential-shaped documents are not written, and stored source URLs exclude user information, query strings, and fragments. Individual documents are capped at 500,000 characters before ranking, and each request can enqueue at most four documents. Cognee calls time out after 1.5 seconds. A Cognee or SSH-tunnel failure never drops the request. `QWEN_COGNEE=0` disables writes and recall for true-offline work, while the local 6,000-character reduction still protects Qwen's window.
-
-The proxy resolves Cognee settings from its process environment, then `~/.cognee/.env`, then `~/projects/.env`. That makes the same behavior available to terminal launchers and Dock-launched clients that never source `.zshrc`. A missing key or unreachable service degrades to local reduction only.
+Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Unapproved, authenticated, intranet, and client sources remain ephemeral. Approved source text is marked as untrusted data, high-confidence credential-shaped documents are not written, and stored source URLs exclude user information, query strings, and fragments. Individual documents are capped at 500,000 characters before ranking, and each request can enqueue at most four documents. Worker calls time out after 1.5 seconds and fail open, while the local 6,000-character reduction still protects Qwen's window.
 
 #### The guard has to sit below every routing branch
 
@@ -1317,21 +1307,17 @@ The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces fo
 
 ### Durable memory on local models
 
-Local sessions read Mem0 recall from the offline mirror at `~/.mem0-local/cache.db` and get it prepended to the system prompt as plain text. No MCP server, no tool call, no network.
+Local sessions read the synced claude-mem replica at `~/.claude-mem/claude-mem.db` and prepend bounded recall to the system prompt as plain text. The read needs no MCP server, tool call, or network.
 
-This exists because of a gap that was invisible from either side. Memory normally arrives through the `UserPromptSubmit` hook, which is why `bare.py` puts Mem0's MCP tools on the dropped side of the keep-list — the hook already injected the text before the request was built. But the `qwen` wrapper's lean and fast modes pass `--bare`, and `--bare` disables CLAUDE.md discovery and **every hook**. So the default local tier, the 27B, was the only brain in the stack with no durable memory, while `/model qwen`, failover, and `qwen full` all had it.
+Claude's lifecycle hooks normally supply memory, but the `qwen` wrapper's lean and fast modes pass `--bare`, which disables every hook. Backdoor therefore injects recall at the proxy layer, the one path every local request crosses.
 
 | Path | Before | Now |
 |---|---|---|
-| `/model qwen` (router) | hook injects | unchanged |
-| Cloud→local failover | hook injects | unchanged |
-| `qwen full` | hook injects | unchanged |
+| `/model qwen` (router) | path-dependent | proxy injects |
+| Cloud→local failover | path-dependent | proxy injects |
+| `qwen full` | hook injects | proxy deduplicates |
 | `qwen`, `qwen lean` | **nothing** | proxy injects |
 | `qwen fast` | **nothing** | proxy injects |
-
-The proxy is the one place every local request passes through whichever door it came in by, so one code path covers all of them.
-
-Reading the local mirror rather than the Mem0 API is deliberate: the cloud endpoint is unreachable during exactly the outage failover exists to cover, since the breaker opens on one condition — this host being offline.
 
 ```
 PROVIDER_BASE_URL=http://localhost:11434/v1   # injection only fires for local providers
@@ -1340,7 +1326,7 @@ MEMORY_TOP_K=6
 MEMORY_CHAR_BUDGET=1200
 ```
 
-Cloud providers are excluded so a session whose hook already ran does not pay for the same text twice. Recall is read-only (`mode=ro`), fails open on a missing or locked cache, and times out in 1.5s so the Mem0 sync job's write lock cannot stall a turn. The budget is small on purpose: bare mode exists to hold the prompt near 945 tokens, and unbounded recall would rebuild the problem it solved.
+Cloud providers are excluded so a session whose hook already ran does not pay for the same text twice. Recall is read-only (`mode=ro`), fails open on a missing or locked database, and times out in 1.5 seconds so the sync worker's write lock cannot stall a turn. The budget stays small because bare mode exists to hold the prompt near 945 tokens.
 
 Memories are labelled as background that may be stale rather than as instructions, because they are. The mirror still describes the heavy tier as `qwen3.5:27b-bare` at 15 GB, two facts that are both now wrong, and a local model asked about the tier will say so rather than assert the stale version.
 
@@ -1578,16 +1564,16 @@ over its summaries, observations and prompts (read-only, 1.5 s timeout, fail-ope
 `external_context.remember_document` posts fetched documents to the local worker on
 `127.0.0.1:37701` as verbatim prompts, which the worker queues durably and syncs to the
 cmem.ai hub. Cognee and Mem0 are gone: no tunnel, no API key, no HTTP recall.
+The superseded Cognee failover design and implementation plan were removed from `docs/` so no
+operator can mistake them for a supported recovery path; Git history retains the old design.
 
 Settings renamed with it: `codex_memory_timeout_seconds`, `codex_memory_top_k`,
-`codex_memory_char_budget`, `qwen_memory` (env `QWEN_MEMORY`; `QWEN_COGNEE` is still
-accepted as an alias so an older wrapper keeps working), plus `memory_db_path` and
-`memory_worker_url`. The qwen MCP builder's `--cognee-shim` is now `--memory-shim` and
-registers the server as `cmem`.
+`codex_memory_char_budget`, `qwen_memory` (env `QWEN_MEMORY`), plus
+`memory_db_path` and `memory_worker_url`. The Qwen launcher no longer builds or
+attaches a memory MCP shim.
 
 The store is a synced replica of every device, so a failed-over local session recalls
-what Hermes on src or r2h learned, with the network gone. That is the property the
-Mem0 mirror was meant to provide and the Cognee tunnel could not.
+what Hermes on src or r2h learned, even when the network is down.
 
 ### Recall shares its budget instead of spending it first-come (2026-09-04)
 

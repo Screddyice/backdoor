@@ -150,7 +150,7 @@ local operator convenience; it is not the MCP path.
 ### `qwen` wiring
 
 MCP is off by default in every tier (`MCP_DEFAULT=0`) because the global schema set costs roughly
-142K tokens. Hermes joins as an opt-in alongside the existing `QWEN_MEM0` and `QWEN_MCP` branches:
+142K tokens. Hermes joins as an opt-in alongside the existing `QWEN_MCP` branch:
 `QWEN_HERMES=1` adds the server to the generated config under `~/.cache/backdoor/`, mode 600,
 regenerated each launch so key rotations carry over.
 

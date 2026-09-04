@@ -70,32 +70,6 @@ def test_build_includes_only_requested_servers(source_config: Path, tmp_path: Pa
     assert os.stat(output).st_mode & 0o777 == 0o600
 
 
-def test_build_can_keep_memory_with_the_requested_server(
-    source_config: Path, tmp_path: Path
-):
-    output = tmp_path / "selected.json"
-    shim = tmp_path / "cmem-mcp-shim.py"
-    result = run_helper(
-        "--config",
-        str(source_config),
-        "build",
-        "--servers",
-        "alpha",
-        "--output",
-        str(output),
-        "--memory-shim",
-        str(shim),
-    )
-    assert result.returncode == 0
-    config = json.loads(output.read_text(encoding="utf-8"))["mcpServers"]
-    assert set(config) == {"alpha", "cmem"}
-    assert config["cmem"] == {
-        "type": "stdio",
-        "command": "python3",
-        "args": [str(shim)],
-    }
-
-
 def test_unknown_server_fails_without_writing_config(source_config: Path, tmp_path: Path):
     output = tmp_path / "selected.json"
     result = run_helper(
