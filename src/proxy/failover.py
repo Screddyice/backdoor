@@ -36,7 +36,8 @@ Two consequences follow, and both are why triggers are as tight as they are:
   * A transport error proves only that *Anthropic* is unreachable, which is not
     the same as this host being offline (their edge or DNS can be down while
     everything else works). So reaching the threshold is necessary but not
-    sufficient — :func:`internet_reachable` gets the final say.
+    sufficient — :func:`internet_usable` gets the final say, and it asks both
+    halves of the question: a verified route out, and a resolver that answers.
 
 Auth failures (401/403) were never triggers, for the same underlying reason:
 the network path is fine and a credential is broken, and masking that behind a
@@ -55,6 +56,7 @@ import os
 import socket
 import ssl
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -98,8 +100,9 @@ STATE_PATH = Path(
 
 # Literal IPs on purpose: the question is whether this MACHINE has a working
 # route to the internet, and a hostname would fold a broken resolver into the
-# answer. (A host that cannot resolve anything is offline for our purposes, but
-# it should read as offline because of the probe, not because of a DNS timeout.)
+# answer. A host that cannot resolve anything IS offline for our purposes, but
+# it has to read that way because of a check that measures resolution — see
+# name_resolution_works — not because a DNS timeout swallowed a link probe.
 #
 # The third element is the name the probe's certificate must be valid for. It is
 # passed as SNI and verified, never resolved, so the no-DNS property above still
@@ -115,6 +118,18 @@ CONNECTIVITY_TIMEOUT = 2.0
 # outcome that does not distinguish a lying middlebox from a slow link, and the
 # only thing that tells them apart is giving it more room and looking again.
 CONNECTIVITY_SLOW_FACTOR = 4.0
+
+# Names the resolution check tries: the probes' own certificate names, so the
+# module keeps ONE list of public things it already trusts to exist. Any single
+# name resolving is enough — the question is whether this host's resolver answers
+# at all, not whether some particular zone is healthy.
+RESOLUTION_PROBE_NAMES = tuple(cert_name for _, _, cert_name in CONNECTIVITY_PROBES)
+
+# How long the resolver gets before the router calls DNS broken. Deliberately
+# the same patient budget the ambiguous handshake gets, and for the same reason:
+# reading a working link as offline claims the GPU and downgrades live sessions,
+# so a slow answer must not be mistaken for no answer.
+RESOLUTION_TIMEOUT = CONNECTIVITY_TIMEOUT * CONNECTIVITY_SLOW_FACTOR
 
 # Escape hatch back to the old TCP-only probe. Exists because a false "offline"
 # is not a harmless failure here — it claims the GPU and routes a session to a
@@ -274,6 +289,90 @@ def internet_reachable(
     return _probe_all(probes, timeout, _verify_enabled())
 
 
+def _resolves(name: str, timeout: float) -> bool:
+    """Does `name` resolve within `timeout` seconds?
+
+    getaddrinfo takes no timeout and socket.setdefaulttimeout does not reach it,
+    so the only way to bound a resolver that accepts queries and never answers is
+    to stop waiting for one. The lookup runs on a daemon thread that is abandoned
+    rather than joined: it cannot hold the process open, and a router restart is
+    not blocked by a resolver that is still thinking.
+    """
+    answered: list[bool] = []
+    done = threading.Event()
+
+    def _lookup() -> None:
+        try:
+            socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)
+            answered.append(True)
+        except OSError:
+            answered.append(False)
+        finally:
+            done.set()
+
+    threading.Thread(
+        target=_lookup, name=f"dns-probe-{name}", daemon=True
+    ).start()
+    if not done.wait(timeout):
+        logger.warning(
+            "name resolution for %s did not answer within %.1fs — treating DNS "
+            "as unusable; a resolver that accepts queries and never replies "
+            "fails exactly this way",
+            name, timeout,
+        )
+        return False
+    return bool(answered and answered[0])
+
+
+def name_resolution_works(
+    names=RESOLUTION_PROBE_NAMES, timeout: float = RESOLUTION_TIMEOUT
+) -> bool:
+    """Can this host turn a public name into an address?
+
+    The half of "offline" that :func:`internet_reachable` cannot see, and by
+    construction: its probes dial literal IPs so a broken resolver cannot fold
+    itself into a link verdict. That leaves a real outage with no measurement.
+    Observed 2026-09-04 23:36:32-23:39:41 — every upstream request failed with
+    `[Errno 8] nodename nor servname provided`, the IP probes verified a peer on
+    the first try, and so the offline-gated breaker refused to open and handed
+    ~200 requests a 502 apiece. The Codex breaker, which is service-gated and
+    never asks this question, failed over at 23:36:39 and rode the outage out on
+    the local model. Same host, same three minutes, opposite outcomes.
+
+    A host that cannot resolve names cannot reach an upstream addressed by one,
+    however healthy its route to 1.1.1.1 is. Returns True as soon as any name
+    answers.
+    """
+    return any(_resolves(name, timeout) for name in names)
+
+
+def internet_usable(
+    reachable: Callable[[], bool] = internet_reachable,
+    resolves: Callable[[], bool] = name_resolution_works,
+) -> bool:
+    """Is this host online in the sense an offline-gated breaker means?
+
+    Both halves, in the cheap order: a verified route out (no DNS involved), and
+    then a resolver that answers. Either one missing leaves every name-addressed
+    upstream unreachable, which is exactly the condition that justifies serving
+    from the local model.
+
+    Resolution is checked SECOND so the common outage — no route at all — still
+    costs one link probe and no lookup, and so a dead link is never reported as
+    a DNS fault.
+    """
+    if not reachable():
+        return False
+    if not resolves():
+        logger.warning(
+            "connectivity probes verified a peer but no name resolved — this "
+            "host has a route out and no usable DNS, so every upstream reached "
+            "by name is unreachable; treating as offline",
+        )
+        return False
+    return True
+
+
 def service_reachable(url: str, timeout: float = CONNECTIVITY_TIMEOUT) -> bool:
     """Is the host behind `url` reachable, with a certificate that verifies?
 
@@ -336,7 +435,7 @@ class FailoverBreaker:
         probe_interval: float = 60.0,
         now_fn: Callable[[], float] = time.monotonic,
         notify_fn: Callable[[str, str], None] = _notify,
-        online_fn: Callable[[], bool] = internet_reachable,
+        online_fn: Callable[[], bool] = internet_usable,
         state_path: Path | None = None,
         source: str = "anthropic",
         upstream_name: str = "Anthropic",
