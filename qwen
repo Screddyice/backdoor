@@ -37,12 +37,12 @@
 # (ROUTE_BARE); that is a separate path from this wrapper, which uses :8082.
 #
 # Env overrides:
-#   QWEN_COGNEE=1  Cognee memory as a 2-tool MCP shim (small schema). ON BY
+#   QWEN_MEMORY=1  claude-mem memory via the cmem.ai hosted MCP (5 read tools). ON BY
 #               DEFAULT since 2026-08-22: a small window only works if durable
 #               facts live outside it. Local Ollama inference + remote memory.
-#               Needs COGNEE_API_KEY + network; no key degrades to empty MCP.
-#   QWEN_COGNEE=0  force memory off (true-offline, zero network calls).
-#               (QWEN_MEM0=1 is a deprecated alias — Mem0 was retired 2026-08-20.)
+#               Needs CMEM_PRO_TOKEN + network; no key degrades to empty MCP.
+#   QWEN_MEMORY=0  force memory off (true-offline, zero network calls).
+#               (QWEN_COGNEE is accepted as a deprecated alias.)
 #   QWEN_MCP=0  (the default everywhere now) no MCP servers — true-offline,
 #               fast. MCP schemas are big (~142K tokens for the global set; even
 #               the curated stack overflows the 64K window) and were half of why
@@ -209,93 +209,58 @@ fi
 #    — set QWEN_MCP_SERVERS to the ~/.claude.json servers you want).
 MCP_DEFAULT=0
 MCP_ARGS=()
-# Cognee memory: ON by default (flipped from opt-in 2026-08-22). Inference stays
-# local; store/search hit the Cognee instance. This is the ONE exception to the
+# Memory: ON by default. Inference stays local; recall hits the cmem.ai hub over
+# HTTPS with a bearer token. This is the ONE exception to the
 # MCP-off rule above, and it earns it: the shim exposes exactly two tools, so the
 # schema costs ~hundreds of tokens rather than the ~142K of the global set.
 #
 # Defaulting it on is the point, not a convenience. Without memory the local
-# model has to carry every durable fact in-context, which is exactly what blows
-# a 32K window and makes the session crawl; with it, facts live in the graph and
-# the window stays short. Cognee Cloud exposes no hosted MCP endpoint (/mcp
-# 404s) and the full cognee-mcp schema will not fit 64K, hence the stdio shim.
-#
-# Needs COGNEE_API_KEY + network. Both degrade safely: no key falls through to
-# an empty MCP config below, so a genuinely offline run still works. Set
-# QWEN_COGNEE=0 to force it off (true-offline, zero network calls).
-COGNEE_DEFAULT=1
-COGNEE_ENABLED="${QWEN_COGNEE:-${QWEN_MEM0:-$COGNEE_DEFAULT}}"
-COGNEE_SHIM=""
-if [ "$COGNEE_ENABLED" = "1" ]; then
-  if [ -n "${QWEN_MEM0:-}" ] && [ "${QWEN_MEM0:-0}" = "1" ] && [ -z "${QWEN_COGNEE:-}" ]; then
-    echo "qwen: QWEN_MEM0 is deprecated (Mem0 retired 2026-08-20) — using Cognee; set QWEN_COGNEE=1" >&2
-  fi
-  # Ensure creds are available (env wins, then ~/.cognee/.env, then ~/projects/.env).
-  if [ -z "${COGNEE_API_KEY:-}" ] && [ -f "$HOME/.cognee/.env" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$HOME/.cognee/.env"
-    set +a
-  fi
-  if [ -z "${COGNEE_API_KEY:-}" ] && [ -f "$HOME/projects/.env" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$HOME/projects/.env"
-    set +a
-  fi
-  [ -n "${COGNEE_API_KEY:-}" ] && COGNEE_SHIM="$HOME/.claude/scripts/cognee-mcp-shim.py"
+# Memory: claude-mem through a 2-tool stdio shim (memory_search capped at 1,500 chars,
+# memory_remember into the local worker). The hosted MCP's 5 tools stay out of the window. QWEN_MEMORY=0 forces
+# true-offline (zero network calls). Needs CMEM_PRO_TOKEN (~/projects/.env).
+MEMORY_ENABLED="${QWEN_MEMORY:-${QWEN_COGNEE:-1}}"
+if [ "$MEMORY_ENABLED" = "1" ] && [ -z "${CMEM_PRO_TOKEN:-}" ] && [ -f "$HOME/projects/.env" ]; then
+  CMEM_PRO_TOKEN=$(grep -m1 '^CMEM_PRO_TOKEN=' "$HOME/projects/.env" | cut -d= -f2- | tr -d "\"'")
 fi
 
-if [ "$COGNEE_ENABLED" = "1" ] && [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
-  if [ -n "${COGNEE_API_KEY:-}" ]; then
-    COGNEE_MCP_CONF="$HOME/.cache/backdoor/qwen-cognee-mcp.json"
-    mkdir -p "$(dirname "$COGNEE_MCP_CONF")"
-    # The shim reads creds from its own env/~/.cognee/.env, so unlike the Mem0
-    # config this file holds NO secret — but keep it 600 anyway, since the path
-    # is shared with configs that do.
+if [ "$MEMORY_ENABLED" = "1" ] && [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
+  if [ -n "${CMEM_PRO_TOKEN:-}" ]; then
+    CMEM_MCP_CONF="$HOME/.cache/backdoor/qwen-cmem-mcp.json"
+    mkdir -p "$(dirname "$CMEM_MCP_CONF")"
+    # Two-tool stdio shim (~140 tokens of schema, results capped at 1,500 chars) instead of the
+    # hosted MCP's five tools and unbounded rows: a 32K window cannot afford either. The shim
+    # reads CMEM_PRO_TOKEN from the env / ~/projects/.env itself, so this file holds no secret.
     (
       umask 077
-      python3 - "$COGNEE_MCP_CONF" <<'PY2'
-import json, sys, os
-path = sys.argv[1]
-cfg = {
-  "mcpServers": {
-    "cognee": {
-      "type": "stdio",
-      "command": "python3",
-      "args": [os.path.expanduser("~/.claude/scripts/cognee-mcp-shim.py")],
-    }
-  }
-}
-json.dump(cfg, open(path, "w"), indent=2)
+      python3 - "$CMEM_MCP_CONF" <<'PY2'
+import json, os, sys
+cfg = {"mcpServers": {"cmem": {"type": "stdio", "command": "python3",
+       "args": [os.path.expanduser("~/.claude/scripts/cmem-mcp-shim.py")]}}}
+json.dump(cfg, open(sys.argv[1], "w"), indent=2)
 PY2
     )
-    chmod 600 "$COGNEE_MCP_CONF"
-    MCP_ARGS=(--strict-mcp-config --mcp-config "$COGNEE_MCP_CONF")
-    echo "qwen: Cognee memory MCP enabled (cloud memory, local inference)" >&2
+    chmod 600 "$CMEM_MCP_CONF"
+    MCP_ARGS=(--strict-mcp-config --mcp-config "$CMEM_MCP_CONF")
+    echo "qwen: claude-mem memory MCP enabled (cloud memory, local inference)" >&2
   else
-    echo "qwen: QWEN_COGNEE=1 but COGNEE_API_KEY unset — MCP empty" >&2
+    echo "qwen: memory on but CMEM_PRO_TOKEN unset — MCP empty" >&2
     MCP_ARGS=(--strict-mcp-config --mcp-config "$HOME/backdoor/empty-mcp.json")
   fi
 elif [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
   MCP_ARGS=(--strict-mcp-config --mcp-config "$HOME/backdoor/empty-mcp.json")
 else
-  # Regenerated every launch from ~/.claude.json so key rotations carry over.
+  # Regenerated every launch from ~/.claude.json so key rotations carry over; that
+  # file already carries the cmem http server at user scope, so memory rides along.
   # Lives in ~/.cache (NOT the backdoor repo) because it contains API keys.
   MCP_CONF="$HOME/.cache/backdoor/qwen-mcp.json"
   mkdir -p "$(dirname "$MCP_CONF")"
-  # umask 077 so the file is created 600 from its first byte (see the Mem0
-  # branch above for why the chmod below stays as a backstop, not a duplicate).
-  COGNEE_BUILD_ARGS=()
-  [ -n "$COGNEE_SHIM" ] && COGNEE_BUILD_ARGS=(--cognee-shim "$COGNEE_SHIM")
-  python3 "$QWEN_MCP_HELPER" build --servers "${QWEN_MCP_SERVERS:-}" \
-    --output "$MCP_CONF" ${COGNEE_BUILD_ARGS[@]+"${COGNEE_BUILD_ARGS[@]}"}
+  python3 "$QWEN_MCP_HELPER" build --servers "${QWEN_MCP_SERVERS:-}" --output "$MCP_CONF"
   chmod 600 "$MCP_CONF"
   MCP_ARGS=(--strict-mcp-config --mcp-config "$MCP_CONF")
 fi
 
 # Optional: reach the Hermes MCP bridge from this local model. Independent of
-# QWEN_COGNEE/QWEN_MCP above — when set it takes over MCP_ARGS with just the
+# QWEN_MEMORY/QWEN_MCP above — when set it takes over MCP_ARGS with just the
 # hermes-mcp server. Regenerated every launch (mode 600, under ~/.cache, not
 # the repo) so key rotations carry over; a missing URL/key degrades to a
 # warning rather than a failed launch.
