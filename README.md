@@ -1187,6 +1187,45 @@ One turn in that sample reused a prefix and cost 1.3 seconds. The rest ran at co
 
 Bounding applies only where the provider is a local Ollama tier. The ceiling is a property of this machine's GPU, so applying it to a hosted provider would discard context for nothing. The client keeps its full transcript either way — this decides what is forwarded, exactly as bare mode decides how much of each message is forwarded.
 
+### Recall shares its budget instead of spending it first-come (2026-09-04)
+
+`memory.recall()` fills a character budget from the best-ranked memories. Two things were wrong,
+and together they meant the router recalled nothing.
+
+**It stopped at the first memory that did not fit.** The loop `break`ed rather than skipping, so
+one long memory discarded every shorter one ranked behind it. That is not a corner case: a
+claude-mem session summary runs 700-1400 characters while bare mode allows 1200 in total.
+Measured against the real store on this machine, `corpus ingest cognee rename`,
+`qwen router failover` and `claude-mem sync hub` each returned **zero** memories. The search was
+fine — 4, 13 and 7 rows matched and joined — and every row was then thrown away.
+
+**First-come selection cannot fill six slots from a 1200-character budget anyway.** The budget is
+deliberately small: bare mode exists to hold the prompt near 945 tokens against a 32K window. But
+one summary is larger than a sixth of it, so even with the `break` fixed a single memory spent the
+lot and five slots went unused.
+
+Each memory now takes a share of what is left, divided between the memories that can still land,
+and is clipped to that share on a word boundary. Clipping is safe because the columns are selected
+lesson-first — `learned` before `investigated` and `request`, `title` before `narrative` — so the
+head of the text is the part worth keeping. Room that the remaining slots cannot use flows to the
+memories that exist, so two candidates against an 8000-character budget are taken whole rather
+than clipped to an eighth.
+
+| | before | after |
+|---|---|---|
+| qwen bare mode (k=6, 1200 chars) | 0 memories | 6 memories, 1197 chars |
+| Codex failover (k=8, 8000 chars) | 0 memories | 8 memories, 7982 chars |
+
+**Matched-but-dropped is no longer silent.** Recall is fail-open, so a broken filter and a store
+with nothing to say both returned an empty list — which is why this survived. When candidates
+match but none fit, recall now logs a warning naming the count, the budget and `k`, and says
+recall is off.
+
+**Left alone deliberately:** `_SOURCES` still includes `user_prompts_fts`. Prompts are 32% of rows
+on this store and rank first for several ordinary queries, so they take slots a distilled summary
+could have used. Whether the router should recall verbatim prompts at all is a product decision,
+not a defect.
+
 ### Sizing the failover tier
 
 Ollama caps residency by model count, never by bytes, and Metal allocations are wired and cannot be paged out. Over-commit and this host panics instead of raising OOM. Measure with `ollama ps`, which reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
