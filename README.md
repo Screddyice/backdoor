@@ -1426,6 +1426,7 @@ executed by someone — or something — with no prior context on this repo.
 | Plan | Tasks | For |
 | --- | --- | --- |
 | [Hermes MCP Bridge](docs/superpowers/plans/2026-08-15-hermes-mcp-bridge.md) | 9 | [the spec above](docs/specs/hermes-mcp-bridge.md) |
+| [Hermes delegate-only tier](docs/superpowers/plans/2026-09-05-hermes-delegate-only-tier.md) | 3 | A narrow machine-delegation surface for the bridge |
 
 The Hermes bridge is worth a note here because it changes what this repo is. Backdoor has been one
 thing so far: a proxy that makes Claude Code talk to any model. The bridge adds a second, separate
@@ -1455,6 +1456,20 @@ the repository. Successful password submissions use an HTTP 303 redirect to a sa
 `/login/complete` GET. That GET loads a no-store approval page with a **Continue to Claude**
 link. Loading a real page before the external callback keeps Chrome and Comet from treating the
 callback as part of the password POST redirect chain and replaying the consumed login state.
+
+**Delegate-only bridge.** A `delegate_only` profile exposes four run-scoped tools:
+`hermes_chat`, `hermes_run_status`, `hermes_run_approve`, and `hermes_run_stop`.
+The bridge refuses that profile's session history, configuration, model, toolset,
+job, log, status, and lifecycle tools before they reach the gateway or subprocess
+runner. `hermes_list` remains available for health discovery and returns only the
+profile's structured health state and tier.
+
+Run machine delegation through a second static-bearer bridge instance. Give it a
+dedicated environment file, service name, bind port, bearer, and one-profile
+registry. Keep the existing OAuth bridge and its broader registry unchanged. This
+repository ships the tier, tests, and deployment examples. An operator must install
+the second service, provide secrets, configure proxy routing, and restart it in a
+separate deployment step.
 
 **Environment.** Set at deploy time, never committed:
 
