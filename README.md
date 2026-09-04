@@ -1461,8 +1461,10 @@ callback as part of the password POST redirect chain and replaying the consumed 
 `hermes_chat`, `hermes_run_status`, `hermes_run_approve`, and `hermes_run_stop`.
 The bridge refuses that profile's session history, configuration, model, toolset,
 job, log, status, and lifecycle tools before they reach the gateway or subprocess
-runner. `hermes_list` remains available for health discovery and returns only the
-profile's structured health state and tier.
+runner. It also refuses caller-supplied `session_id` values, so a delegate cannot
+attach a new run to an existing personal conversation. `hermes_list` remains
+available for health discovery and returns only the profile's structured health
+state and tier.
 
 Run machine delegation through a second static-bearer bridge instance. Give it a
 dedicated environment file, service name, bind port, bearer, and one-profile

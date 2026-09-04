@@ -215,6 +215,19 @@ def register_tools(
         but approvals from chat-platform-initiated turns still surface on that
         platform, not here.
         """
+        resolved, refusal = resolve(registry, profile)
+        if refusal is not None:
+            return refusal
+        refusal = check_tier(resolved, "hermes_chat")
+        if refusal is not None:
+            return refusal
+        if resolved.tier == "delegate_only" and session_id is not None:
+            return state(
+                resolved.name,
+                "delegate_only",
+                reason="delegate_only chat does not accept a caller-supplied session_id",
+                next="start a new run without session_id",
+            )
         body: dict = {"input": message}
         if session_id:
             body["session_id"] = session_id

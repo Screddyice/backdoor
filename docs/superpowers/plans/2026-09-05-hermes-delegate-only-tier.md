@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, MCPServer 2.x, pytest, TOML registry.
 
-**Spec:** `../nebos-v2/docs/superpowers/specs/2026-09-05-slack-personal-agent-delegation-design.md` in the companion `teamnebula-ai/nebos-v2` repository.
+**Spec:** `docs/superpowers/specs/2026-09-05-slack-personal-agent-delegation-design.md` in the companion `teamnebula-ai/nebos-v2` repository.
 
 ## Global Constraints
 

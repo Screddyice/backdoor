@@ -182,6 +182,23 @@ async def test_chat_with_session_id_includes_it():
     assert body["input"] == "hello"
 
 
+async def test_delegate_only_chat_refuses_caller_supplied_session_id_before_gateway():
+    """A machine delegate cannot attach a new run to personal session history."""
+    _Client.calls = []
+    mcp = _MCP()
+    register_tools(mcp, {"screddy": DELEGATE}, client_factory=_Client)
+
+    got = await mcp.tools["hermes_chat"](
+        profile="screddy",
+        message="hello",
+        session_id="personal-session",
+    )
+
+    assert got["state"] == "delegate_only"
+    assert "session_id" in got["reason"]
+    assert _Client.calls == []
+
+
 async def test_chat_against_control_only_never_reaches_the_gateway():
     """The refusal must happen before any request. A gateway that answered
     would mean the tier is advisory, which is not what it is for."""
