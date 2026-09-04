@@ -292,6 +292,38 @@ broken without stalling the turn, and the abandoned thread cannot block a restar
 | `RESOLUTION_PROBE_NAMES` | probe cert names | Names tried; any one answering proves the resolver works |
 | `RESOLUTION_TIMEOUT` | `CONNECTIVITY_TIMEOUT × CONNECTIVITY_SLOW_FACTOR` | How long a lookup gets before DNS reads as broken |
 
+### Last-known-good DNS
+
+`src/proxy/resolver.py` wraps `socket.getaddrinfo` for the router process. A
+successful lookup is remembered for six hours; a lookup that fails with a resolver
+error is answered from that memory rather than raised. `install()` runs first thing
+in the app lifespan, before any client exists.
+
+This machine has one resolver, the LAN gateway DHCP hands out, and 722 of the 731
+upstream transport failures in the router log are `[Errno 8] nodename nor servname
+provided`. The link was up for all of them. An address the router already knows is
+enough to get those requests through.
+
+Serving an old address costs nothing in safety: the connection still verifies TLS
+against the hostname that was asked for, so an address that has moved on to someone
+else fails the handshake instead of being trusted. If it is simply dead, the request
+fails as it would have anyway and the breaker takes over.
+
+**This layer exists so the breaker does not have to fire.** Opening it loads a 17 GB
+tier into the Ollama server the llm-jury council needs, which `failover.py` allows
+only when local is the one way a session survives. A cached address that connects
+means it was not, so the session stays on the cloud model and the GPU stays free.
+
+The failover DNS probe is deliberately exempt. `name_resolution_works` calls
+`resolver.system_getaddrinfo()` to reach the stdlib directly, because a probe asking
+whether DNS answers cannot be answered from a cache of the times it did.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `BACKDOOR_DNS_CACHE` | unset | Set to `0` to disable and leave `socket.getaddrinfo` alone |
+| `CACHE_TTL` | 6 h | How long a remembered address stays usable |
+| `CACHE_MAX` | 256 | Entries kept before the oldest is dropped |
+
 ## Troubleshooting
 
 **`500 ... "system message must be at the beginning"`**

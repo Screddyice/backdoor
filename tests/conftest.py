@@ -43,3 +43,18 @@ def _no_live_mlx_probe(monkeypatch):
         return profile
 
     monkeypatch.setattr(mlx_admin, "resolve_profile", _identity)
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_dns_cache():
+    """Keep the resolver wrapper out of every test that did not ask for it.
+
+    `install()` rebinds `socket.getaddrinfo` for the whole process, so a test
+    that builds the app leaves the wrapper in place for everything that runs
+    after it — including tests that patch `socket.getaddrinfo` and would then be
+    talking to the real resolver without noticing.
+    """
+    yield
+    from src.proxy import resolver
+
+    resolver.uninstall()
