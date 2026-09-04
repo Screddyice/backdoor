@@ -244,11 +244,20 @@ def register_tools(
         return await _call(profile, "hermes_run_stop", "POST", f"/v1/runs/{run_id}/stop")
 
     @mcp.tool()
-    async def hermes_run_approve(profile: str, run_id: str, approved: bool) -> dict:
-        """Answer an approval request raised inside a run."""
+    async def hermes_run_approve(
+        profile: str,
+        run_id: str,
+        request_id: str,
+        approved: bool,
+    ) -> dict:
+        """Answer one identified approval request raised inside a run."""
         return await _call(
             profile, "hermes_run_approve", "POST",
-            f"/v1/runs/{run_id}/approval", {"approved": approved},
+            f"/v1/runs/{run_id}/approval",
+            {
+                "choice": "once" if approved else "deny",
+                "request_id": request_id,
+            },
         )
 
     async def _systemctl(profile_name: str, verb: str) -> dict:

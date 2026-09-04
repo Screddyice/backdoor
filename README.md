@@ -1459,6 +1459,8 @@ callback as part of the password POST redirect chain and replaying the consumed 
 
 **Delegate-only bridge.** A `delegate_only` profile exposes four run-scoped tools:
 `hermes_chat`, `hermes_run_status`, `hermes_run_approve`, and `hermes_run_stop`.
+The approval tool requires the request ID returned by `hermes_run_status` and maps its boolean MCP
+input to the gateway's `once` or `deny` choice. A delayed caller cannot approve a newer action.
 The bridge refuses that profile's session history, configuration, model, toolset,
 job, log, status, and lifecycle tools before they reach the gateway or subprocess
 runner. It also refuses caller-supplied `session_id` values, so a delegate cannot

@@ -208,12 +208,21 @@ async def test_chat_against_control_only_never_reaches_the_gateway():
     assert _Client.calls == [], "a request was sent to a control_only profile"
 
 
-async def test_run_approve_posts_the_decision():
+@pytest.mark.parametrize(
+    ("approved", "choice"),
+    [(True, "once"), (False, "deny")],
+)
+async def test_run_approve_posts_a_gateway_choice(approved, choice):
     t = _tools()
-    await t["hermes_run_approve"](profile="alpha", run_id="r-9", approved=True)
+    await t["hermes_run_approve"](
+        profile="alpha",
+        run_id="r-9",
+        request_id="approval-7",
+        approved=approved,
+    )
     name, method, path, body = _Client.calls[-1]
     assert path == "/v1/runs/r-9/approval"
-    assert body == {"approved": True}
+    assert body == {"choice": choice, "request_id": "approval-7"}
 
 
 async def test_run_stop_posts_to_the_run():
@@ -234,7 +243,11 @@ _CHAT_TOOL_ARGS: dict[str, dict] = {
     "hermes_chat": {"message": "hello"},
     "hermes_run_status": {"run_id": "r-9"},
     "hermes_run_stop": {"run_id": "r-9"},
-    "hermes_run_approve": {"run_id": "r-9", "approved": True},
+    "hermes_run_approve": {
+        "run_id": "r-9",
+        "request_id": "approval-7",
+        "approved": True,
+    },
 }
 
 _NON_CHAT_TOOL_ARGS: dict[str, dict] = {
