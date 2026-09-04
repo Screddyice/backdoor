@@ -1161,11 +1161,9 @@ Measured end to end on 2026-09-05, driving a dev router on port 8099 against the
 
 First answer in 116s, the turn after it 143s — the second cold prefill, since the first request after a model load leaves no reusable cache — then 10.6s, 13.3s and 13.8s as the boundary held and each turn appended. The same session before this change escalated to the 256K 4B and prefilled all 205K tokens, which on the measured curve is about thirteen minutes to first answer, on a weaker model, every time the session was resumed.
 
-#### Codex takes the same lock, and still has the other half of the problem
+#### Codex replays a stable prefix too
 
-The Codex local path serializes on the same tier as the Claude path, because a Codex turn and a Claude turn on one 27B evict each other's cache exactly as two Claude turns do.
-
-What that does not fix is Codex's own prefix. `build_local_payload` composes the ACTIVE TURN — the latest user instruction, its paired tool calls, and recalled memories — and discards the rest by design, which keeps the prompt small but rebuilds it from a different head every turn. Real turns from this machine's log, all of them small:
+Codex sent the ACTIVE TURN ALONE — the latest instruction, its paired tool calls, and recalled memories — and discarded the rest. That keeps the prompt small and guarantees a cold prefill on every turn, because the head changes with every new instruction. Real turns from this machine's log, all of them small:
 
 ```
   2648 tok    232.5s     11 tok/s
@@ -1176,7 +1174,15 @@ What that does not fix is Codex's own prefix. `build_local_payload` composes the
   2556 tok      1.3s   1925 tok/s
 ```
 
-One turn in that sample reused a prefix and cost 1.3 seconds. The rest ran at cold-prefill rate or worse — a 180x spread across nearly identical inputs. The lock removes the contention half of that spread. The remaining half is structural, and the fix is the same one the Claude path just got: a stable head that survives between turns. It is worth doing on the measurements above, where a stable 18K prefix costs about 10s per turn while an unstable 5K one costs 20–45s, but it changes what Codex sends rather than how much, so it is a separate change with its own acceptance testing.
+One turn in that sample reused a prefix and cost 1.3 seconds. The rest ran at cold-prefill rate or worse — a 180x spread across nearly identical inputs. The tier lock removes the contention half of it. The structural half is fixed by replaying history: `CODEX_HISTORY_BUDGET_TOKENS` (default 12,000) of earlier items go ahead of the memory block, behind the same sticky boundary the Claude path uses, so turn N's payload opens with turn N-1's.
+
+Three things make that safe to send where the active turn alone was safe by construction:
+
+- **An allowlist, not a denylist.** Only user and assistant messages and paired `function_call`/`function_call_output` items are replayable. `additional_tools` advertises hosted web search, developer messages restate a cloud harness the local preamble already replaced, and reasoning items carry `encrypted_content` only the cloud can verify.
+- **The budget is leftovers.** History spends what the active turn did not use, capped — never its own allocation. A large instruction reduces history to nothing and the path behaves exactly as it did before, which is why `validate_codex_context_allocation` did not have to move.
+- **Pairs stay whole.** A window never opens on a `function_call_output` whose call was left behind.
+
+Memories sit between the history and the active turn on purpose: the block is rebuilt from a fresh recall query every turn, so anything placed after it is new work anyway, and putting it ahead of the history would make the history unreusable.
 
 | Setting | Default | What it does |
 |---|---|---|

@@ -176,6 +176,12 @@ class Settings(BaseSettings):
     codex_memory_budget_tokens: int = Field(default=2_000, ge=0)
     codex_tools_budget_tokens: int = Field(default=4_000, ge=0)
     codex_active_turn_budget_tokens: int = Field(default=21_000, ge=1)
+
+    # Stable history sent ahead of the active turn so the local tier can reuse a
+    # KV prefix. Deliberately NOT part of validate_codex_context_allocation: it
+    # spends only what the active turn left unused, so it can never push the
+    # allocation past the window. 0 restores the active-turn-only behaviour.
+    codex_history_budget_tokens: int = Field(default=12_000, ge=0)
     codex_local_model: str = "qwen3.8:27b-obliterated"
     codex_local_responses_url: str = "http://127.0.0.1:11434/v1/responses"
     codex_local_tools: str = "local"

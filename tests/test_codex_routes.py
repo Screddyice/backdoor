@@ -560,7 +560,8 @@ async def test_eligible_cloud_failure_uses_fresh_memory_backed_qwen_request(
     assert "active task" in rendered
     assert "Replica continuity marker" in rendered
     assert "bounded result" in rendered
-    assert "older task" not in rendered
+    # History is replayed now (see test_codex_context), so the older turn is
+    # expected. The cloud-only identifiers still must not be.
     assert "prompt_cache_key" not in rendered
     assert local_payload["reasoning"] == {"effort": "none"}
     assert "authorization" not in local_calls[0].headers
