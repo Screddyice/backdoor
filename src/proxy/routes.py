@@ -247,7 +247,7 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
     counted a fraction of the failures and took correspondingly longer to open,
     or never reached the threshold inside its window at all. Recording here is
     evidence-gathering only; the breaker still decides on its own terms, and
-    :func:`internet_reachable` still has the final say on opening.
+    :func:`internet_usable` still has the final say on opening.
 
     Deliberately does NOT call record_success. Closing the breaker obliges the
     caller to release the local tiers it claimed (see `_try_upstream`), and only
@@ -277,8 +277,8 @@ async def _record_failure(
 ) -> bool:
     """Record a failure without freezing the router, and without racing.
 
-    `record_failure` runs `internet_reachable`, a blocking socket probe against
-    a public address. Called straight from a coroutine it runs ON the event
+    `record_failure` runs `internet_usable`, a blocking socket probe against a
+    public address plus a bounded DNS lookup. Called straight from a coroutine it runs ON the event
     loop, so every failed turn stalls every other session for the length of the
     probe — worst at exactly the moment the router is busiest, an outage.
 

@@ -266,6 +266,32 @@ GPU and routes a live session to a local model while the cloud was fine. If veri
 misbehaves on a network this was not tested against, it can be switched off without a deploy.
 Leaving it set re-opens the hole.
 
+### The probe also asks whether DNS answers
+
+`internet_usable` is what the offline-gated breaker calls, and it asks two questions in order: does
+a link probe verify a peer, and does `name_resolution_works` get an address back for
+`one.one.one.one` or `dns.google`. Either half missing means offline. Resolution goes second, so the
+common outage still costs one TCP probe and no lookup, and a dead link never gets logged as a DNS
+fault.
+
+The literal-IP probes left DNS unmeasured, and that was its own silent hole. On 2026-09-04 between
+23:36:32 and 23:39:41 every upstream request failed with `[Errno 8] nodename nor servname provided`
+while the link stayed up. `internet_reachable` verified a peer on the first probe each time, so the
+Anthropic breaker read the host as online, logged `Anthropic failing (ConnectError) but this host is
+online`, and handed roughly 200 requests a `502` apiece across three and a half minutes. The Codex
+breaker never consults connectivity, opened at 23:36:39, and served the same outage from the local
+model. One host, one outage, opposite outcomes.
+
+`getaddrinfo` takes no timeout and `socket.setdefaulttimeout` does not reach it, so the lookup runs
+on a daemon thread the router stops waiting for after `RESOLUTION_TIMEOUT` (8 s, the same patient
+budget the ambiguous handshake gets). A resolver that accepts queries and never replies reads as
+broken without stalling the turn, and the abandoned thread cannot block a restart.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RESOLUTION_PROBE_NAMES` | probe cert names | Names tried; any one answering proves the resolver works |
+| `RESOLUTION_TIMEOUT` | `CONNECTIVITY_TIMEOUT × CONNECTIVITY_SLOW_FACTOR` | How long a lookup gets before DNS reads as broken |
+
 ## Troubleshooting
 
 **`500 ... "system message must be at the beginning"`**
@@ -491,7 +517,7 @@ What each route does now when upstream will not answer:
 | `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage |
 | `/{path:path}` | `502` |
 
-Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+Recording a failure never opens the breaker on its own. `internet_usable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
 
 ### Deploying: scripts/deploy-router.sh
 
