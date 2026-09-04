@@ -40,6 +40,7 @@ _locks: dict[tuple[str, str], asyncio.Lock] = {}
 def reset() -> None:
     """Drop every lock. Tests only."""
     _locks.clear()
+    _held.clear()
 
 
 def _lock_for(base_url: str, model: str) -> asyncio.Lock:
@@ -98,4 +99,53 @@ async def hold(base_url: str, model: str, *, timeout: float):
     try:
         yield True
     finally:
+        lock.release()
+
+
+# Explicit acquire/release for callers whose response lifetime is not a single
+# block. The Codex local path reserves and releases its slot in two different
+# functions (see codex_routes._reserve_local_slot / _release_local_slot), so it
+# cannot use `hold` — but it needs the same serialization, because a Codex turn
+# and a Claude turn on the same tier evict each other exactly as two Claude
+# turns do.
+_held: set[tuple[str, str]] = set()
+
+
+async def acquire(base_url: str, model: str, *, timeout: float) -> bool:
+    """Take the tier. Returns False when it was not taken, and never raises.
+
+    A False return is not a failure: it means proceed unserialized, which is
+    the pre-2026-09-05 behaviour and merely slow.
+    """
+    if not model or timeout <= 0:
+        return False
+    lock = _lock_for(base_url, model)
+    if lock.locked():
+        logger.info("tier %s busy — queueing behind the live response", model)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning(
+            "tier %s still busy after %.0fs — proceeding without the lock",
+            model, timeout,
+        )
+        return False
+    _held.add((base_url or "", model or ""))
+    return True
+
+
+def release(base_url: str, model: str) -> None:
+    """Hand the tier back. Idempotent: releasing what was never taken is a no-op.
+
+    Idempotence is the point. The caller's paired release runs on several exit
+    paths including a BaseException handler, and a double release on an
+    asyncio.Lock raises RuntimeError — which would turn a slow response into a
+    failed one.
+    """
+    key = (base_url or "", model or "")
+    if key not in _held:
+        return
+    _held.discard(key)
+    lock = _locks.get(key)
+    if lock is not None and lock.locked():
         lock.release()
