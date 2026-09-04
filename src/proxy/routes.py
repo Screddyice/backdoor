@@ -394,10 +394,24 @@ async def failover_recovery_loop(
                     logger.exception("failover recovery could not release tiers")
 
 
-# Failover responses still being generated, and the tiers whose release is
-# waiting on them. See _release_claims for why the two cannot be independent.
-_failover_inflight: int = 0
+# Locally served responses still being generated, and the tiers whose release
+# is waiting on them. See _release_claims for why the two cannot be independent.
+#
+# The count covers EVERY response this router serves from a local tier, not
+# just failover ones. A deliberate `/model qwen` route holds the same GPU as a
+# breaker claim does, and since 2026-09-05 a route escalation asks for the
+# outgoing tier to be evicted (see _evict_outgoing_tier). Counting only
+# failover responses would let an escalation evict a model a route stream was
+# mid-generation on, which is the 2026-08-26 bug reached by a second door.
+_local_inflight: int = 0
 _deferred_unloads: set[tuple[str, str]] = set()
+
+# Tiers a route escalation stopped using, waiting for the last local response
+# to finish before they can be freed. Kept separate from _deferred_unloads
+# because the two are released under different conditions: a breaker claim must
+# not be released into a re-opened outage, while an escalation's eviction has
+# no breaker to consult — the tier simply is not serving this session any more.
+_deferred_evictions: set[tuple[str, str]] = set()
 
 
 async def _release_claims(br: FailoverBreaker, settings: Settings) -> None:
@@ -419,33 +433,35 @@ async def _release_claims(br: FailoverBreaker, settings: Settings) -> None:
     same 62ms window; the stream then produced nothing until it died on the
     600-second read timeout at 23:20:38.
 
-    So the unload waits for the last in-flight failover response, and is dropped
-    entirely if a FRESH outage re-opened the breaker while it waited — that tier
-    is claimed again and releasing it would evict a model now in use.
+    So the unload waits for the last in-flight LOCAL response — failover or a
+    deliberate `/model qwen` route, since 2026-09-05 both hold the same GPU —
+    and is dropped entirely if a FRESH outage re-opened the breaker while it
+    waited, because that tier is claimed again and releasing it would evict a
+    model now in use.
     """
     claims = br.drain_claims()
     if not claims:
         return
-    if _failover_inflight:
+    if _local_inflight:
         # Deferred, not backgrounded: a detached task cannot see a later
         # re-open, and would unload a tier the next outage had re-claimed.
         _deferred_unloads.update(claims)
         logger.info(
             "breaker closed with %d failover response(s) still streaming — "
             "deferring release of %s",
-            _failover_inflight, ", ".join(sorted(m for _, m in claims)),
+            _local_inflight, ", ".join(sorted(m for _, m in claims)),
         )
         return
     for base_url, model in claims:
         await ollama_admin.unload(base_url, model)
 
 
-def _failover_stream_started() -> None:
-    global _failover_inflight
-    _failover_inflight += 1
+def _local_stream_started() -> None:
+    global _local_inflight
+    _local_inflight += 1
 
 
-def _failover_stream_ended() -> set[tuple[str, str]]:
+def _local_stream_ended() -> set[tuple[str, str]]:
     """Drop this response from the in-flight count; return any tiers now due.
 
     Split from the unloading itself, and deliberately free of `await`, because
@@ -456,12 +472,54 @@ def _failover_stream_ended() -> set[tuple[str, str]]:
     would defer every future unload forever, which is a worse failure than the
     race this fixes.
     """
-    global _failover_inflight, _deferred_unloads
-    _failover_inflight = max(0, _failover_inflight - 1)
-    if _failover_inflight or not _deferred_unloads:
+    global _local_inflight, _deferred_unloads
+    _local_inflight = max(0, _local_inflight - 1)
+    if _local_inflight or not _deferred_unloads:
         return set()
     claims, _deferred_unloads = _deferred_unloads, set()
     return claims
+
+
+async def _evict_outgoing_tier(base_url: str, model: str) -> None:
+    """Free the tier a route escalation just stopped using.
+
+    A `/model qwen` session that outgrows the 27B escalates to the 256K 4B
+    (see the ROUTE ESCALATE branch). Until 2026-09-05 nothing evicted the tier
+    it left: MODEL_ROUTES sessions never claimed a tier, so no breaker close
+    would ever release one, and Ollama holds a model for OLLAMA_KEEP_ALIVE
+    after its last request. The two therefore overlap by design.
+
+    On this host they do not fit. Measured 2026-09-05 with the 27B alone
+    resident: 22.0 GB wired of a ~27 GB ceiling on 36 GB of RAM. The 256K 4B
+    adds ~13 GB, so the escalation asks for ~35 GB and Ollama has to evict
+    something to serve it — with `OLLAMA_MAX_LOADED_MODELS=3` it is entitled to
+    try holding both first. `mlx_admin.resolve_profile` already guards the
+    MLX-versus-Ollama version of this collision for the same reason and cites
+    the same two kernel panics; the Ollama-to-Ollama ladder had no equivalent.
+
+    Evicting is skipped, not forced, while a local response is generating.
+    Unloading a tier mid-generation is what stalled a stream for six minutes on
+    2026-08-26, and a memory risk is the better trade against a certain outage.
+    """
+    if _local_inflight:
+        _deferred_evictions.add((base_url, model))
+        logger.info(
+            "escalation left %s resident with %d local response(s) still "
+            "streaming — deferring its eviction",
+            model, _local_inflight,
+        )
+        return
+    await ollama_admin.unload(base_url, model)
+
+
+async def _drain_deferred_evictions() -> None:
+    """Evict tiers whose escalation waited for the last local response."""
+    global _deferred_evictions
+    if _local_inflight or not _deferred_evictions:
+        return
+    due, _deferred_evictions = _deferred_evictions, set()
+    for base_url, model in due:
+        await ollama_admin.unload(base_url, model)
 
 
 async def _release_deferred(
@@ -477,21 +535,28 @@ async def _release_deferred(
         await ollama_admin.unload(base_url, model)
 
 
-async def _tracked_failover_stream(
+async def _tracked_local_stream(
     inner: AsyncIterator[str], settings: Settings
 ) -> AsyncIterator[str]:
-    """Hold a failover response's tier claim open for as long as it generates."""
-    _failover_stream_started()
+    """Hold a local response's tier open for as long as it generates.
+
+    Wrapped around every locally served stream, failover or deliberate route.
+    A failover stream additionally holds a breaker CLAIM; a route stream holds
+    only the in-flight count, which is enough to stop an escalation evicting
+    the model underneath it.
+    """
+    _local_stream_started()
     try:
         async for event in inner:
             yield event
     finally:
-        due = _failover_stream_ended()
-        if due:
-            try:
+        due = _local_stream_ended()
+        try:
+            if due:
                 await _release_deferred(due, settings)
-            except Exception:  # release is housekeeping; never mask the response
-                logger.exception("deferred tier release failed")
+            await _drain_deferred_evictions()
+        except Exception:  # release is housekeeping; never mask the response
+            logger.exception("deferred tier release failed")
 
 
 async def _try_upstream(request: Request, body: bytes, settings: Settings):
@@ -691,8 +756,23 @@ async def create_message(
                             "⇢ ROUTE ESCALATE [%s → %s] in≈%s over %s",
                             profile, escalated, est, settings.route_max_input_tokens,
                         )
+                        # Captured BEFORE the swap: this is the tier the session
+                        # has been using, and the one that must go before the
+                        # bigger-window tier loads beside it.
+                        outgoing = (settings.provider_base_url, settings.provider_model)
                         profile = escalated
                         settings = load_profile_settings(profile)
+                        if outgoing != (settings.provider_base_url, settings.provider_model):
+                            try:
+                                await _evict_outgoing_tier(*outgoing)
+                            except Exception:
+                                # Its own guard: this sits inside the bare-mode
+                                # try, and a failure here is not a stripping
+                                # failure — reporting it as one would send the
+                                # request unstripped for no reason.
+                                logger.exception(
+                                    "could not evict %s after escalation", outgoing[1]
+                                )
 
                 logger.info(
                     "→ local [%s → %s] bare in≈%s (raw %s)",
@@ -775,6 +855,7 @@ async def create_message(
     # same model. Tiers that opt out (route_max_input_tokens unset, i.e. the
     # wide 64K/256K ones) are unaffected, which also stops a second escalation
     # firing on top of the hybrid branch's.
+    evicting: tuple[str, str] | None = None
     if settings.route_max_input_tokens and est_in > settings.route_max_input_tokens:
         try:
             escalated = pick_failover_profile(est_in)
@@ -785,6 +866,7 @@ async def create_message(
                     settings.provider_model, esettings.provider_model,
                     est_in, settings.route_max_input_tokens,
                 )
+                evicting = (settings.provider_base_url, settings.provider_model)
                 settings = esettings
                 client = _get_profile_client(escalated, esettings)
         except Exception:
@@ -792,6 +874,16 @@ async def create_message(
             # it to the original tier reproduces the old behaviour — an honest
             # provider error — which beats dropping it here.
             logger.exception("tier escalation failed; staying on %s", settings.provider_model)
+            evicting = None
+
+    # Outside the try above so a failure here cannot be mistaken for a failed
+    # escalation, and outside the branch so the swap is already committed: the
+    # tier being freed is one this request has stopped using either way.
+    if evicting is not None:
+        try:
+            await _evict_outgoing_tier(*evicting)
+        except Exception:  # freeing memory must not cost the request
+            logger.exception("could not evict %s after escalation", evicting[1])
 
     # Runtime supervision must sit after BOTH router-mode branches and after
     # size escalation. The qwen wrapper uses profile mode on :8082, so keeping
@@ -841,17 +933,22 @@ async def create_message(
         input_tokens = est_in
         body = _stream(client, payload, msg_id, req, input_tokens, provider,
                        settings.provider_strip_inline_thinking)
-        if failed_over:
-            # Only the failover path: a deliberate `/model qwen` loads a tier
-            # too, but the breaker never claimed it and closing must not
-            # release it, so it has nothing to hold open.
-            body = _tracked_failover_stream(body, get_settings())
+        # Every local stream, not only the failover ones. A deliberate
+        # `/model qwen` route holds no breaker claim — closing must not release
+        # a tier it never claimed — but it does hold the GPU, and an escalation
+        # on a second session must not evict the model this one is generating
+        # on. The claim and the in-flight count answer different questions.
+        body = _tracked_local_stream(body, get_settings())
         return StreamingResponse(
             body,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    # Non-streaming responses hold the tier just as a stream does; a completion
+    # that takes minutes to prefill is exactly when an escalation elsewhere
+    # would like to evict the model it is prefilling on.
+    _local_stream_started()
     try:
         resp = await client.complete(payload)
     except ProviderError as e:
@@ -876,19 +973,27 @@ async def create_message(
         raise HTTPException(
             status_code=status, detail=f"local provider {provider} unreachable: {e}"
         ) from e
-
-    result = nim_response_to_anthropic(
-        resp, req, msg_id, settings.provider_strip_inline_thinking
-    )
-    usage = result.get("usage", {})
-    logger.info(
-        "← %s [%s] stop=%s out_tokens=%s in_tokens=%s",
-        provider, mode,
-        result.get("stop_reason"),
-        usage.get("output_tokens"),
-        usage.get("input_tokens"),
-    )
-    return result
+    else:
+        result = nim_response_to_anthropic(
+            resp, req, msg_id, settings.provider_strip_inline_thinking
+        )
+        usage = result.get("usage", {})
+        logger.info(
+            "← %s [%s] stop=%s out_tokens=%s in_tokens=%s",
+            provider, mode,
+            result.get("stop_reason"),
+            usage.get("output_tokens"),
+            usage.get("input_tokens"),
+        )
+        return result
+    finally:
+        due = _local_stream_ended()
+        try:
+            if due:
+                await _release_deferred(due, get_settings())
+            await _drain_deferred_evictions()
+        except Exception:  # housekeeping must not mask the response
+            logger.exception("deferred tier release failed")
 
 
 async def _stream(

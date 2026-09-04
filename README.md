@@ -1113,6 +1113,16 @@ Recovery is not instant. While OPEN the breaker probes upstream once per `failov
 
 `PROVIDER_KEEP_ALIVE` is set on `local-failover-256k` and `local-failover-128k` only. Do not set it on a tier reachable through `MODEL_ROUTES`: a deliberate `/model qwen` session that thinks for longer than the clamp would evict its own 17 GB model and reload it next turn, which is slower and more memory churn than leaving it resident. The same rule is why only breaker-diverted requests are claimed at all — the user asked for that tier, so it is not ours to evict.
 
+#### Escalating frees the tier it leaves
+
+The rule above says a tier the user deliberately asked for is not ours to evict. Escalation is the one case where it stops applying, because the session has already stopped using it. A `/model qwen` session that outgrows the 27B is moved to `qwen3.5:4b-256k` by `ROUTE ESCALATE` (hybrid) or `TIER ESCALATE` (profile mode, and the universal backstop). The user still asked for the 27B, but nothing is being served from it any more.
+
+Until 2026-09-05 nothing freed it. A route holds no breaker claim, so no close would ever release it, and Ollama keeps a model for the global `OLLAMA_KEEP_ALIVE` after its last request — so the two tiers overlap for five minutes by design.
+
+They do not fit. Measured 2026-09-05 with the 27B alone resident: **22.0 GB wired** of a ~27 GB ceiling on 36 GB of RAM. The 256K 4B wants roughly 13 GB more, and `OLLAMA_MAX_LOADED_MODELS=3` entitles Ollama to try holding both, because it caps by model count and never by bytes. `mlx_admin.resolve_profile` has guarded the MLX-versus-Ollama form of this collision since 2026-08-24, citing the two kernel panics; the Ollama-to-Ollama form had no equivalent.
+
+Both escalation sites now unload the outgoing model. The safety rule is the same one the 2026-08-26 stall bought: never evict a tier that is still generating. The in-flight count therefore covers **every** locally served response, streaming and not, failover and deliberate route — a route response holds no claim but does hold the GPU. When something is still open the eviction is deferred and runs as the last response finishes. Failing to evict is logged and never costs the request; the fallback is the old behaviour, one tier resident too long.
+
 Everything here is best-effort. A router that cannot reach Ollama's admin endpoint must still route, and the cost of failing is late release, which is the old behaviour rather than an outage.
 
 ### Sizing the failover tier

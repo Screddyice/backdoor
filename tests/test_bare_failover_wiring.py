@@ -462,3 +462,74 @@ def test_recall_survives_punctuation_that_breaks_fts5():
     """Raw prompts contain quotes and operators; FTS5 treats them as syntax."""
     from src.proxy.memory import recall
     assert recall("what's the 27B's window? (AND OR NOT) -- ;", k=3) == [] or True
+
+
+@pytest.mark.asyncio
+async def test_tier_escalation_frees_the_tier_it_left(monkeypatch):
+    """Escalating must hand back the GPU, not stack a second tier beside it.
+
+    The 27B holds 17 GB (22.0 GB wired, measured 2026-09-05 on a 36 GB host
+    with a ~27 GB ceiling) and the 256K 4B wants ~13 GB more. Escalating
+    without freeing the outgoing tier asks Ollama for both, and
+    OLLAMA_MAX_LOADED_MODELS=3 lets it try.
+    """
+    recorder = RecordingClient()
+    monkeypatch.setattr(routes, "_get_profile_client", lambda p, s: recorder)
+    routes.set_provider_client(recorder)
+    monkeypatch.setattr(routes, "_local_inflight", 0)
+
+    evicted: list[str] = []
+
+    async def _unload(base_url, model):
+        evicted.append(model)
+        return True
+
+    monkeypatch.setattr(routes.ollama_admin, "unload", _unload)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_model="qwen3.5:4b-64k",
+        route_max_input_tokens=28_000,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=20))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert evicted == ["qwen3.5:4b-64k"], (
+        f"escalation left {evicted or 'the outgoing tier'} resident; the tier it "
+        "stopped using must be released before the wider one loads beside it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_stays_put_frees_nothing(monkeypatch):
+    """No escalation, no eviction — the tier serving the request is not a leak."""
+    recorder = RecordingClient()
+    monkeypatch.setattr(routes, "_get_profile_client", lambda p, s: recorder)
+    routes.set_provider_client(recorder)
+    monkeypatch.setattr(routes, "_local_inflight", 0)
+
+    evicted: list[str] = []
+
+    async def _unload(base_url, model):
+        evicted.append(model)
+        return True
+
+    monkeypatch.setattr(routes.ollama_admin, "unload", _unload)
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="profile",
+        provider_model="qwen3.5:4b-64k",
+        route_max_input_tokens=28_000,
+    )
+    try:
+        resp = await _post(app, _route_request(turns=1))
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert evicted == [], f"unloaded {evicted} for a session that never escalated"
