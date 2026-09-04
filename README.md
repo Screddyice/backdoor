@@ -1182,6 +1182,15 @@ Three things make that safe to send where the active turn alone was safe by cons
 - **The budget is leftovers.** History spends what the active turn did not use, capped — never its own allocation. A large instruction reduces history to nothing and the path behaves exactly as it did before, which is why `validate_codex_context_allocation` did not have to move.
 - **Pairs stay whole.** A window never opens on a `function_call_output` whose call was left behind.
 
+Validated against real Ollama on 2026-09-05, posting the built payload to the same `/v1/responses` endpoint the Codex path uses, with a 10-turn conversation:
+
+```
+turn 1: items=23  in≈4316   34.6s  status=completed
+turn 2: items=25  in≈4367    4.0s  status=completed  prefix_stable=True
+```
+
+Turn two is the same size and 8.6x faster, and the provider accepts the replayed `function_call` items rather than rejecting the shape — the two things that could not be proven from unit tests alone. Before this change every turn cost what turn one costs.
+
 Memories sit between the history and the active turn on purpose: the block is rebuilt from a fresh recall query every turn, so anything placed after it is new work anyway, and putting it ahead of the history would make the history unreusable.
 
 | Setting | Default | What it does |
