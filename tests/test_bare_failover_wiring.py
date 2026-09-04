@@ -64,7 +64,7 @@ def offline_app(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="hybrid", failover_to_local=True, failover_threshold=1,
-        qwen_cognee=False,
+        qwen_memory=False,
     )
     try:
         yield app, recorder
@@ -91,8 +91,8 @@ def _harness_request() -> dict:
         "tools": [
             {"name": "Bash", "description": "run a command", "input_schema": {}},
             {"name": "Read", "description": "read a file", "input_schema": {}},
-            {"name": "mcp__plugin_mem0_mem0__search_memories",
-             "description": "recall", "input_schema": {}},
+            {"name": "mcp__example__crm_lookup",
+             "description": "lookup", "input_schema": {}},
         ],
         "messages": [
             {"role": "user", "content": "did the router ever fail over?"},
@@ -142,7 +142,7 @@ async def test_bare_mode_can_be_disabled(offline_app, monkeypatch):
     app, recorder = offline_app
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="hybrid", failover_to_local=True, failover_threshold=1,
-        failover_bare=False, qwen_cognee=False,
+        failover_bare=False, qwen_memory=False,
     )
     await _post(app, _harness_request())
     assert "official CLI" in json.dumps(recorder.payload)
@@ -453,8 +453,7 @@ def test_memory_injected_for_local_provider(monkeypatch):
 
 
 def test_memory_not_injected_for_cloud_provider(monkeypatch):
-    """Cloud sessions already get Mem0 from the UserPromptSubmit hook; injecting
-    again would spend the context twice on the same text."""
+    """Cloud sessions get claude-mem through hooks, so proxy injection would duplicate it."""
     from src.proxy import translate
     import src.proxy.memory as memory
     monkeypatch.setattr(memory, "recall", lambda *a, **k: ["should not appear"])

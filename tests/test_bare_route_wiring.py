@@ -77,8 +77,8 @@ def _harness_request(model: str = "qwen") -> dict:
             {"name": "Read", "description": "read a file", "input_schema": {}},
             {"name": "WebSearch", "description": "search the web", "input_schema": {}},
             {"name": "WebFetch", "description": "fetch a URL", "input_schema": {}},
-            {"name": "mcp__plugin_mem0_mem0__search_memories",
-             "description": "recall", "input_schema": {}},
+            {"name": "mcp__example__crm_lookup",
+             "description": "lookup", "input_schema": {}},
         ],
         "messages": [
             {"role": "user", "content": "why is qwen still the 4b?"},
@@ -98,7 +98,7 @@ def _pin(monkeypatch, **overrides):
         router_mode="hybrid",
         provider_base_url="http://localhost:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
-        qwen_cognee=False,
+        qwen_memory=False,
     )
     monkeypatch.setattr(
         routes, "load_profile_settings", lambda profile: Settings(**base, **overrides)
@@ -294,7 +294,7 @@ def profile_app(monkeypatch):
         route_bare=True,
         provider_base_url="http://localhost:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
-        qwen_cognee=False,
+        qwen_memory=False,
     )
     try:
         yield app, recorder
@@ -345,7 +345,7 @@ async def test_profile_mode_leaves_the_harness_alone_when_route_bare_is_off(monk
         route_bare=False,
         provider_base_url="http://localhost:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
-        qwen_cognee=False,
+        qwen_memory=False,
     )
     try:
         resp = await _post(app, _harness_request(model="claude-opus-4-1"))

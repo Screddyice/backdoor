@@ -95,7 +95,6 @@ def main() -> int:
     build_parser = subparsers.add_parser("build")
     build_parser.add_argument("--servers", required=True)
     build_parser.add_argument("--output", type=Path, required=True)
-    build_parser.add_argument("--cognee-shim", type=Path)
 
     args = parser.parse_args()
     if args.command == "online":
@@ -109,12 +108,6 @@ def main() -> int:
 
     selected = select_servers(servers, args.servers)
     if args.command == "build":
-        if args.cognee_shim:
-            selected["cognee"] = {
-                "type": "stdio",
-                "command": "python3",
-                "args": [str(args.cognee_shim.expanduser())],
-            }
         write_private_config(args.output, selected)
     return 0
 
