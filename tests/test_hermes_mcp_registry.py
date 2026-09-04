@@ -70,6 +70,34 @@ def test_full_profile_without_key_env_is_rejected(tmp_path):
     assert "key_env" in str(e.value)
 
 
+def test_delegate_only_requires_a_port_and_key(tmp_path):
+    with pytest.raises(RegistryError, match="declares no port"):
+        load_registry(
+            _write(
+                tmp_path,
+                '[profiles.screddy]\ntier = "delegate_only"\nkey_env = "SCREDDY_KEY"\n',
+            )
+        )
+    with pytest.raises(RegistryError, match="declares no key_env"):
+        load_registry(
+            _write(
+                tmp_path,
+                '[profiles.screddy]\ntier = "delegate_only"\nport = 9003\n',
+            )
+        )
+
+
+def test_delegate_only_loads_as_reachable(tmp_path):
+    registry = load_registry(
+        _write(
+            tmp_path,
+            '[profiles.screddy]\ntier = "delegate_only"\nport = 9003\n'
+            'key_env = "SCREDDY_KEY"\n',
+        )
+    )
+    assert registry["screddy"].reachable is True
+
+
 def test_duplicate_ports_are_rejected(tmp_path):
     body = (
         '[profiles.alpha]\ntier = "full"\nport = 9001\nkey_env = "A"\n'
@@ -120,7 +148,7 @@ def test_the_real_registry_on_disk_is_loadable_and_consistent():
     assert reg, "a deployed registry declares no profiles"
 
     for name, profile in reg.items():
-        assert profile.tier in {"full", "control_only", "unconfigured"}
+        assert profile.tier in {"full", "control_only", "delegate_only", "unconfigured"}
         if profile.tier == "unconfigured":
             continue
         assert profile.port, f"{name} is {profile.tier} with no port"
