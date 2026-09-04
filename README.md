@@ -405,7 +405,7 @@ After three eligible failures inside 120 seconds, the Codex breaker routes the t
 The visible Codex thread does not change. Qwen receives a fresh internal request containing:
 
 - the latest user instruction and the active local tool loop, including a paired tool continuation that does not repeat the user message;
-- a bounded recall from Cognee when `QWEN_COGNEE` is enabled;
+- a bounded recall from the local claude-mem replica when `QWEN_MEMORY` is enabled;
 - local Code Mode tools converted from Codex's Responses Lite namespace format.
 
 It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Cognee can provide continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads agent recall through `POST /api/v1/recall`. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_COGNEE=0` to suppress every Cognee read and write on the local path.
@@ -429,7 +429,7 @@ Backdoor enforces this allocation on the fresh request that it sends to Qwen:
 | Component | Limit |
 | --- | ---: |
 | Local guidance | 1,000 tokens |
-| Cognee recall | 2,000 tokens |
+| claude-mem recall | 2,000 tokens |
 | Local tool schemas | 4,000 tokens |
 | Current task and active tool results | 21,000 tokens |
 | Reply reserve | 4,000 tokens |
@@ -1520,24 +1520,41 @@ The store is a synced replica of every device, so a failed-over local session re
 what Hermes on src or r2h learned, with the network gone. That is the property the
 Mem0 mirror was meant to provide and the Cognee tunnel could not.
 
-### Recall's budget skips, it does not stop (2026-09-04)
+### Recall shares its budget instead of spending it first-come (2026-09-04)
 
-`memory.recall()` fills a character budget from the best-ranked memories. The loop used to
-`break` on the first memory that did not fit, which threw away everything ranked behind it.
-That is not a corner case: claude-mem session summaries routinely run past the 1200-character
-default, so the usual outcome was an empty list from a store full of usable memories. Measured
-against the real store on this machine, three ordinary queries returned **nothing at all**; the
-same queries return a memory each with the loop fixed.
+`memory.recall()` fills a character budget from the best-ranked memories. Two things were wrong,
+and together they meant the router recalled nothing.
 
-Nothing surfaced it because recall is fail-open by design — an empty list from a broken filter
-and an empty list from a store with nothing to say are the same value.
+**It stopped at the first memory that did not fit.** The loop `break`ed rather than skipping, so
+one long memory discarded every shorter one ranked behind it. That is not a corner case: a
+claude-mem session summary runs 700-1400 characters while bare mode allows 1200 in total.
+Measured against the real store on this machine, `corpus ingest cognee rename`,
+`qwen router failover` and `claude-mem sync hub` each returned **zero** memories. The search was
+fine — 4, 13 and 7 rows matched and joined — and every row was then thrown away.
 
-The loop now skips an oversized memory and keeps going. Truncation is the last resort, used only
-when no candidate fits whole, because a complete memory is worth more than a fragment; a budget
-too small to hold anything meaningful still returns nothing rather than a scrap.
+**First-come selection cannot fill six slots from a 1200-character budget anyway.** The budget is
+deliberately small: bare mode exists to hold the prompt near 945 tokens against a 32K window. But
+one summary is larger than a sixth of it, so even with the `break` fixed a single memory spent the
+lot and five slots went unused.
 
-**Left alone deliberately:** `_SOURCES` still includes `user_prompts_fts`, and prompts now
-dominate what comes back — one 1171-character prompt fills the entire 1200-character budget on
-its own, leaving no room for a distilled summary. Whether the router should recall verbatim
-prompts at all is a product decision, not a bug, so it is unchanged here.
+Each memory now takes a share of what is left, divided between the memories that can still land,
+and is clipped to that share on a word boundary. Clipping is safe because the columns are selected
+lesson-first — `learned` before `investigated` and `request`, `title` before `narrative` — so the
+head of the text is the part worth keeping. Room that the remaining slots cannot use flows to the
+memories that exist, so two candidates against an 8000-character budget are taken whole rather
+than clipped to an eighth.
 
+| | before | after |
+|---|---|---|
+| qwen bare mode (k=6, 1200 chars) | 0 memories | 6 memories, 1197 chars |
+| Codex failover (k=8, 8000 chars) | 0 memories | 8 memories, 7982 chars |
+
+**Matched-but-dropped is no longer silent.** Recall is fail-open, so a broken filter and a store
+with nothing to say both returned an empty list — which is why this survived. When candidates
+match but none fit, recall now logs a warning naming the count, the budget and `k`, and says
+recall is off.
+
+**Left alone deliberately:** `_SOURCES` still includes `user_prompts_fts`. Prompts are 32% of rows
+on this store and rank first for several ordinary queries, so they take slots a distilled summary
+could have used. Whether the router should recall verbatim prompts at all is a product decision,
+not a defect.

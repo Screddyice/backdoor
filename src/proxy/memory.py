@@ -87,6 +87,18 @@ def _db_path(cache: Path | None) -> Path:
 _MIN_USEFUL_CHARS = 80
 
 
+def _clip(text: str, limit: int) -> str:
+    """`text` shortened to `limit` characters, on a word boundary where possible."""
+    if len(text) <= limit:
+        return text
+    head = text[: limit - 1]
+    cut = head.rsplit(" ", 1)[0]
+    # A single very long token leaves nothing to cut back to; keep the hard slice.
+    if len(cut) >= limit // 2:
+        head = cut
+    return head.rstrip(" ,;:.") + "\u2026"
+
+
 def recall(query: str, k: int = 6, char_budget: int = 1200, cache: Path | None = None) -> list[str]:
     """Return up to `k` memories relevant to `query`, best-ranked first. Never raises."""
     path = _db_path(cache)
@@ -125,29 +137,56 @@ def recall(query: str, k: int = 6, char_budget: int = 1200, cache: Path | None =
         return []
 
     ranked.sort(key=lambda r: r[0])  # FTS5 rank: lower is better
+
+    # Every memory gets an equal share of the budget rather than first-come.
+    #
+    # Taking whole memories first-come cannot work here. The bare-mode budget is
+    # 1200 characters over 6 slots on purpose (see Settings.memory_char_budget),
+    # while a claude-mem session summary runs 700-1400 characters on its own, so
+    # one memory consumed the lot and the other five slots went unused. The
+    # earlier code was worse still: it `break`ed on the first memory too large to
+    # fit, discarding every shorter one ranked behind it, and returned nothing at
+    # all for ordinary queries against a store full of usable memory.
+    #
+    # Truncating is safe because the columns are ordered lesson-first: a session
+    # summary leads with `learned` and an observation with `title`, so the head of
+    # the text is the part worth keeping.
     out: list[str] = []
     seen: set[str] = set()
     used = 0
-    for _, text in ranked:
+    truncated = 0
+    for index, (_, text) in enumerate(ranked):
         if text in seen:
             continue
-        # Skip past an oversized memory rather than stopping at it. `break` here
-        # meant one long memory discarded every shorter one ranked behind it,
-        # and because claude-mem summaries routinely run past a 1200-char budget
-        # the usual result was no memory at all — indistinguishable from a store
-        # with nothing to say.
-        if used + len(text) > char_budget:
-            continue
+        # Share what is left between the memories that can still land, so a short
+        # one hands its unused room to the next and a query with three candidates
+        # gives each a third rather than a k-th of the budget.
+        contenders = max(1, min(k - len(out), len(ranked) - index))
+        share = max(_MIN_USEFUL_CHARS, (char_budget - used) // contenders)
+        room = min(share, char_budget - used)
+        if room < _MIN_USEFUL_CHARS:
+            break
+        if len(text) > room:
+            text = _clip(text, room)
+            truncated += 1
         out.append(text)
         seen.add(text)
         used += len(text)
         if len(out) >= k:
             break
 
-    # Whole memories are worth more than a fragment, so truncation is the last
-    # resort: only when every candidate was too big to fit intact.
-    if not out and ranked and char_budget > _MIN_USEFUL_CHARS:
-        out.append(ranked[0][1][:char_budget].rstrip() + "…")
+    # A silent empty result is why the `break` bug survived: a broken filter and a
+    # store with nothing to say returned the same value. Say which one happened.
+    if ranked and not out:
+        logger.warning(
+            "memory recall: %d candidates matched but none fit (budget %d, k %d) — recall is off",
+            len(ranked), char_budget, k,
+        )
+    else:
+        logger.debug(
+            "memory recall: %d candidates, %d returned, %d truncated, %d/%d chars",
+            len(ranked), len(out), truncated, used, char_budget,
+        )
     return out
 
 
