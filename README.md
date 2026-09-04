@@ -1574,3 +1574,17 @@ attaches a memory MCP shim.
 
 The store is a synced replica of every device, so a failed-over local session recalls
 what Hermes on src or r2h learned, even when the network is down.
+
+## CI (2026-09-05)
+
+`.github/workflows/ci.yml` runs the suite on every pull request and on pushes to `main`.
+
+This repo had no CI at all. Shawn's QA Assist reviewed its pull requests and then declined to
+merge them, reporting "this repo has no gate I can trust" and asking whether it should merge on
+review alone. That was the right refusal: a review with nothing runnable behind it is an opinion,
+and this repo is the router every local model session goes through.
+
+The suite is the gate: failover, memory recall, the working set, tier serialization and the
+provider edges. The count is deliberately not quoted here — it moves every time a regression gets
+cover, and a number in prose only ever goes stale. Nothing here needs a secret, so the workflow runs with `contents: read` and no
+environment.
