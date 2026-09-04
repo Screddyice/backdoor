@@ -1835,3 +1835,34 @@ async def test_half_open_probe_closes_breaker_when_the_client_disconnects(
 
     assert started == [200]
     assert breaker.open is False
+
+
+@pytest.mark.asyncio
+async def test_the_codex_local_path_hands_its_tier_back():
+    """A Codex turn takes the same lock a Claude turn does, and returns it.
+
+    Measured 2026-09-05: two sessions alternating on one model cost 105.8s and
+    116.3s per turn against 0.7s for one session repeating, because each
+    request evicts the other's KV cache. A Codex turn and a Claude turn on the
+    same 27B do that to each other, so both paths serialize on the tier — and a
+    lock that is taken and not returned would queue every later turn until the
+    timeout.
+    """
+    from src.proxy import codex_routes, tier_lock
+    from src.proxy.config import Settings
+    from src.proxy.failover import FailoverBreaker
+
+    tier_lock.reset()
+    settings = Settings()
+    await codex_routes._hold_tier(settings)
+    assert codex_routes._held_tier is not None, "the Codex path took no lock"
+    held = codex_routes._held_tier
+    assert tier_lock.waiting(*held)
+
+    await codex_routes._release_local_slot(
+        FailoverBreaker(threshold=1, online_fn=lambda: False)
+    )
+
+    assert codex_routes._held_tier is None
+    assert not tier_lock.waiting(*held), "the Codex path kept the tier locked"
+    tier_lock.reset()

@@ -1014,13 +1014,24 @@ async def create_message(
         # would leave the real 13 GB tier resident.
         br = get_breaker(get_settings())
         br.note_claim(settings.provider_base_url, provider)
-        # Re-clamped per request because Ollama resets the timer to the global
-        # OLLAMA_KEEP_ALIVE on every inference call; setting it once at load
-        # would be undone by the second request of the outage.
-        if settings.provider_keep_alive:
-            await ollama_admin.set_keep_alive(
-                settings.provider_base_url, provider, settings.provider_keep_alive
-            )
+
+
+    # Residency is clamped for EVERY local tier that declares it, not only the
+    # failover ones. Re-clamped per request because Ollama resets the timer to
+    # the global OLLAMA_KEEP_ALIVE on every inference call, so setting it once
+    # at load would be undone by the next turn.
+    #
+    # A failover tier uses this to be released EARLY (45s: nobody asked for it).
+    # A route tier uses it for the opposite reason. The working set keeps a
+    # session's prefix byte-stable so each turn is a 5-10s append, but that
+    # only holds while Ollama still has the cache — and the global timer is 5
+    # minutes, so any think-time longer than that silently re-imposes a cold
+    # prefill of 70-100s at 18K. Extending residency past ordinary think-time
+    # is what makes the stable prefix worth having.
+    if settings.provider_keep_alive and ollama_admin.is_ollama(settings.provider_base_url):
+        await ollama_admin.set_keep_alive(
+            settings.provider_base_url, provider, settings.provider_keep_alive
+        )
 
     if req.stream:
         input_tokens = est_in

@@ -90,3 +90,32 @@ async def test_the_lock_is_released_when_a_response_raises():
 async def test_an_unnamed_tier_is_never_serialized():
     async with tier_lock.hold(OLLAMA, "", timeout=5) as locked:
         assert locked is False
+
+
+@pytest.mark.asyncio
+async def test_paired_acquire_and_release_serialize_too():
+    """The Codex path reserves and releases in two different functions."""
+    assert await tier_lock.acquire(OLLAMA, "m", timeout=5)
+    assert tier_lock.waiting(OLLAMA, "m")
+
+    # A second caller cannot take it while the first holds it.
+    assert not await tier_lock.acquire(OLLAMA, "m", timeout=0.05)
+
+    tier_lock.release(OLLAMA, "m")
+    assert not tier_lock.waiting(OLLAMA, "m")
+
+
+@pytest.mark.asyncio
+async def test_releasing_twice_is_a_no_op():
+    """The caller's release runs on several exit paths, one of them a
+    BaseException handler. A double release on an asyncio.Lock raises
+    RuntimeError, which would turn a slow response into a failed one."""
+    assert await tier_lock.acquire(OLLAMA, "m", timeout=5)
+    tier_lock.release(OLLAMA, "m")
+    tier_lock.release(OLLAMA, "m")  # must not raise
+    assert not tier_lock.waiting(OLLAMA, "m")
+
+
+@pytest.mark.asyncio
+async def test_releasing_what_was_never_taken_is_a_no_op():
+    tier_lock.release(OLLAMA, "never-held")

@@ -1101,7 +1101,13 @@ Backdoor now counts the failover responses that are still generating and holds t
 
 Recovery is not instant. While OPEN the breaker probes upstream once per `failover_probe_seconds` (60s), so it cannot notice Anthropic is back until it is allowed to try. Release lands within about a minute of real recovery, against the nine minutes above.
 
-`PROVIDER_KEEP_ALIVE` is set on `local-failover-256k` and `local-failover-128k` only. Do not set it on a tier reachable through `MODEL_ROUTES`: a deliberate `/model qwen` session that thinks for longer than the clamp would evict its own 17 GB model and reload it next turn, which is slower and more memory churn than leaving it resident. The same rule is why only breaker-diverted requests are claimed at all — the user asked for that tier, so it is not ours to evict.
+`PROVIDER_KEEP_ALIVE` does two opposite jobs, and which one depends on who asked for the tier.
+
+On `local-failover-256k` and `local-failover-128k` it is `45s`, to release EARLY: nobody asked for those tiers, and an outage that ends with its sessions abandoned leaves no successful call to close the breaker.
+
+On `local-qwen38-obliterated` it is `10m`, to release LATE. The rule here used to be "never set this on a tier reachable through `MODEL_ROUTES`", because a short clamp would make a `/model qwen` session evict its own 17 GB model while the user was still thinking. That reasoning was right about short clamps and it argues for a long one: the global `OLLAMA_KEEP_ALIVE` is five minutes, and the working set only pays while Ollama still holds the prefix, so any pause longer than five minutes silently costs a 70-100s cold prefill at an 18K window. Ten minutes rather than thirty because a resident 27B is 17 GB and every minute of it is a minute `llmjury solve` can collide with, Ollama capping by model count and never by bytes.
+
+Only breaker-diverted requests are CLAIMED, which is a different thing: a claim is released when the breaker closes, and the user asked for a routed tier, so it is not ours to evict on someone else's schedule. Escalation is the one exception, above.
 
 #### Escalating frees the tier it leaves
 
@@ -1154,6 +1160,23 @@ Measured end to end on 2026-09-05, driving a dev router on port 8099 against the
 ```
 
 First answer in 116s, the turn after it 143s — the second cold prefill, since the first request after a model load leaves no reusable cache — then 10.6s, 13.3s and 13.8s as the boundary held and each turn appended. The same session before this change escalated to the 256K 4B and prefilled all 205K tokens, which on the measured curve is about thirteen minutes to first answer, on a weaker model, every time the session was resumed.
+
+#### Codex takes the same lock, and still has the other half of the problem
+
+The Codex local path serializes on the same tier as the Claude path, because a Codex turn and a Claude turn on one 27B evict each other's cache exactly as two Claude turns do.
+
+What that does not fix is Codex's own prefix. `build_local_payload` composes the ACTIVE TURN — the latest user instruction, its paired tool calls, and recalled memories — and discards the rest by design, which keeps the prompt small but rebuilds it from a different head every turn. Real turns from this machine's log, all of them small:
+
+```
+  2648 tok    232.5s     11 tok/s
+  2578 tok    220.4s     12 tok/s
+  6643 tok    223.6s     30 tok/s
+  3354 tok     20.5s    163 tok/s
+  6702 tok     43.9s    153 tok/s
+  2556 tok      1.3s   1925 tok/s
+```
+
+One turn in that sample reused a prefix and cost 1.3 seconds. The rest ran at cold-prefill rate or worse — a 180x spread across nearly identical inputs. The lock removes the contention half of that spread. The remaining half is structural, and the fix is the same one the Claude path just got: a stable head that survives between turns. It is worth doing on the measurements above, where a stable 18K prefix costs about 10s per turn while an unstable 5K one costs 20–45s, but it changes what Codex sends rather than how much, so it is a separate change with its own acceptance testing.
 
 | Setting | Default | What it does |
 |---|---|---|
