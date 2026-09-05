@@ -122,13 +122,13 @@ def test_large_magic_prefix_cannot_bypass_codex_compaction():
     assert len(out["input"][-1]["output"]) < 5_000
 
 
-def test_secret_shaped_documents_are_never_sent_to_cognee():
+def test_secret_shaped_documents_are_never_sent_to_memory():
     assert not safe_to_remember("-----BEGIN PRIVATE KEY-----\nnot-a-real-key")
     assert not safe_to_remember("Authorization: Bearer example-token-value")
     assert safe_to_remember("A public report about product launch pricing.")
 
 
-def test_secret_shaped_message_source_url_is_never_sent_to_cognee():
+def test_secret_shaped_message_source_url_is_never_sent_to_memory():
     request = _request("Public report. " * 1_000)
     request.messages[1].content[0]["input"]["url"] = (
         "https://example.com/public/sk-AAAAAAAAAAAAAAAAAAAAAAAA"
@@ -144,7 +144,7 @@ def test_secret_shaped_message_source_url_is_never_sent_to_cognee():
     assert documents == []
 
 
-def test_secret_shaped_codex_source_url_is_never_sent_to_cognee():
+def test_secret_shaped_codex_source_url_is_never_sent_to_memory():
     payload = {
         "input": [
             {"type": "message", "role": "user", "content": [
@@ -169,7 +169,7 @@ def test_secret_shaped_codex_source_url_is_never_sent_to_cognee():
     assert documents == []
 
 
-def test_authenticated_or_unapproved_fetches_are_never_queued_for_cognee():
+def test_authenticated_or_unapproved_fetches_are_never_queued_for_memory():
     payload = {
         "input": [
             {"type": "message", "role": "user", "content": [
@@ -283,7 +283,7 @@ async def test_prepare_stores_full_document_and_keeps_only_capsule(monkeypatch):
     assert len(json.dumps(out.model_dump())) < len(page) / 3
 
 
-async def test_later_turn_recalls_cognee_without_readding_full_document(monkeypatch):
+async def test_later_turn_recalls_memory_without_readding_full_document(monkeypatch):
     req = MessagesRequest(
         model="qwen",
         messages=[Message(role="user", content="What was the launch price in that report?")],
@@ -304,7 +304,7 @@ async def test_later_turn_recalls_cognee_without_readding_full_document(monkeypa
     assert "$49 per month" in str(out.messages[-1].content)
 
 
-async def test_cognee_failure_never_costs_qwen_the_turn(monkeypatch):
+async def test_memory_failure_never_costs_qwen_the_turn(monkeypatch):
     async def broken_recall(_query, _settings):
         raise TimeoutError("tunnel unavailable")
 
@@ -321,7 +321,7 @@ async def test_cognee_failure_never_costs_qwen_the_turn(monkeypatch):
 
 async def test_non_qwen_provider_is_not_changed(monkeypatch):
     async def should_not_run(*_args):
-        raise AssertionError("Cognee external context ran for a cloud model")
+        raise AssertionError("memory external context ran for a cloud model")
 
     monkeypatch.setattr("src.proxy.external_context.recall_context", should_not_run)
     req = MessagesRequest(model="claude-opus-5", messages=[Message(role="user", content="hello")])
@@ -359,7 +359,7 @@ def test_codex_function_output_becomes_the_same_bounded_capsule():
     assert payload["input"][-1]["output"] == page
 
 
-def test_codex_shell_output_is_compacted_but_never_queued_for_cognee():
+def test_codex_shell_output_is_compacted_but_never_queued_for_memory():
     output = "private workspace data " * 1_000
     payload = {
         "input": [

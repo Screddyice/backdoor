@@ -1,6 +1,5 @@
 """Bare mode: stripping the Claude Code harness off a failed-over request."""
 
-import pytest
 
 from src.proxy.bare import (
     DEFAULT_KEEP_TOOLS,
@@ -23,7 +22,7 @@ def req(**kw) -> MessagesRequest:
 # ── keep-list parsing ────────────────────────────────────────────────────────
 
 def test_parse_keep_splits_and_trims():
-    assert parse_keep("mem0, jarvis ") == ("mem0", "jarvis")
+    assert parse_keep("github, jarvis ") == ("github", "jarvis")
 
 
 def test_parse_keep_empty_string_keeps_nothing():
@@ -49,7 +48,7 @@ def test_default_keeps_local_tools_only():
 def test_local_token_keeps_harness_tools_and_drops_mcp():
     out = make_bare(req(tools=[
         Tool(name="Read"), Tool(name="Bash"), Tool(name="Grep"),
-        Tool(name="mcp__plugin_mem0_mem0__search_memories"),
+        Tool(name="mcp__example__crm_lookup"),
         Tool(name="mcp__apify__search-actors"),
         Tool(name="mcp__example__crm_list"),
     ]))
@@ -69,11 +68,11 @@ def test_explicit_entries_compose_with_the_local_token():
     """Add a specific MCP tool back without losing the local ones."""
     out = make_bare(req(tools=[
         Tool(name="Read"),
-        Tool(name="mcp__plugin_mem0_mem0__search_memories"),
+        Tool(name="mcp__example__crm_lookup"),
         Tool(name="mcp__apify__search-actors"),
-    ]), keep=("local", "mem0"))
+    ]), keep=("local", "example"))
     assert [t.name for t in out.tools] == [
-        "Read", "mcp__plugin_mem0_mem0__search_memories",
+        "Read", "mcp__example__crm_lookup",
     ]
 
 
@@ -156,15 +155,15 @@ def test_only_kept_tools_survive():
     shipped default keeps nothing (see test_default_keeps_no_tools)."""
     out = make_bare(req(tools=[
         Tool(name="Bash", description="run", input_schema={"a": 1}),
-        Tool(name="mcp__plugin_mem0_mem0__search_memories", description="recall"),
+        Tool(name="mcp__example__crm_lookup", description="lookup"),
         Tool(name="Read"),
-    ]), keep=("mem0",))
-    assert [t.name for t in out.tools] == ["mcp__plugin_mem0_mem0__search_memories"]
+    ]), keep=("example",))
+    assert [t.name for t in out.tools] == ["mcp__example__crm_lookup"]
 
 
 def test_default_strips_every_mcp_tool():
     out = make_bare(req(tools=[
-        Tool(name="mcp__plugin_mem0_mem0__search_memories"),
+        Tool(name="mcp__example__crm_lookup"),
         Tool(name="mcp__apify__search-actors"),
     ]))
     assert out.tools is None
@@ -182,7 +181,7 @@ def test_no_surviving_tools_clears_tools_and_tool_choice():
 
 
 def test_keep_match_is_case_insensitive_substring():
-    out = make_bare(req(tools=[Tool(name="MCP__Plugin_MEM0__add")]), keep=("mem0",))
+    out = make_bare(req(tools=[Tool(name="MCP__Example__CRM_Add")]), keep=("example",))
     assert out.tools is not None and len(out.tools) == 1
 
 

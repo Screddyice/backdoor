@@ -28,7 +28,8 @@ from .context_store import ContextStore, ContextStoreUnavailable
 from .context_tokenizer import ContextLimitError, QwenTokenGate
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
-from . import compute_lease, mlx_admin, ollama_admin
+from .provider_errors import is_provider_edge_404
+from . import compute_lease, mlx_admin, ollama_admin, tier_lock, working_set
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
 from .client import ProviderClient, ProviderError
 from .tokens import count_messages
@@ -235,6 +236,15 @@ _SKIP_RESP_HEADERS = {"content-length", "transfer-encoding", "connection"}
 # and raise "Error -3 while decompressing data: incorrect header check".
 # content-length is already stripped above; Starlette recomputes it.
 _DECODED_SKIP_HEADERS = _SKIP_RESP_HEADERS | {"content-encoding"}
+# The only transport failures safe to replay. A connect or pool failure means
+# nothing reached Anthropic, so a second attempt cannot duplicate anything. A
+# read, write or protocol error carries no such promise: the request may already
+# be on their side, and replaying it can bill and run the turn twice.
+_RETRYABLE_PRE_SEND_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
 
 
 def _decoded_relay_headers(uresp: httpx.Response) -> dict[str, str]:
@@ -268,7 +278,7 @@ async def _upstream_send(request: Request, body: bytes, settings: Settings) -> h
                 )
             return uresp
         except httpx.TransportError as exc:
-            if attempt:
+            if attempt or not isinstance(exc, _RETRYABLE_PRE_SEND_ERRORS):
                 raise
             if isinstance(exc, httpx.PoolTimeout):
                 poisoned = upstream
@@ -328,7 +338,7 @@ async def _relay_body(uresp: httpx.Response, settings: Settings) -> AsyncIterato
             "headers were already sent, so this turn cannot be failed over",
             uresp.num_bytes_downloaded, type(exc).__name__, exc,
         )
-        get_breaker(settings).record_failure(type(exc).__name__)
+        await _record_failure(get_breaker(settings), type(exc).__name__)
         raise
 
 
@@ -366,7 +376,7 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
     counted a fraction of the failures and took correspondingly longer to open,
     or never reached the threshold inside its window at all. Recording here is
     evidence-gathering only; the breaker still decides on its own terms, and
-    :func:`internet_reachable` still has the final say on opening.
+    :func:`internet_usable` still has the final say on opening.
 
     Deliberately does NOT call record_success. Closing the breaker obliges the
     caller to release the local tiers it claimed (see `_try_upstream`), and only
@@ -377,7 +387,7 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
         uresp = await _upstream_send(request, body, settings)
     except httpx.TransportError as e:
         logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
-        get_breaker(settings).record_failure(type(e).__name__)
+        await _record_failure(get_breaker(settings), type(e).__name__)
         return None
     return _relay_upstream(uresp, settings)
 
@@ -387,6 +397,54 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
 # built from settings so env overrides apply.
 
 _breaker: FailoverBreaker | None = None
+# Serialises every breaker verdict. See `_record_failure`.
+_breaker_failure_lock = asyncio.Lock()
+
+
+async def _record_failure(
+    br: FailoverBreaker,
+    reason: str,
+    *,
+    transport_error: bool = True,
+    confirmed_service_failure: bool = False,
+) -> bool:
+    """Record a failure without freezing the router, and without racing.
+
+    `record_failure` runs `internet_usable`, a blocking socket probe against a
+    public address plus a bounded DNS lookup. Called straight from a coroutine it runs ON the event
+    loop, so every failed turn stalls every other session for the length of the
+    probe — worst at exactly the moment the router is busiest, an outage.
+
+    The lock is the second half. Off-loop alone, a slow probe can still land
+    after a NEWER request has already succeeded and closed the breaker, writing
+    its stale verdict over that success. Serialising failure against success
+    means the breaker sees them in the order the requests actually resolved.
+
+    Cancellation cannot stop a worker thread, only stop waiting for it. So a
+    cancelled caller holds the lock until the probe it started finishes;
+    releasing early would let that thread mutate the breaker behind whoever
+    took the lock next.
+    """
+    async with _breaker_failure_lock:
+        probe = asyncio.create_task(
+            asyncio.to_thread(
+                br.record_failure,
+                reason,
+                transport_error=transport_error,
+                confirmed_service_failure=confirmed_service_failure,
+            )
+        )
+        try:
+            return await asyncio.shield(probe)
+        except asyncio.CancelledError:
+            await asyncio.shield(probe)
+            raise
+
+
+async def _record_success(br: FailoverBreaker) -> None:
+    """Close the breaker in order with any failure probe still running."""
+    async with _breaker_failure_lock:
+        br.record_success()
 
 
 def get_breaker(settings: Settings) -> FailoverBreaker:
@@ -474,10 +532,24 @@ async def failover_recovery_loop(
                     logger.exception("failover recovery could not release tiers")
 
 
-# Failover responses still being generated, and the tiers whose release is
-# waiting on them. See _release_claims for why the two cannot be independent.
-_failover_inflight: int = 0
+# Locally served responses still being generated, and the tiers whose release
+# is waiting on them. See _release_claims for why the two cannot be independent.
+#
+# The count covers EVERY response this router serves from a local tier, not
+# just failover ones. A deliberate `/model qwen` route holds the same GPU as a
+# breaker claim does, and since 2026-09-05 a route escalation asks for the
+# outgoing tier to be evicted (see _evict_outgoing_tier). Counting only
+# failover responses would let an escalation evict a model a route stream was
+# mid-generation on, which is the 2026-08-26 bug reached by a second door.
+_local_inflight: int = 0
 _deferred_unloads: set[tuple[str, str]] = set()
+
+# Tiers a route escalation stopped using, waiting for the last local response
+# to finish before they can be freed. Kept separate from _deferred_unloads
+# because the two are released under different conditions: a breaker claim must
+# not be released into a re-opened outage, while an escalation's eviction has
+# no breaker to consult — the tier simply is not serving this session any more.
+_deferred_evictions: set[tuple[str, str]] = set()
 
 
 async def _release_claims(br: FailoverBreaker, settings: Settings) -> None:
@@ -499,33 +571,35 @@ async def _release_claims(br: FailoverBreaker, settings: Settings) -> None:
     same 62ms window; the stream then produced nothing until it died on the
     600-second read timeout at 23:20:38.
 
-    So the unload waits for the last in-flight failover response, and is dropped
-    entirely if a FRESH outage re-opened the breaker while it waited — that tier
-    is claimed again and releasing it would evict a model now in use.
+    So the unload waits for the last in-flight LOCAL response — failover or a
+    deliberate `/model qwen` route, since 2026-09-05 both hold the same GPU —
+    and is dropped entirely if a FRESH outage re-opened the breaker while it
+    waited, because that tier is claimed again and releasing it would evict a
+    model now in use.
     """
     claims = br.drain_claims()
     if not claims:
         return
-    if _failover_inflight:
+    if _local_inflight:
         # Deferred, not backgrounded: a detached task cannot see a later
         # re-open, and would unload a tier the next outage had re-claimed.
         _deferred_unloads.update(claims)
         logger.info(
             "breaker closed with %d failover response(s) still streaming — "
             "deferring release of %s",
-            _failover_inflight, ", ".join(sorted(m for _, m in claims)),
+            _local_inflight, ", ".join(sorted(m for _, m in claims)),
         )
         return
     for base_url, model in claims:
         await ollama_admin.unload(base_url, model)
 
 
-def _failover_stream_started() -> None:
-    global _failover_inflight
-    _failover_inflight += 1
+def _local_stream_started() -> None:
+    global _local_inflight
+    _local_inflight += 1
 
 
-def _failover_stream_ended() -> set[tuple[str, str]]:
+def _local_stream_ended() -> set[tuple[str, str]]:
     """Drop this response from the in-flight count; return any tiers now due.
 
     Split from the unloading itself, and deliberately free of `await`, because
@@ -536,12 +610,148 @@ def _failover_stream_ended() -> set[tuple[str, str]]:
     would defer every future unload forever, which is a worse failure than the
     race this fixes.
     """
-    global _failover_inflight, _deferred_unloads
-    _failover_inflight = max(0, _failover_inflight - 1)
-    if _failover_inflight or not _deferred_unloads:
+    global _local_inflight, _deferred_unloads
+    _local_inflight = max(0, _local_inflight - 1)
+    if _local_inflight or not _deferred_unloads:
         return set()
     claims, _deferred_unloads = _deferred_unloads, set()
     return claims
+
+
+_TRIM_NOTE = (
+    " Earlier turns of this conversation were omitted to fit the local window; "
+    "the client still holds the full transcript and the cloud model still sees it."
+)
+
+
+# Chat template, role markers and the injected memory block are not in the
+# router's count and come to roughly this much at the provider.
+_TEMPLATE_SLACK = 1_500
+
+
+def _window_guard(settings: Settings) -> int:
+    """The largest router-side estimate that still fits the provider's window.
+
+    (window - output reserve - template slack) / estimate ratio. For the 27B at
+    32,768 with a 4,096 reserve and the measured 1.8 ratio that is 15,095 — well
+    under the configured 22K ceiling, which is why the ceiling alone overflowed.
+    """
+    # A local tier's window is a property of this machine and its Modelfile.
+    # A hosted provider's is neither known here nor ours to second-guess.
+    if not ollama_admin.is_ollama(settings.provider_base_url):
+        return 0
+    window = max(0, settings.provider_context_tokens)
+    reserve = settings.provider_max_tokens if 0 < settings.provider_max_tokens < window else 4_096
+    ratio = max(1.0, float(settings.local_token_estimate_ratio or 1.0))
+    return max(0, int((window - reserve - _TEMPLATE_SLACK) / ratio))
+
+
+def _note_provider_count(provider: str, estimate: int, real: int | None, settings: Settings) -> None:
+    """Make an overflow loud. The provider's count is the truth; log the ratio
+    every time so the estimate can be tuned from evidence, and warn when the
+    prompt reached the window — Ollama truncates from the front without saying
+    so, and the symptom is a model that answers nothing."""
+    if not real:
+        return
+    ratio = real / estimate if estimate else 0.0
+    window = settings.provider_context_tokens
+    reserve = settings.provider_max_tokens if 0 < settings.provider_max_tokens < window else 4_096
+    if window and real >= window - reserve:
+        logger.warning(
+            "%s prompt reached the window: %d provider tokens against %d (estimate %d, "
+            "ratio %.2f) — expect truncation from the front; raise "
+            "LOCAL_TOKEN_ESTIMATE_RATIO or lower the working set",
+            provider, real, window - reserve, estimate, ratio,
+        )
+    else:
+        logger.info("%s prompt: %d provider tokens for an estimate of %d (ratio %.2f)",
+                    provider, real, estimate, ratio)
+
+
+def _bound_working_set(req, profile: str, settings: Settings):
+    """Trim the transcript to a sticky local window. Returns (request, tokens).
+
+    Returns the request unchanged when it already fits, when bounding is off,
+    or when even the tail is over the ceiling — that last case is what the
+    ladder is still for. See working_set.py for the measurements.
+    """
+    est = count_messages(req.messages, req.system, req.tools)
+    if not settings.local_working_set:
+        return req, est
+    guard = _window_guard(settings)
+    ceiling = min(settings.local_working_set_max_tokens, guard) if guard else settings.local_working_set_max_tokens
+    target = min(settings.local_working_set_target_tokens, int(ceiling * 0.8))
+    res = working_set.bound(
+        req.messages,
+        req.system,
+        req.tools,
+        profile=profile,
+        target=target,
+        ceiling=ceiling,
+    )
+    if res.keep_from == 0 or res.overflow:
+        if res.overflow:
+            logger.warning(
+                "working set for %s cannot reach %s tokens (tail alone is %s) — "
+                "leaving it to the ladder",
+                profile, ceiling, res.tokens,
+            )
+        return req, est
+    trimmed = req.model_copy(deep=False)
+    trimmed.messages = res.messages
+    # Appended to the system prompt rather than injected as a message: the note
+    # has to be identical on every turn or it moves the prefix it is meant to
+    # keep still, and the system block is already rebuilt verbatim each time.
+    if isinstance(trimmed.system, str) and _TRIM_NOTE not in trimmed.system:
+        trimmed.system = trimmed.system + _TRIM_NOTE
+    logger.warning(
+        "⇢ WORKING SET [%s] kept %d/%d messages in≈%s (%s)",
+        profile, len(res.messages), len(req.messages), res.tokens,
+        "rebuilt" if res.rebuilt else "stable",
+    )
+    return trimmed, res.tokens
+
+
+async def _evict_outgoing_tier(base_url: str, model: str) -> None:
+    """Free the tier a route escalation just stopped using.
+
+    A `/model qwen` session that outgrows the 27B escalates to the 256K 4B
+    (see the ROUTE ESCALATE branch). Until 2026-09-05 nothing evicted the tier
+    it left: MODEL_ROUTES sessions never claimed a tier, so no breaker close
+    would ever release one, and Ollama holds a model for OLLAMA_KEEP_ALIVE
+    after its last request. The two therefore overlap by design.
+
+    On this host they do not fit. Measured 2026-09-05 with the 27B alone
+    resident: 22.0 GB wired of a ~27 GB ceiling on 36 GB of RAM. The 256K 4B
+    adds ~13 GB, so the escalation asks for ~35 GB and Ollama has to evict
+    something to serve it — with `OLLAMA_MAX_LOADED_MODELS=3` it is entitled to
+    try holding both first. `mlx_admin.resolve_profile` already guards the
+    MLX-versus-Ollama version of this collision for the same reason and cites
+    the same two kernel panics; the Ollama-to-Ollama ladder had no equivalent.
+
+    Evicting is skipped, not forced, while a local response is generating.
+    Unloading a tier mid-generation is what stalled a stream for six minutes on
+    2026-08-26, and a memory risk is the better trade against a certain outage.
+    """
+    if _local_inflight:
+        _deferred_evictions.add((base_url, model))
+        logger.info(
+            "escalation left %s resident with %d local response(s) still "
+            "streaming — deferring its eviction",
+            model, _local_inflight,
+        )
+        return
+    await ollama_admin.unload(base_url, model)
+
+
+async def _drain_deferred_evictions() -> None:
+    """Evict tiers whose escalation waited for the last local response."""
+    global _deferred_evictions
+    if _local_inflight or not _deferred_evictions:
+        return
+    due, _deferred_evictions = _deferred_evictions, set()
+    for base_url, model in due:
+        await ollama_admin.unload(base_url, model)
 
 
 async def _release_deferred(
@@ -557,21 +767,50 @@ async def _release_deferred(
         await ollama_admin.unload(base_url, model)
 
 
-async def _tracked_failover_stream(
-    inner: AsyncIterator[str], settings: Settings
+async def _tracked_local_stream(
+    inner: AsyncIterator[str],
+    settings: Settings,
+    *,
+    tier: tuple[str, str] | None = None,
+    lock_timeout: float = 0.0,
+    keep_alive: str = "",
 ) -> AsyncIterator[str]:
-    """Hold a failover response's tier claim open for as long as it generates."""
-    _failover_stream_started()
+    """Hold a local response's tier open for as long as it generates.
+
+    Wrapped around every locally served stream, failover or deliberate route.
+    A failover stream additionally holds a breaker CLAIM; a route stream holds
+    only the in-flight count, which is enough to stop an escalation evicting
+    the model underneath it.
+
+    `tier` also takes the serialization lock, acquired HERE rather than in the
+    handler: a client that hangs up before the first chunk never starts this
+    generator, and a lock taken in the handler would then be released by
+    nobody. Acquiring inside means the lock's lifetime is exactly the
+    generator's.
+    """
+    _local_stream_started()
     try:
-        async for event in inner:
-            yield event
+        if tier is not None:
+            async with tier_lock.hold(tier[0], tier[1], timeout=lock_timeout):
+                async for event in inner:
+                    yield event
+        else:
+            async for event in inner:
+                yield event
     finally:
-        due = _failover_stream_ended()
-        if due:
-            try:
+        due = _local_stream_ended()
+        try:
+            if due:
                 await _release_deferred(due, settings)
-            except Exception:  # release is housekeeping; never mask the response
-                logger.exception("deferred tier release failed")
+            await _drain_deferred_evictions()
+            # Re-clamped AFTER the response as well as before it. The clamp
+            # before is what the tests exercise; this one is what a session
+            # measured on 2026-09-05 needed, when the residency timer read the
+            # global default right after a routed stream finished.
+            if tier is not None and keep_alive:
+                await ollama_admin.set_keep_alive(tier[0], tier[1], keep_alive)
+        except Exception:  # release is housekeeping; never mask the response
+            logger.exception("deferred tier release failed")
 
 
 async def _try_upstream(request: Request, body: bytes, settings: Settings):
@@ -591,20 +830,38 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
         # VPN diagnosis meant correlating banners against a log that never
         # mentioned them. Every transport failure gets a line.
         logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
-        if br.record_failure(type(e).__name__):
+        if await _record_failure(br, type(e).__name__):
             return None
         raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
-    if uresp.status_code in FAILOVER_STATUSES:
+    if uresp.status_code in FAILOVER_STATUSES or uresp.status_code == 404:
         err_body = await uresp.aread()  # decoded: content-encoding is undone here
         err_headers = _decoded_relay_headers(uresp)
         await uresp.aclose()
-        if br.record_failure(f"HTTP {uresp.status_code}", transport_error=False):
-            return None
-        # Below the threshold: relay the error verbatim so the client's own
-        # retry/backoff logic still runs (a lone 429 is normal backpressure).
+        edge_404 = is_provider_edge_404(uresp.status_code, uresp.headers, err_body)
+        if uresp.status_code in FAILOVER_STATUSES or edge_404:
+            reason = "HTTP 404 provider edge" if edge_404 else f"HTTP {uresp.status_code}"
+            if edge_404:
+                logger.warning(
+                    "Anthropic provider edge returned an unstructured 404; "
+                    "counting it as outage evidence"
+                )
+            if await _record_failure(
+                br, reason, transport_error=False, confirmed_service_failure=edge_404
+            ):
+                return None
+            # Below the threshold: relay the error verbatim so the client's own
+            # retry/backoff logic still runs (a lone 429 is normal backpressure).
+            return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
+
+        # A structured API 404 is a valid response (for example, an invalid
+        # model). Keep it visible and let it close a half-open breaker.
+        was_open = br.open
+        await _record_success(br)
+        if was_open:
+            await _release_claims(br, settings)
         return Response(content=err_body, status_code=uresp.status_code, headers=err_headers)
     was_open = br.open
-    br.record_success()
+    await _record_success(br)
     if was_open:
         # The breaker just closed, so every tier it caused to be loaded is now
         # dead weight — unless a failover response is still generating from one.
@@ -679,6 +936,9 @@ async def create_message(
     # router may clamp and later evict on its own — see ollama_admin.
     failed_over = False
     context_prepared: PreparedContext | None = None
+    # Set by the two early bounding sites so the backstop below does not bound
+    # the same request twice — harmless but it would log twice and re-count.
+    bounded = False
 
     if settings.router_mode == "hybrid":
         model = _model_from_body(body)
@@ -710,10 +970,10 @@ async def create_message(
                 context_settings = _profile_context_settings(
                     load_profile_settings(profile), router_settings
                 )
-                # The router-level QWEN_COGNEE=0 escape hatch must survive the
+                # The router-level QWEN_MEMORY=0 escape hatch must survive the
                 # profile load, including true offline failover.
-                if not settings.qwen_cognee:
-                    context_settings.qwen_cognee = False
+                if not settings.qwen_memory:
+                    context_settings.qwen_memory = False
                 prepared_req = await prepare_external_context(fr, context_settings)
                 fr = prepared_req
                 if settings.failover_bare:
@@ -725,18 +985,29 @@ async def create_message(
                     )
                     bare_req = stripped  # only on success: make_bare is pure
                     fr = stripped
+                # Bound before sizing: a session trimmed to the working set
+                # usually fits the strong tier, and picking the tier from the
+                # untrimmed count would send it to the wide 4B for tokens the
+                # local model is never going to be shown. Virtualization does the
+                # same job by a different route, so it replaces the working-set
+                # bound rather than stacking on it; either way the request is
+                # bounded and `est` reflects what the local model will prefill.
                 if context_settings.context_virtualization:
                     context_prepared = await _prepare_claude_local(
                         fr, context_settings, failed_over=True
                     )
                     fr = context_prepared.payload
-                    if bare_req is not None:
-                        bare_req = fr
-                    else:
-                        prepared_req = fr
                     est = context_prepared.token_count
                 else:
-                    est = count_messages(fr.messages, fr.system, fr.tools)
+                    fr, est = _bound_working_set(fr, profile, settings)
+                bounded = True
+                # Write the bound result back to whichever object the dispatch
+                # below actually sends: bare mode's copy when stripping ran,
+                # the external-context copy when it did not.
+                if bare_req is not None:
+                    bare_req = fr
+                else:
+                    prepared_req = fr
                 profile = pick_failover_profile(est)
             except ContextLimitError:
                 logger.warning("Claude failover context cannot fit the local hard limit")
@@ -780,8 +1051,9 @@ async def create_message(
                     ),
                     tool_result_chars=settings.failover_tool_result_chars,
                 )
+                stripped, est = _bound_working_set(stripped, profile, settings)
+                bounded = True
                 bare_req = stripped  # only on success: make_bare is pure
-                est = count_messages(stripped.messages, stripped.system, stripped.tools)
 
                 if settings.context_virtualization:
                     context_prepared = await _prepare_claude_local(
@@ -796,17 +1068,36 @@ async def create_message(
                 # not the transcript, so a long-lived route session outgrows its
                 # window; MODEL_ROUTES is static and would keep sending it there
                 # forever. Escalate instead of failing.
-                if settings.route_max_input_tokens and est > settings.route_max_input_tokens:
+                limit = settings.route_max_input_tokens
+                guard = _window_guard(settings)
+                if guard:
+                    limit = min(limit, guard) if limit else guard
+                if limit and est > limit:
                     escalated = pick_failover_profile(est)
                     if escalated != profile:
                         logger.warning(
                             "⇢ ROUTE ESCALATE [%s → %s] in≈%s over %s",
                             profile, escalated, est, settings.route_max_input_tokens,
                         )
+                        # Captured BEFORE the swap: this is the tier the session
+                        # has been using, and the one that must go before the
+                        # bigger-window tier loads beside it.
+                        outgoing = (settings.provider_base_url, settings.provider_model)
                         profile = escalated
                         settings = _profile_context_settings(
                             load_profile_settings(profile), router_settings
                         )
+                        if outgoing != (settings.provider_base_url, settings.provider_model):
+                            try:
+                                await _evict_outgoing_tier(*outgoing)
+                            except Exception:
+                                # Its own guard: this sits inside the bare-mode
+                                # try, and a failure here is not a stripping
+                                # failure — reporting it as one would send the
+                                # request unstripped for no reason.
+                                logger.exception(
+                                    "could not evict %s after escalation", outgoing[1]
+                                )
 
                 logger.info(
                     "→ local [%s → %s] bare in≈%s (raw %s)",
@@ -905,6 +1196,20 @@ async def create_message(
     if client is None:
         client = get_provider_client()
 
+    # Backstop for every local path the two early call sites do not cover —
+    # profile mode (which is what the `qwen` wrapper runs, so it is the common
+    # case in daily use) and any profile whose ROUTE_BARE is off. Gated on the
+    # provider being a local Ollama tier: the ceiling is a property of this
+    # machine's GPU, and applying it to a hosted provider would throw away
+    # context for nothing.
+    if not bounded and ollama_admin.is_ollama(settings.provider_base_url):
+        try:
+            req, _ = _bound_working_set(
+                req, settings.provider_model or "profile", settings
+            )
+        except Exception:
+            logger.exception("working set failed; sending the request untrimmed")
+
     est_in = count_messages(req.messages, req.system, req.tools)
 
     # Last-resort tier guard, deliberately placed AFTER every routing branch so
@@ -921,7 +1226,12 @@ async def create_message(
     # same model. Tiers that opt out (route_max_input_tokens unset, i.e. the
     # wide 64K/256K ones) are unaffected, which also stops a second escalation
     # firing on top of the hybrid branch's.
-    if settings.route_max_input_tokens and est_in > settings.route_max_input_tokens:
+    evicting: tuple[str, str] | None = None
+    tier_limit = settings.route_max_input_tokens
+    tier_guard = _window_guard(settings)
+    if tier_guard:
+        tier_limit = min(tier_limit, tier_guard) if tier_limit else tier_guard
+    if tier_limit and est_in > tier_limit:
         try:
             escalated = pick_failover_profile(est_in)
             esettings = _profile_context_settings(
@@ -931,8 +1241,9 @@ async def create_message(
                 logger.warning(
                     "⇢ TIER ESCALATE [%s → %s] in≈%s over %s",
                     settings.provider_model, esettings.provider_model,
-                    est_in, settings.route_max_input_tokens,
+                    est_in, tier_limit,
                 )
+                evicting = (settings.provider_base_url, settings.provider_model)
                 settings = esettings
                 client = _get_profile_client(escalated, esettings)
         except Exception:
@@ -940,6 +1251,16 @@ async def create_message(
             # it to the original tier reproduces the old behaviour — an honest
             # provider error — which beats dropping it here.
             logger.exception("tier escalation failed; staying on %s", settings.provider_model)
+            evicting = None
+
+    # Outside the try above so a failure here cannot be mistaken for a failed
+    # escalation, and outside the branch so the swap is already committed: the
+    # tier being freed is one this request has stopped using either way.
+    if evicting is not None:
+        try:
+            await _evict_outgoing_tier(*evicting)
+        except Exception:  # freeing memory must not cost the request
+            logger.exception("could not evict %s after escalation", evicting[1])
 
     # Runtime supervision must sit after BOTH router-mode branches and after
     # size escalation. The qwen wrapper uses profile mode on :8082, so keeping
@@ -977,60 +1298,89 @@ async def create_message(
         # would leave the real 13 GB tier resident.
         br = get_breaker(get_settings())
         br.note_claim(settings.provider_base_url, provider)
-        # Re-clamped per request because Ollama resets the timer to the global
-        # OLLAMA_KEEP_ALIVE on every inference call; setting it once at load
-        # would be undone by the second request of the outage.
-        if settings.provider_keep_alive:
-            await ollama_admin.set_keep_alive(
-                settings.provider_base_url, provider, settings.provider_keep_alive
-            )
+
+
+    # Residency is clamped for EVERY local tier that declares it, not only the
+    # failover ones. Re-clamped per request because Ollama resets the timer to
+    # the global OLLAMA_KEEP_ALIVE on every inference call, so setting it once
+    # at load would be undone by the next turn.
+    #
+    # A failover tier uses this to be released EARLY (45s: nobody asked for it).
+    # A route tier uses it for the opposite reason. The working set keeps a
+    # session's prefix byte-stable so each turn is a 5-10s append, but that
+    # only holds while Ollama still has the cache — and the global timer is 5
+    # minutes, so any think-time longer than that silently re-imposes a cold
+    # prefill of 70-100s at 18K. Extending residency past ordinary think-time
+    # is what makes the stable prefix worth having.
+    if settings.provider_keep_alive and ollama_admin.is_ollama(settings.provider_base_url):
+        await ollama_admin.set_keep_alive(
+            settings.provider_base_url, provider, settings.provider_keep_alive
+        )
 
     if req.stream:
         input_tokens = est_in
+        def _local_stream_body() -> AsyncIterator[str]:
+            # Tracking and the tier lock belong to the generation, so they sit
+            # inside the factory. `stream_once` runs this for the first caller of
+            # a request hash only; every other caller replays that caller's
+            # events and must not take the lock, or it would wait on a tier the
+            # leader still needs to finish producing.
+            #
+            # Every local stream, not only the failover ones. A deliberate
+            # `/model qwen` route holds no breaker claim — closing must not
+            # release a tier it never claimed — but it does hold the GPU, and an
+            # escalation on a second session must not evict the model this one is
+            # generating on. The claim and the in-flight count answer different
+            # questions.
+            return _tracked_local_stream(
+                _stream(client, payload, msg_id, req, input_tokens, provider,
+                        settings.provider_strip_inline_thinking, window_settings=settings),
+                get_settings(),
+                tier=(
+                    (settings.provider_base_url, provider)
+                    if ollama_admin.is_ollama(settings.provider_base_url)
+                    else None
+                ),
+                lock_timeout=settings.local_tier_lock_timeout_seconds,
+                keep_alive=settings.provider_keep_alive,
+            )
+
         if context_prepared is not None:
             runtime = _get_claude_context_runtime(settings)
-            body = runtime.stream_once(
-                context_prepared.request_hash,
-                lambda: _stream(
-                    client,
-                    payload,
-                    msg_id,
-                    req,
-                    input_tokens,
-                    provider,
-                    settings.provider_strip_inline_thinking,
-                ),
-            )
+            body = runtime.stream_once(context_prepared.request_hash, _local_stream_body)
         else:
-            body = _stream(
-                client,
-                payload,
-                msg_id,
-                req,
-                input_tokens,
-                provider,
-                settings.provider_strip_inline_thinking,
-            )
-        if failed_over:
-            # Only the failover path: a deliberate `/model qwen` loads a tier
-            # too, but the breaker never claimed it and closing must not
-            # release it, so it has nothing to hold open.
-            body = _tracked_failover_stream(body, get_settings())
+            body = _local_stream_body()
         return StreamingResponse(
             body,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    # Non-streaming responses hold the tier just as a stream does; a completion
+    # that takes minutes to prefill is exactly when an escalation elsewhere
+    # would like to evict the model it is prefilling on.
+    _local_stream_started()
     try:
+        async def _complete_local() -> dict:
+            # The tier lock is the generation's, so it sits inside the factory:
+            # run_complete_once gives every caller of a request hash the SAME
+            # task, and only the one that created it runs this.
+            if ollama_admin.is_ollama(settings.provider_base_url):
+                async with tier_lock.hold(
+                    settings.provider_base_url,
+                    provider,
+                    timeout=settings.local_tier_lock_timeout_seconds,
+                ):
+                    return await client.complete(payload)
+            return await client.complete(payload)
+
         if context_prepared is not None:
             runtime = _get_claude_context_runtime(settings)
             resp = await runtime.run_complete_once(
-                context_prepared.request_hash,
-                lambda: client.complete(payload),
+                context_prepared.request_hash, _complete_local
             )
         else:
-            resp = await client.complete(payload)
+            resp = await _complete_local()
     except ProviderError as e:
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)
@@ -1053,19 +1403,32 @@ async def create_message(
         raise HTTPException(
             status_code=status, detail=f"local provider {provider} unreachable: {e}"
         ) from e
-
-    result = nim_response_to_anthropic(
-        resp, req, msg_id, settings.provider_strip_inline_thinking
-    )
-    usage = result.get("usage", {})
-    logger.info(
-        "← %s [%s] stop=%s out_tokens=%s in_tokens=%s",
-        provider, mode,
-        result.get("stop_reason"),
-        usage.get("output_tokens"),
-        usage.get("input_tokens"),
-    )
-    return result
+    else:
+        result = nim_response_to_anthropic(
+            resp, req, msg_id, settings.provider_strip_inline_thinking
+        )
+        usage = result.get("usage", {})
+        logger.info(
+            "← %s [%s] stop=%s out_tokens=%s in_tokens=%s",
+            provider, mode,
+            result.get("stop_reason"),
+            usage.get("output_tokens"),
+            usage.get("input_tokens"),
+        )
+        _note_provider_count(provider, est_in, usage.get("input_tokens"), settings)
+        if settings.provider_keep_alive and ollama_admin.is_ollama(settings.provider_base_url):
+            await ollama_admin.set_keep_alive(
+                settings.provider_base_url, provider, settings.provider_keep_alive
+            )
+        return result
+    finally:
+        due = _local_stream_ended()
+        try:
+            if due:
+                await _release_deferred(due, get_settings())
+            await _drain_deferred_evictions()
+        except Exception:  # housekeeping must not mask the response
+            logger.exception("deferred tier release failed")
 
 
 async def _stream(
@@ -1076,6 +1439,7 @@ async def _stream(
     input_tokens: int,
     provider: str,
     strip_inline_thinking: bool = False,
+    window_settings: Settings | None = None,
 ) -> AsyncIterator[str]:
     # Backends that leave <think> tags in `content` rather than filling
     # `reasoning`; see Settings.provider_strip_inline_thinking.
@@ -1102,9 +1466,14 @@ async def _stream(
                 pending = None
                 break
             pending = None
+            if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+                state["provider_prompt_tokens"] = chunk["usage"].get("prompt_tokens")
             for event in stream_openai_to_anthropic(chunk, state, msg_id, req, input_tokens):
                 yield event
-        logger.info("← %s [stream] done in_tokens=%s", provider, input_tokens)
+        logger.info("← %s [stream] done in_tokens=%s provider_in=%s", provider, input_tokens,
+                    state.get("provider_prompt_tokens"))
+        if window_settings is not None:
+            _note_provider_count(provider, input_tokens, state.get("provider_prompt_tokens"), window_settings)
     except ProviderError as e:
         logger.error("Provider stream error %s: %s", e.status_code, e.message)
         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':e.message}})}\n\n"

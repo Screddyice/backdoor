@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import subprocess
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)

@@ -65,7 +65,58 @@ def test_decode_codex_body_rejects_unsupported_or_malformed_requests(
     assert caught.value.status_code == status
 
 
-def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
+def test_build_local_payload_replays_stable_history_ahead_of_the_active_turn():
+    """The reverse of "start at the active user", and the reason is measured.
+
+    Sending the active turn alone keeps the prompt small and guarantees a cold
+    prefill on every turn, because the head changes with every new instruction.
+    Real Codex turns from this machine's log ran 20-45s for 3-7K tokens, while
+    the single turn that happened to repeat a prompt cost 1.3s. Replaying stable
+    history costs more tokens and much less time — but only while it is STABLE,
+    which is what the sticky boundary in working_set provides.
+
+    What must still never appear is anything cloud-only: hosted tool
+    advertisements, developer instructions the local preamble replaced, and
+    prompt-cache identifiers.
+    """
+    cloud = load_request()
+    local, budget = build_local_payload(cloud, ["decision one"], Settings())
+    rendered = json.dumps(local)
+
+    assert "older task" in rendered, "history was dropped; every turn stays cold"
+    assert "active task" in rendered
+    assert "cloud-only instructions" not in rendered
+    assert "cloud-only" not in rendered
+    assert "remove-me" not in rendered
+    assert budget.input_tokens <= 28_000
+
+    roles = [item.get("role") for item in local["input"]]
+    assert roles[0] == "developer", "the local preamble must open the prompt"
+    memory_index = next(
+        i for i, item in enumerate(local["input"])
+        if "Relevant context recalled from local memory" in json.dumps(item)
+    )
+    active_index = next(
+        i for i, item in enumerate(local["input"]) if "active task" in json.dumps(item)
+    )
+    assert memory_index < active_index, "memories must precede the instruction"
+    assert memory_index > 1, (
+        "the memory block is rebuilt from a fresh query every turn; putting it "
+        "ahead of the history makes the history unreusable"
+    )
+
+
+def test_history_is_dropped_when_the_active_turn_needs_the_budget():
+    """History spends leftovers only, so a large instruction still fits."""
+    cloud = load_request()
+    local, _ = build_local_payload(
+        cloud, [], Settings(codex_history_budget_tokens=0)
+    )
+
+    assert "older task" not in json.dumps(local), "history ignored its budget"
+
+
+def test_build_local_payload_starts_at_active_user_and_injects_memory_context():
     cloud = load_request()
     local, budget = build_local_payload(
         cloud,
@@ -77,22 +128,29 @@ def test_build_local_payload_starts_at_active_user_and_injects_cognee_context():
 
     assert local["model"] == "qwen3.8:27b-obliterated"
     assert local["stream"] is True
-    assert "Relevant context recalled from local Cognee" in text
+    assert "Relevant context recalled from local memory" in text
     assert "decision one" in text
     assert "active task" in text
     assert "bounded result" in rendered
-    assert "older task" not in rendered
-    assert "older answer" not in rendered
     assert "cloud-only instructions" not in rendered
     assert "cloud-only" not in rendered
     assert "remove-me" not in rendered
     assert budget.input_tokens <= 28_000
     assert local["input"][0]["role"] == "developer"
     assert "decision one" not in json.dumps(local["input"][0])
-    assert local["input"][1]["role"] == "user"
-    assert "Relevant context recalled from local Cognee" in json.dumps(
-        local["input"][1]
+    # Position asserted by test_build_local_payload_replays_stable_history_ahead
+    # _of_the_active_turn; here only that the block is its own item, not merged
+    # into the preamble or an ordinary turn.
+    assert any(
+        "Relevant context recalled from local memory" in json.dumps(item)
+        for item in local["input"]
     )
+
+
+def test_build_local_payload_disables_unverifiable_ollama_reasoning_items():
+    local, _ = build_local_payload(load_request(), [], Settings())
+
+    assert local["reasoning"] == {"effort": "none"}
 
 
 def test_build_local_payload_drops_cloud_only_items_after_active_user():
@@ -583,3 +641,80 @@ def test_codex_component_budgets_must_fit_context_window():
             codex_tools_budget_tokens=20,
             codex_active_turn_budget_tokens=21,
         )
+
+
+def _turn(role: str, text: str) -> dict:
+    return {"type": "message", "role": role,
+            "content": [{"type": "input_text", "text": text}]}
+
+
+def _conversation(n: int, tag: str = "s1") -> dict:
+    items = [_turn("user", f"[{tag}] start the task")]
+    for i in range(n):
+        items.append(_turn("assistant", f"[{tag}] step {i} " + "detail " * 40))
+        items.append(_turn("user", f"[{tag}] follow-up {i} " + "context " * 40))
+    return {"model": "gpt-5", "input": items, "stream": True}
+
+
+def test_the_codex_prefix_is_stable_across_turns():
+    """The property the whole change exists for.
+
+    Turn N's payload must OPEN with turn N-1's payload, or Ollama has nothing to
+    reuse and every turn is a cold prefill — which is what the active-turn-only
+    build guaranteed. Measured 2026-09-05: appending to a prefix the model holds
+    costs 5-10s where the same content cold costs 26-136s.
+    """
+    from src.proxy import working_set
+
+    working_set.reset()
+    settings = Settings()
+    first, _ = build_local_payload(_conversation(6), [], settings)
+    grown = _conversation(6)
+    grown["input"].extend([_turn("assistant", "acknowledged"), _turn("user", "next question")])
+    second, _ = build_local_payload(grown, [], settings)
+    working_set.reset()
+
+    first_history = [i for i in first["input"] if "step" in json.dumps(i)]
+    second_history = [i for i in second["input"] if "step" in json.dumps(i)]
+    assert first_history, "no history was replayed at all"
+    assert second_history[: len(first_history)] == first_history, (
+        "the replayed history changed between turns; every turn would be a cold "
+        "prefill and the change would cost more than it saves"
+    )
+
+
+def test_a_new_conversation_does_not_inherit_another_s_boundary():
+    from src.proxy import working_set
+
+    working_set.reset()
+    settings = Settings()
+    build_local_payload(_conversation(6, "a"), [], settings)
+    other, _ = build_local_payload(_conversation(2, "b"), [], settings)
+    working_set.reset()
+
+    assert "[b]" in json.dumps(other) and "[a]" not in json.dumps(other)
+
+
+def test_history_never_opens_on_a_call_output_whose_call_was_dropped():
+    """A function_call_output without its function_call is meaningless, and a
+    provider that validates the shape rejects it."""
+    from src.proxy import working_set
+
+    working_set.reset()
+    items = [_turn("user", "start")]
+    for i in range(8):
+        items.append({"type": "function_call", "call_id": f"c{i}", "name": "bash",
+                      "arguments": "{}"})
+        items.append({"type": "function_call_output", "call_id": f"c{i}",
+                      "output": "result " * 200})
+    items.append(_turn("user", "what now?"))
+    local, _ = build_local_payload(
+        {"model": "gpt-5", "input": items, "stream": True}, [],
+        Settings(codex_history_budget_tokens=800),
+    )
+    working_set.reset()
+
+    calls = {i.get("call_id") for i in local["input"] if i.get("type") == "function_call"}
+    for item in local["input"]:
+        if item.get("type") == "function_call_output":
+            assert item.get("call_id") in calls, "an orphan tool output was replayed"

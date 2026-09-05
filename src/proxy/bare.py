@@ -17,9 +17,8 @@ out of control.
 
 What gets stripped, in descending order of how much it costs:
 
-  * **Tool definitions.** All of them except an explicit keep-list (Mem0, so
-    the failover model can still reach durable memory). A local model cannot
-    usefully drive the harness mid-outage anyway.
+  * **Tool definitions.** All of them except an explicit keep-list. A local
+    model cannot usefully drive the harness mid-outage anyway.
   * **Tool results in the transcript.** Truncated to a budget. A single Read of
     a large file can outweigh the entire rest of a conversation.
   * **Images.** Replaced by a placeholder. Base64 image data is enormous and
@@ -72,11 +71,9 @@ from .models import MessagesRequest, Message
 # measured on this machine came from MCP servers, not from the dozen local tools, so dropping `mcp__*`
 # removes nearly all of the cost and nearly none of the offline capability.
 #
-# Mem0 is the interesting case and it belongs on the dropped side. Its MCP tools
-# call mcp.mem0.ai and cannot work offline, but local Mem0 recall still reaches
-# the model anyway: the hook reads ~/.mem0-local/cache.db client-side and
-# injects memories into the prompt BEFORE the request is sent, which bare mode
-# preserves as ordinary text.
+# Remote memory tools belong on the dropped side. Local claude-mem recall still
+# reaches the model because the proxy reads ~/.claude-mem/claude-mem.db and
+# injects the result before the request is sent. Bare mode preserves that text.
 #
 # REQUIRED: the failover tier must accept tool definitions. deepseek-r1 does
 # not, and Ollama answers a request carrying them with HTTP 400 ("does not
