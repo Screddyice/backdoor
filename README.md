@@ -1705,15 +1705,16 @@ the bridge as an open HTTP proxy.
 The bridge reuses `src/hermes_mcp/oauth.py` for dynamic client registration, PKCE, one-hour access
 tokens, and rotating refresh tokens. It keeps product authorization separate behind the bridge:
 HyperCrawl uses its tenant REST token, HyperScale uses its organization API key, and EngageMate
-uses its internal key plus explicit user ID. Credentials stay in their existing protected
-environment files. The Claude connector receives only the public MCP URL.
+uses its internal key plus explicit user ID. Store each product's credentials in a protected
+Hermes-owned `%h/.config/products-mcp/<name>.env` file. The Claude connector receives only the
+public MCP URL.
 
 Deploy this branch in `~/backdoor-products-mcp`, then install
 [`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start
 the `hypercrawl`, `hyperscale`, and `engagemate` instances. Each instance loads its matching
-`deploy/products-mcp-<name>.env` file after the shared credential files, so its bind address, port,
-OAuth issuer, state path, and product selection take precedence. The separate checkout keeps
-connector updates from changing the live router or Hermes bridge.
+`%h/.config/products-mcp/<name>.env` credential file before `deploy/products-mcp-<name>.env`, so
+its bind address, port, OAuth issuer, state path, and product selection take precedence. The
+separate checkout keeps connector updates from changing the live router or Hermes bridge.
 
 Merge [`deploy/products-mcp.Caddyfile`](deploy/products-mcp.Caddyfile) into the host Caddyfile and
 add each public `/mcp` URL as a separate Claude custom connector. For each endpoint, complete OAuth,

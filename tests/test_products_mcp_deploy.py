@@ -17,10 +17,13 @@ def _environment(path: Path) -> dict[str, str]:
 
 def test_product_runtime_overrides_load_after_shared_credential_files() -> None:
     unit = (ROOT / "deploy/products-mcp-http@.service").read_text()
+    credential_file = "%h/.config/products-mcp/%i.env"
     runtime_file = "%h/backdoor-products-mcp/deploy/products-mcp-%i.env"
 
+    assert "/root/" not in unit
+    assert credential_file in unit
     assert runtime_file in unit
-    assert unit.index(runtime_file) > unit.index("/root/engagemate/src/deploy/.env.api")
+    assert unit.index(runtime_file) > unit.index(credential_file)
 
 
 def test_product_runtimes_have_unique_oauth_and_network_boundaries() -> None:
