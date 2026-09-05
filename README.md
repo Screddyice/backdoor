@@ -470,10 +470,11 @@ existing whole-machine connectivity gate.
 The visible Codex thread does not change. Qwen receives a fresh internal request containing:
 
 - the latest user instruction and the active local tool loop, including a paired tool continuation that does not repeat the user message;
+- a bounded, sticky slice of earlier user and assistant history ahead of the active turn, so the local model can reuse a stable KV prefix;
 - a bounded recall from the local claude-mem replica when `QWEN_MEMORY` is enabled;
 - local Code Mode tools converted from Codex's Responses Lite namespace format.
 
-It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Backdoor reads the synced local replica at `~/.claude-mem/claude-mem.db`, so recall works without a network call or memory tunnel. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_MEMORY=0` to suppress memory reads and writes on the local path.
+It does not receive the full old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Backdoor reads the synced local replica at `~/.claude-mem/claude-mem.db`, so recall works without a network call or memory tunnel. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_MEMORY=0` to suppress memory reads and writes on the local path.
 
 Backdoor sets `reasoning.effort=none` on the local Responses request so Ollama answers with a plain assistant message. Ollama's own reasoning items carry `encrypted_content` signed locally, which ChatGPT cannot verify once the breaker closes; a thread carrying them cannot go back to cloud inference. Keeping them out of Codex history is what lets the same task return to cloud.
 
@@ -1046,13 +1047,12 @@ The backend must also return usable summary text. On 2026-08-28 the action-tuned
 
 A short window works only when durable facts live outside the prompt. Backdoor reads the local claude-mem SQLite replica before each local turn and injects a bounded result as background context. This adds no MCP schema and still works when the network is down. `QWEN_MEMORY=0` disables recall.
 
-Automatic Qwen context compaction is specified for both Claude Messages and Codex Responses.
-When either client switches a mature task to Qwen, Backdoor will archive the exact transcript
-locally and send the 32K model a bounded 18K–22K working set. Cloud requests keep the full client
-history. Cognee remains an optional durable-memory layer rather than an outage dependency. See
+Automatic Qwen context virtualization is specified for both Claude Messages and Codex Responses.
+When either client switches a mature task to Qwen, Backdoor archives the exact transcript locally
+and sends the 32K model a bounded 18K–22K working set selected without a model-generated summary.
+Cloud requests keep the full client history. Durable recall comes from the local claude-mem
+replica; Cognee is not in the request path. See
 [`docs/superpowers/specs/2026-09-04-automatic-qwen-context-compaction-design.md`](docs/superpowers/specs/2026-09-04-automatic-qwen-context-compaction-design.md).
-
-A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
 
 Large fetched pages also bypass the model window at the proxy layer. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted to the local claude-mem worker. Browser-session tools never persist their output.
 
@@ -1736,8 +1736,8 @@ over its summaries, observations and prompts (read-only, 1.5 s timeout, fail-ope
 `external_context.remember_document` posts fetched documents to the local worker on
 `127.0.0.1:37701` as verbatim prompts, which the worker queues durably and syncs to the
 cmem.ai hub. Cognee and Mem0 are gone: no tunnel, no API key, no HTTP recall.
-The superseded Cognee failover design and implementation plan were removed from `docs/` so no
-operator can mistake them for a supported recovery path; Git history retains the old design.
+Older Cognee failover designs are superseded by the local claude-mem path; design documents that
+remain under `docs/` must name claude-mem rather than a remote memory tunnel.
 
 Settings renamed with it: `codex_memory_timeout_seconds`, `codex_memory_top_k`,
 `codex_memory_char_budget`, `qwen_memory` (env `QWEN_MEMORY`), plus

@@ -615,7 +615,9 @@ def build_local_payload(
     )
     input_items.extend(history)
 
+    memory_index: int | None = None
     if memory_lines:
+        memory_index = len(input_items)
         input_items.append(
             {
                 "type": "message",
@@ -687,8 +689,8 @@ def build_local_payload(
 
     max_input = settings.codex_context_window - settings.codex_reply_reserve_tokens
     input_tokens = estimate_codex_tokens(local)
-    if input_tokens > max_input and memory_lines:
-        input_items.pop(1)
+    if input_tokens > max_input and memory_index is not None:
+        input_items.pop(memory_index)
         memory_tokens = 0
         trimmed += len(memory_lines)
         input_tokens = estimate_codex_tokens(local)

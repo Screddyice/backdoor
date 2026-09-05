@@ -1,4 +1,4 @@
-# Automatic Qwen Context Compaction
+# Automatic Qwen Context Virtualization
 
 **Status:** Draft for review
 **Date:** 2026-09-04
@@ -23,7 +23,7 @@ The feature covers four entry paths:
 - Codex breaker-driven outage failover
 
 The 27B model will remain at its measured 32K daily configuration. A 64K profile may remain an
-operator experiment, but automatic compaction will not depend on it.
+operator experiment, but automatic virtualization will not depend on it.
 
 ## Problem
 
@@ -53,9 +53,9 @@ set across both client protocols.
 2. Send no local provider request above its proven input limit.
 3. Preserve the exact client transcript locally before selecting a smaller working set.
 4. Keep cloud traffic byte-faithful and free from local-window limits.
-5. Preserve the current instruction and active tool state across compaction.
+5. Preserve the current instruction and active tool state across local selection.
 6. Retrieve useful older context without a network dependency.
-7. Use Cognee for approved durable memory when it is reachable.
+7. Use the local claude-mem replica for durable recall.
 8. Coalesce identical retries so several clients do not prefill the same prompt at once.
 9. Keep the live router disabled until isolated acceptance tests pass.
 
@@ -63,7 +63,7 @@ set across both client protocols.
 
 - Invoking Claude Code's `/compact` command from the server
 - Changing Claude or Codex context meters
-- Sending full private transcripts to Cognee
+- Sending full private transcripts to any remote memory service
 - Paging a model's KV cache between requests
 - Expanding the default 27B context above 32K
 - Changing cloud request bodies, responses, or provider selection
@@ -77,7 +77,7 @@ client-specific adapters.
 
 This approach has three advantages over model-generated summarization:
 
-- The first compaction never asks a model to read the oversized prompt that caused the failure.
+- The first selection never asks a model to read the oversized prompt that caused the failure.
 - Exact transcript segments remain available for later retrieval.
 - Tests can prove which content survives and enforce the final token bound.
 
@@ -92,9 +92,9 @@ than a validated setting for the current GGUF. An isolated GGUF canary must prov
 latency before that profile can become supported. Larger windows consume the remaining Metal
 headroom and make long prefills unresponsive.
 
-**Use Cognee as the transcript store.** Cognee provides durable semantic memory while reachable.
-The Mac reaches it through a tunnel to a remote host, so an internet outage can remove memory at
-the same moment Backdoor needs failover. Backdoor will keep outage continuity local.
+**Use a remote memory service as the transcript store.** Remote semantic memory is useful only
+while reachable, so an internet outage can remove memory at the same moment Backdoor needs
+failover. Backdoor keeps outage continuity local.
 
 ## Architecture
 
@@ -118,7 +118,7 @@ Neither adapter may leave an orphaned call or result in the compacted request.
 
 ### 2. Trigger placement
 
-The compaction gate will run after Backdoor chooses a local Qwen route and applies bare-mode and
+The virtualization gate will run after Backdoor chooses a local Qwen route and applies bare-mode and
 external-context reduction, but before tier selection and provider invocation:
 
 ```text
@@ -128,7 +128,7 @@ receive request
   -> remove cloud-only prompt material
   -> reduce approved oversized tool results
   -> estimate normalized local input
-  -> compact when input exceeds 22K
+  -> select a stable working set when input exceeds 22K
   -> enforce exact token gate
   -> choose Qwen tier
   -> call provider
@@ -170,23 +170,25 @@ The final gate will serialize the Qwen provider prompt and count it with a match
 tokenizer. The 32K profile will enforce a 22K input ceiling, leaving room for templates and output.
 Backdoor will refuse the provider call if it cannot prove that the payload fits.
 
-### 5. Cognee integration
+### 5. Local memory integration
 
-Cognee will remain an optional second memory layer:
+The local claude-mem replica supplies durable facts across tasks without adding a network
+dependency:
 
-- The context engine may inject a bounded recall result when Cognee responds within its timeout.
-- Backdoor may store approved public fetched sources under the existing source policy.
+- The context engine may inject a bounded recall result from `~/.claude-mem/claude-mem.db`.
+- Backdoor may store approved public fetched sources through the local worker under the existing
+  source policy.
 - Backdoor will not upload the private transcript archive.
-- A Cognee error will not stop local compaction or Qwen generation.
+- A claude-mem read or worker error will not stop local selection or Qwen generation.
 
-Local FTS5 supplies task continuity during an outage. Cognee supplies durable facts across tasks
-while the remote service is reachable.
+Lineage-scoped FTS5 in the private archive supplies task continuity during an outage. The
+claude-mem replica supplies durable facts across tasks while remaining local to the Mac.
 
 ### 6. Response continuity
 
 Backdoor will return the local Qwen response in the client's native protocol. Claude and Codex
 will append that response to their full task histories. Each later Qwen-bound turn will pass
-through the compaction gate again.
+through the virtualization gate again.
 
 After Backdoor returns to a cloud route, it will relay the client's full request without applying
 the local working set. The cloud model will see the original transcript plus the local responses
@@ -209,7 +211,7 @@ If Backdoor cannot build a request under the hard ceiling:
 
 Provider timeouts will retain the selected working set and request hash for a retry. Backdoor will
 not cache partial streams. Claude and Codex cloud traffic will bypass storage failures and local
-compaction errors.
+selection errors.
 
 The client may continue to display its estimate of the full task size. Backdoor will report honest
 provider usage for the compacted local request and will not falsify context metrics to change the
@@ -236,7 +238,7 @@ CONTEXT_HARD_INPUT_TOKENS=22000
 CONTEXT_ARCHIVE_MAX_BYTES=1073741824
 CONTEXT_ARCHIVE_INACTIVE_DAYS=30
 CONTEXT_RESPONSE_CACHE_SECONDS=600
-CONTEXT_COGNEE_RECALL=true
+QWEN_MEMORY=true
 ```
 
 Claude and Codex adapters will share the token and storage settings. Client-specific switches may
@@ -254,7 +256,7 @@ disable one adapter during staged validation, but the accepted end state enables
 - Database and WAL permissions
 - Archive soft-cap pruning
 - Retry coalescing and response-cache expiry
-- Cognee timeout and offline behavior
+- claude-mem timeout and offline behavior
 
 ### Integration tests
 
@@ -262,7 +264,7 @@ disable one adapter during staged validation, but the accepted end state enables
 - A 142K Codex task produces a bounded Qwen request and valid Responses SSE.
 - Deliberate model switches and breaker failover use the same engine.
 - Healthy Claude and Codex cloud paths remain byte-faithful.
-- SQLite, tokenizer, and Cognee failures preserve cloud service.
+- SQLite, tokenizer, and claude-mem failures preserve cloud service.
 - An orphaned call pair never reaches Qwen.
 
 ### Isolated acceptance canary
@@ -290,8 +292,8 @@ No agent will edit the detached service checkout, signal the router, or change l
 ## Success Criteria
 
 - A mature Claude or Codex task can switch to Qwen without sending more than 22K input tokens.
-- The current instruction and active call pairs survive compaction.
+- The current instruction and active call pairs survive local selection.
 - Qwen returns useful text within the local response deadline.
 - Cloud traffic remains byte-faithful.
-- Cognee and SQLite failures do not interrupt healthy cloud service.
+- claude-mem and SQLite failures do not interrupt healthy cloud service.
 - The 27B remains at 32K and does not exceed its measured memory envelope.
