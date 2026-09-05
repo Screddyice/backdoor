@@ -1324,6 +1324,38 @@ Two guards now, because either alone leaves a hole:
 
 Both go through Ollama's **native** API. `keep_alive` in a `/v1/chat/completions` body is silently ignored (verified against Ollama 0.32.13) and the model lands on the global default, so the clamp has to be a separate `/api/generate` call. With no `prompt` that call neither generates nor prefills — it returns `done_reason: "load"`, or `"unload"` for `keep_alive: 0`, and only touches the residency timer.
 
+### The clamp has to outlive the work it queues behind
+
+Sending the clamp is not the same as landing it. Between 2026-09-03 and
+2026-09-06 the live router attempted eleven clamps and **landed none of them**,
+so every route tier quietly ran on Ollama's global 5m timer — precisely the
+cold prefill `10m` exists to avoid. Two faults, each of which hid the other:
+
+* **The timeout was priced for a cheap call.** Ollama serialises per model, so
+  `/api/generate` queues behind whatever that model is doing — a cold load, or
+  the very turn the clamp was issued around. Measured 2026-09-06: **8.2s to
+  load a 2.5 GB model**, and the default route tier is 17 GB. Against a 5s
+  ceiling the call did not clamp late, it never clamped at all.
+* **The failure named no cause.** httpx timeout exceptions carry an empty
+  message — `str(httpx.ReadTimeout())` is `""` — and the log line interpolated
+  only the message, so eleven consecutive failures rendered as
+  `ollama admin qwen3.8:27b-obliterated keep_alive='10m' failed:` at DEBUG.
+  A blank cause at DEBUG is indistinguishable from silence.
+
+Mutating residency now allows **120s** (`ADMIN_MUTATE_TIMEOUT`); reading it via
+`/api/ps` still allows 5s (`ADMIN_READ_TIMEOUT`), because that one really is a
+cheap lookup and `evict_all` consults it under memory pressure. Failures log
+the exception type alongside its message.
+
+A timeout measured in minutes is only safe because **no request waits on it**.
+The route path calls `ollama_admin.clamp_soon()`, which schedules the clamp on
+the event loop and returns immediately, keeping one pending clamp per tier
+rather than one per turn. Ordering costs nothing: Ollama resets the idle timer
+on every inference, so a clamp that lands *after* its turn is the one that
+sticks. Verified end to end against Ollama 0.32.13 — `clamp_soon` returns in
+under a millisecond on a cold tier, and `/api/ps` then reports 10.0 minutes
+remaining instead of the global default.
+
 Closing the breaker does not mean the tier is idle. The breaker closes on the first upstream success, and that success is a newer request than the failover streams still running. A local tier prefilling a 386K-token session emits nothing for minutes, so a stream dispatched during the outage is often still open when the outage ends.
 
 On 2026-08-26 a failover stream opened at 23:10:34. The breaker closed at 23:14:17 and released `qwen3.5:4b-256k` inside the same 62ms window, while that stream was still generating. It produced nothing after that and died on the 600-second read timeout at 23:20:38.
