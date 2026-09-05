@@ -34,7 +34,7 @@ The corollary is in `LocalCA.server_ssl_context`: ALPN must offer only
 
 ## Why everything else is blind
 
-One session's traffic also includes Composio, mem0, Neon, PostHog, npm, and the
+One session's traffic also includes Composio, cmem.ai, Neon, PostHog, npm, and the
 Remote Control bridge itself. Those get an opaque TCP tunnel — no certificate is
 minted, no plaintext is observed, and the proxy cannot break pinning it never
 participates in.

@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 
 from .client import GatewayClient, MissingKey, state
-from .registry import Profile
+from .registry import Profile, TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +66,20 @@ def check_tier(profile: Profile, tool: str) -> dict | None:
             ),
             next="use a profile registered as full, or change the tier deliberately",
         )
-    if profile.tier not in ("full", "control_only", "unconfigured"):
+    if profile.tier == "delegate_only" and tool not in CHAT_TOOLS:
+        return state(
+            profile.name,
+            "delegate_only",
+            reason=f"{tool} is outside the delegate_only tool ceiling",
+            next="use chat, run status, run approval, or run stop only",
+        )
+    if profile.tier not in TIERS:
         return state(
             profile.name, "unconfigured",
-            reason=f"unrecognised tier {profile.tier!r}; valid tiers are 'full', 'control_only', 'unconfigured'",
+            reason=(
+                f"unrecognised tier {profile.tier!r}; valid tiers are "
+                f"{', '.join(repr(tier) for tier in sorted(TIERS))}"
+            ),
             next="check the profile tier, or update the profile definition",
         )
     return None
@@ -198,11 +208,26 @@ def register_tools(
     async def hermes_chat(profile: str, message: str, session_id: str | None = None) -> dict:
         """Send a prompt to an agent and return its reply.
 
-        Refused for control_only profiles. Hermes applies its own approval
-        layer; approvals raised inside the resulting run are answerable with
-        hermes_run_approve, but approvals from chat-platform-initiated turns
-        still surface on that platform, not here.
+        Refused for control_only profiles. delegate_only profiles may use this
+        run-scoped surface but cannot inspect sessions, configuration, logs, or
+        lifecycle controls. Hermes applies its own approval layer; approvals
+        raised inside the resulting run are answerable with hermes_run_approve,
+        but approvals from chat-platform-initiated turns still surface on that
+        platform, not here.
         """
+        resolved, refusal = resolve(registry, profile)
+        if refusal is not None:
+            return refusal
+        refusal = check_tier(resolved, "hermes_chat")
+        if refusal is not None:
+            return refusal
+        if resolved.tier == "delegate_only" and session_id is not None:
+            return state(
+                resolved.name,
+                "delegate_only",
+                reason="delegate_only chat does not accept a caller-supplied session_id",
+                next="start a new run without session_id",
+            )
         body: dict = {"input": message}
         if session_id:
             body["session_id"] = session_id
@@ -219,11 +244,20 @@ def register_tools(
         return await _call(profile, "hermes_run_stop", "POST", f"/v1/runs/{run_id}/stop")
 
     @mcp.tool()
-    async def hermes_run_approve(profile: str, run_id: str, approved: bool) -> dict:
-        """Answer an approval request raised inside a run."""
+    async def hermes_run_approve(
+        profile: str,
+        run_id: str,
+        request_id: str,
+        approved: bool,
+    ) -> dict:
+        """Answer one identified approval request raised inside a run."""
         return await _call(
             profile, "hermes_run_approve", "POST",
-            f"/v1/runs/{run_id}/approval", {"approved": approved},
+            f"/v1/runs/{run_id}/approval",
+            {
+                "choice": "once" if approved else "deny",
+                "request_id": request_id,
+            },
         )
 
     async def _systemctl(profile_name: str, verb: str) -> dict:

@@ -15,11 +15,15 @@ import pytest
 
 from src.proxy.failover import (
     FAILOVER_STATUSES,
+    RESOLUTION_PROBE_NAMES,
     FailoverBreaker,
     _statuses_from_env,
     internet_reachable,
+    internet_usable,
+    name_resolution_works,
     service_reachable,
 )
+from src.proxy.config import FAILOVER_LADDER, pick_failover_profile
 
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="backdoor-failover-state-"))
 _state_seq = iter(range(1_000_000))
@@ -517,7 +521,6 @@ def test_unwritable_state_path_does_not_break_the_breaker():
 
 
 # ── Failover ladder (size → local tier) ──────────────────────────────────────
-from src.proxy.config import pick_failover_profile, FAILOVER_LADDER
 
 
 def test_ladder_normal_session_gets_the_strong_tool_capable_tier():
@@ -1064,3 +1067,184 @@ def test_every_transition_is_still_logged_even_when_silent(caplog):
     text = caplog.text
     assert "failover OPEN" in text and "failover CLOSED" in text
     assert notes == []
+
+
+# One dropped link takes down every upstream at once, and until 2026-09-04 each
+# breaker announced that separately: the outages at 22:13 and 23:43 on 2026-09-03
+# each produced four popups — Anthropic open, Codex open, Anthropic closed, Codex
+# closed — for one Wi-Fi blip. The per-breaker cooldown cannot collapse those,
+# because they are different breakers. "You are on the local model" is one fact
+# about the machine, so it is said once.
+
+
+def _pair(clock, **kw):
+    """Two breakers on one router, i.e. sharing a state file, as production wires
+    them. The shared path is what lets either one see that the other is open."""
+    shared = _STATE_DIR / f"shared-{next(_state_seq)}.json"
+    anthropic, a_notes = make(
+        clock, threshold=1, notify_cooldown=900.0, state_path=shared, **kw
+    )
+    codex, c_notes = make(
+        clock,
+        threshold=1,
+        notify_cooldown=900.0,
+        state_path=shared,
+        source="codex",
+        upstream_name="ChatGPT Codex",
+        # Mirrors production: Settings.codex_failover_require_offline is False,
+        # so Codex may fail over on its own service being unusable.
+        require_offline=False,
+        **kw,
+    )
+    return anthropic, a_notes, codex, c_notes
+
+
+def test_a_second_upstream_lost_to_the_same_outage_is_silent():
+    clock = Clock()
+    anthropic, a_notes, codex, c_notes = _pair(clock)
+
+    anthropic.record_failure("ConnectError")
+    assert anthropic.open and len(a_notes) == 1
+
+    codex.record_failure("ConnectError")
+    assert codex.open, "the breaker still opens — only the notification is rationed"
+    assert c_notes == [], "the human is already looking at a 'routing to local' popup"
+
+
+def test_the_silent_upstream_does_not_announce_its_own_recovery():
+    """Same orphan rule as the cooldown: a recovery you were never warned about
+    reads as a bug."""
+    clock = Clock()
+    anthropic, a_notes, codex, c_notes = _pair(clock)
+    anthropic.record_failure("ConnectError")
+    codex.record_failure("ConnectError")
+
+    anthropic.record_success()
+    codex.record_success()
+
+    assert len(a_notes) == 2, "the breaker that spoke reports both ends"
+    assert c_notes == []
+
+
+def test_an_upstream_failing_on_its_own_still_speaks():
+    """The suppression is for duplicate reports of one outage, not a mute switch.
+    Codex alone timing out on a working link is news, and on 2026-09-03 23:57 it
+    was the only thing that had failed."""
+    clock = Clock()
+    _anthropic, _a_notes, codex, c_notes = _pair(clock, online_fn=lambda: True)
+
+    codex.record_failure("ConnectTimeout", transport_error=False)
+
+    assert codex.open and len(c_notes) == 1
+
+
+def test_every_transition_is_still_logged_when_a_peer_silences_it(caplog):
+    """Rationing the popup must not ration the record."""
+    import logging
+
+    clock = Clock()
+    anthropic, _a_notes, codex, c_notes = _pair(clock)
+    anthropic.record_failure("ConnectError")
+
+    with caplog.at_level(logging.WARNING, logger="src.proxy.failover"):
+        codex.record_failure("ConnectError")
+        codex.record_success()
+
+    assert "failover OPEN" in caplog.text and "failover CLOSED" in caplog.text
+    assert c_notes == []
+# ── DNS as the other half of "offline" ───────────────────────────────────────
+# Regression cover for the 2026-09-04 23:36-23:39 outage. Name resolution died
+# for three and a half minutes; the link stayed up. `internet_reachable` dials
+# literal IPs, so it verified a peer on the first probe every time, the
+# offline-gated Anthropic breaker read the host as ONLINE, and every request
+# became a hard 502 ("Anthropic unreachable: [Errno 8] nodename nor servname
+# provided"). The service-gated Codex breaker, which never consults
+# connectivity, failed over at 23:36:39 and rode the same outage out locally.
+
+
+def _resolver(monkeypatch, answers):
+    """Patch getaddrinfo. `answers` maps a name to True, False, or a delay."""
+    import socket as _socket
+    import time as _time
+
+    def fake(host, port, *a, **kw):
+        verdict = answers.get(host, False)
+        # bool before number: bool IS an int, and folding the two made every
+        # `False` read as "sleep(0), then answer".
+        if isinstance(verdict, bool):
+            if verdict:
+                return [("info",)]
+        elif isinstance(verdict, (int, float)):
+            _time.sleep(verdict)
+            return [("info",)]
+        raise _socket.gaierror(8, "nodename nor servname provided, or not known")
+
+    monkeypatch.setattr("src.proxy.failover.socket.getaddrinfo", fake)
+
+
+def test_name_resolution_works_when_any_single_name_answers(monkeypatch):
+    """One working name proves the resolver answers; the zone does not matter."""
+    first, second = RESOLUTION_PROBE_NAMES
+    _resolver(monkeypatch, {first: False, second: True})
+
+    assert name_resolution_works(timeout=1.0) is True
+
+
+def test_name_resolution_is_broken_when_every_lookup_fails(monkeypatch):
+    """The exact errno the outage produced, on every name."""
+    _resolver(monkeypatch, {})
+
+    assert name_resolution_works(timeout=1.0) is False
+
+
+def test_a_silent_resolver_reads_as_broken_within_the_budget(monkeypatch):
+    """A resolver that accepts queries and never answers must not hang a turn.
+
+    getaddrinfo takes no timeout, so the only bound is refusing to keep waiting.
+    """
+    import time as _time
+
+    _resolver(monkeypatch, {name: 5.0 for name in RESOLUTION_PROBE_NAMES})
+
+    started = _time.monotonic()
+    assert name_resolution_works(timeout=0.05) is False
+    assert _time.monotonic() - started < 2.0, "the lookup must be abandoned, not joined"
+
+
+def test_internet_usable_is_offline_when_only_dns_is_dead():
+    """The regression itself: a verified route out is not enough on its own."""
+    assert internet_usable(reachable=lambda: True, resolves=lambda: False) is False
+
+
+def test_internet_usable_does_not_ask_dns_when_the_link_is_down():
+    """A dead link is never reported as a DNS fault, and costs no lookup."""
+    asked = []
+
+    assert internet_usable(
+        reachable=lambda: False, resolves=lambda: asked.append(True) or True
+    ) is False
+    assert asked == [], "resolution is the second question, not the first"
+
+
+def test_internet_usable_is_online_only_when_both_halves_answer():
+    assert internet_usable(reachable=lambda: True, resolves=lambda: True) is True
+
+
+def test_breaker_opens_on_a_dns_outage_over_a_working_link():
+    """End of the chain: DNS-only outage now claims the GPU, as it must.
+
+    Before this, `online_fn` was `internet_reachable` alone, the probe said
+    online, and `record_failure` took the relay branch on every request.
+    """
+    clock = Clock()
+    br, notes = make(
+        clock,
+        threshold=1,
+        online_fn=lambda: internet_usable(
+            reachable=lambda: True, resolves=lambda: False
+        ),
+    )
+
+    assert br.record_failure("ConnectError") is True
+    assert br.open
+    assert notes, "a silent downgrade is the thing this must never do"

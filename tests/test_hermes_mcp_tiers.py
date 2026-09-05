@@ -25,6 +25,14 @@ from src.hermes_mcp.tools import (
 FULL = Profile(name="alpha", tier="full", port=9001, key_env="A", unit="a.service")
 LOCKED = Profile(name="prod", tier="control_only", port=9002, key_env="B", unit="b.service")
 GHOST = Profile(name="ghost", tier="unconfigured")
+DELEGATE = Profile(
+    name="screddy",
+    tier="delegate_only",
+    port=9003,
+    key_env="SCREDDY_KEY",
+    unit="screddy.service",
+    home="/srv/gw/screddy",
+)
 
 
 @pytest.mark.parametrize("tool", sorted(CHAT_TOOLS))
@@ -38,6 +46,19 @@ def test_control_only_refuses_every_chat_tool(tool):
 @pytest.mark.parametrize("tool", sorted(CHAT_TOOLS))
 def test_full_allows_every_chat_tool(tool):
     assert check_tier(FULL, tool) is None
+
+
+@pytest.mark.parametrize("tool", sorted(CHAT_TOOLS))
+def test_delegate_only_allows_exactly_run_scoped_tools(tool):
+    assert check_tier(DELEGATE, tool) is None
+
+
+@pytest.mark.parametrize("tool", sorted(NON_CHAT_TOOLS - {"hermes_list"}))
+def test_delegate_only_refuses_profile_inventory_and_control(tool):
+    refusal = check_tier(DELEGATE, tool)
+    assert refusal is not None
+    assert refusal["state"] == "delegate_only"
+    assert tool in refusal["reason"]
 
 
 @pytest.mark.parametrize("tool", ["hermes_status", "hermes_logs", "hermes_models"])
@@ -161,6 +182,23 @@ async def test_chat_with_session_id_includes_it():
     assert body["input"] == "hello"
 
 
+async def test_delegate_only_chat_refuses_caller_supplied_session_id_before_gateway():
+    """A machine delegate cannot attach a new run to personal session history."""
+    _Client.calls = []
+    mcp = _MCP()
+    register_tools(mcp, {"screddy": DELEGATE}, client_factory=_Client)
+
+    got = await mcp.tools["hermes_chat"](
+        profile="screddy",
+        message="hello",
+        session_id="personal-session",
+    )
+
+    assert got["state"] == "delegate_only"
+    assert "session_id" in got["reason"]
+    assert _Client.calls == []
+
+
 async def test_chat_against_control_only_never_reaches_the_gateway():
     """The refusal must happen before any request. A gateway that answered
     would mean the tier is advisory, which is not what it is for."""
@@ -170,12 +208,21 @@ async def test_chat_against_control_only_never_reaches_the_gateway():
     assert _Client.calls == [], "a request was sent to a control_only profile"
 
 
-async def test_run_approve_posts_the_decision():
+@pytest.mark.parametrize(
+    ("approved", "choice"),
+    [(True, "once"), (False, "deny")],
+)
+async def test_run_approve_posts_a_gateway_choice(approved, choice):
     t = _tools()
-    await t["hermes_run_approve"](profile="alpha", run_id="r-9", approved=True)
+    await t["hermes_run_approve"](
+        profile="alpha",
+        run_id="r-9",
+        request_id="approval-7",
+        approved=approved,
+    )
     name, method, path, body = _Client.calls[-1]
     assert path == "/v1/runs/r-9/approval"
-    assert body == {"approved": True}
+    assert body == {"choice": choice, "request_id": "approval-7"}
 
 
 async def test_run_stop_posts_to_the_run():
@@ -196,7 +243,25 @@ _CHAT_TOOL_ARGS: dict[str, dict] = {
     "hermes_chat": {"message": "hello"},
     "hermes_run_status": {"run_id": "r-9"},
     "hermes_run_stop": {"run_id": "r-9"},
-    "hermes_run_approve": {"run_id": "r-9", "approved": True},
+    "hermes_run_approve": {
+        "run_id": "r-9",
+        "request_id": "approval-7",
+        "approved": True,
+    },
+}
+
+_NON_CHAT_TOOL_ARGS: dict[str, dict] = {
+    "hermes_status": {},
+    "hermes_sessions": {},
+    "hermes_session_messages": {"session_id": "s-1"},
+    "hermes_models": {},
+    "hermes_skills": {},
+    "hermes_toolsets": {},
+    "hermes_jobs": {},
+    "hermes_start": {},
+    "hermes_stop": {},
+    "hermes_restart": {},
+    "hermes_logs": {},
 }
 
 
@@ -227,3 +292,25 @@ async def test_chat_tool_gate_is_mandatory_not_merely_available(tool):
     assert got["state"] == "control_only", f"{tool} was allowed against a control_only profile"
     assert _Client.calls == [], f"{tool} reached the gateway for a control_only profile"
     assert runner_calls == [], f"{tool} invoked the subprocess runner for a control_only profile"
+
+
+@pytest.mark.parametrize("tool", sorted(NON_CHAT_TOOLS - {"hermes_list"}))
+async def test_delegate_only_non_chat_gate_precedes_every_side_effect(tool):
+    _Client.calls = []
+    runner_calls = []
+
+    async def fake_runner(*argv, **_kw):
+        runner_calls.append(argv)
+        return None
+
+    mcp = _MCP()
+    register_tools(
+        mcp,
+        {"screddy": DELEGATE},
+        client_factory=_Client,
+        runner=fake_runner,
+    )
+    got = await mcp.tools[tool](profile="screddy", **_NON_CHAT_TOOL_ARGS[tool])
+    assert got["state"] == "delegate_only"
+    assert _Client.calls == [], f"{tool} reached the gateway for a delegate_only profile"
+    assert runner_calls == [], f"{tool} invoked the subprocess runner for a delegate_only profile"

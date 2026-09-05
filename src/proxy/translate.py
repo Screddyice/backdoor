@@ -263,61 +263,71 @@ def tools_to_openai(tools: list[Tool] | None) -> list[dict[str, Any]] | None:
 
 
 def _hoist_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Guarantee at most one system message, at index 0.
+    """Guarantee at most one system message, at index 0 — without moving the head.
 
-    Ollama 0.32 rejects any system message at index > 0 with HTTP 500
-    "system message must be at the beginning", and that includes a payload whose
-    FIRST message is a valid system message and which carries a second one later.
-    0.23.4 accepted both shapes, so this only started failing when the daemon was
-    upgraded on 2026-08-16 — every request in a tool-using session 500'd in about
-    150ms, before any inference, which is what a validation rejection looks like
-    against a load failure.
+    Ollama 0.32 rejects any system message at index > 0 with HTTP 500 ("system
+    message must be at the beginning"). Until 2026-09-05 the fix was to hoist
+    every stray one to the front and merge it into the leading system block.
+    That satisfied Ollama and defeated the working set: Claude Code attaches a
+    fresh system-reminder to most turns, so each turn added one more block to
+    the HEAD of the prompt, the prefix the model had cached never matched
+    again, and a 7.7K-token turn that should have appended in 5-10s cold
+    prefilled in 29s. Measured on a real routed session — `hoisting 3 system
+    message(s) from position(s) [1, 4, 7]` was the log line.
 
-    Anthropic keeps the system prompt in its own top-level field, so a system
-    message arriving inside `messages` is already unusual. Rather than drop that
-    content (it is instruction text, and dropping instructions silently is worse
-    than reordering them) it gets merged into the leading system block in the
-    order it appeared.
-
-    Providers differ on this: some accept system anywhere, some take only the
-    first, some 500. Normalising here means the proxy sends the one shape all of
-    them accept, instead of depending on which daemon is installed.
+    A stray system message is now folded into the NEXT user turn as a note,
+    which is where it was headed anyway. The reminders from earlier turns stay
+    exactly where the client resends them, so the prefix holds; only the newest
+    turn changes, and it was new regardless. Nothing is dropped: instruction
+    text that vanished silently would be worse than either placement.
     """
     stray = [i for i, m in enumerate(messages) if m.get("role") == "system" and i > 0]
     if not stray:
         return messages
 
-    logger.warning(
-        "hoisting %d system message(s) from position(s) %s to the front — "
-        "Ollama 0.32+ rejects system messages that are not first",
-        len(stray),
-        stray,
+    logger.info(
+        "folding %d stray system message(s) at %s into the following user turn — "
+        "Ollama rejects them mid-conversation, and moving them to the head would "
+        "change the prompt prefix every turn",
+        len(stray), stray,
     )
 
-    lead: list[str] = []
-    rest: list[dict[str, Any]] = []
-    for i, m in enumerate(messages):
-        if m.get("role") == "system":
-            content = m.get("content")
-            if isinstance(content, list):
-                content = "".join(
-                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-                )
-            if content:
-                lead.append(str(content))
-        else:
-            rest.append(m)
+    def _text(m: dict[str, Any]) -> str:
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+            )
+        return str(content or "")
 
-    return ([{"role": "system", "content": "\n\n".join(lead)}] if lead else []) + rest
+    def _prepend(content: Any, note: str) -> Any:
+        if isinstance(content, list):
+            return [{"type": "text", "text": note + "\n\n"}] + content
+        return f"{note}\n\n{content}" if content else note
+
+    out: list[dict[str, Any]] = []
+    carry: list[str] = []
+    for i, m in enumerate(messages):
+        if m.get("role") == "system" and i > 0:
+            text = _text(m)
+            if text:
+                carry.append(text)
+            continue
+        if carry and m.get("role") == "user":
+            note = "\n\n".join(f"[system note] {c}" for c in carry)
+            m = {**m, "content": _prepend(m.get("content"), note)}
+            carry = []
+        out.append(m)
+    if carry:
+        out.append({"role": "user", "content": "\n\n".join(f"[system note] {c}" for c in carry)})
+    return out
 
 
 def _is_local_provider(settings) -> bool:
     """Is this request headed for a model running on this machine?
 
-    Cloud sessions already receive Mem0 through the `UserPromptSubmit` hook, so
-    injecting for them would duplicate the same text and spend context twice.
-    Local sessions launched with `--bare` get no hooks at all, which is the gap
-    this fills.
+    Cloud sessions receive memory through claude-mem's lifecycle hooks. Local
+    sessions launched with `--bare` get no hooks, so Backdoor fills that gap.
     """
     url = (getattr(settings, "provider_base_url", "") or "").lower()
     return "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url
@@ -342,9 +352,9 @@ def _inject_memory(messages: list[dict[str, Any]], settings) -> list[dict[str, A
     """Prepend durable-memory recall to the system block for local models.
 
     Local sessions started by the `qwen` wrapper run with `--bare`, which
-    disables every hook — including the one that normally injects Mem0. Without
+    disables every hook, including claude-mem's memory injection. Without
     this, the default local tier is the only one in the stack with no durable
-    memory. Recall is read from the offline SQLite mirror so it survives the
+    memory. Recall comes from the local SQLite replica so it survives the
     outage that failover exists to cover.
 
     Fail-open: a recall problem returns the messages untouched.

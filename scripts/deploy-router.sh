@@ -98,11 +98,18 @@ fi
 
 echo "   fast-forward is clean: $(g rev-list --count "$BEFORE..$TARGET") commit(s)"
 
-echo "== 2/5 waiting for the router to go idle"
-
-if [ "$FORCE" = "1" ]; then
-  echo "   FORCE=1, skipping the wait. In-flight requests WILL be dropped."
+if [ "$DRY_RUN" = "1" ]; then
+  # A dry run restarts nothing, so there are no in-flight requests to protect
+  # and the wait buys nothing. It also cannot finish: on this machine a live
+  # Claude session writes to the router log every few seconds, so the window
+  # never opens, and on 2026-09-04 that turned "show me the plan" into three
+  # minutes ending in ABORT with the plan never printed.
+  echo "== 2/5 no quiet window needed, nothing is going to restart"
+elif [ "$FORCE" = "1" ]; then
+  echo "== 2/5 skipping the quiet window"
+  echo "   FORCE=1. In-flight requests WILL be dropped."
 else
+  echo "== 2/5 waiting for the router to go idle"
   # Established connections never reach zero, because Claude Code holds
   # keep-alive sockets open while idle, so counting them says nothing. Log
   # silence is the better signal for "nothing is actually in flight".

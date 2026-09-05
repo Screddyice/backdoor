@@ -1,5 +1,4 @@
 import asyncio
-import gzip
 import json
 import logging
 from pathlib import Path
@@ -486,7 +485,7 @@ async def _post_local_failover(
 
 
 @pytest.mark.asyncio
-async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
+async def test_eligible_cloud_failure_uses_fresh_memory_backed_qwen_request(
     codex_app, monkeypatch, tmp_path
 ):
     app, settings, _ = codex_app
@@ -515,7 +514,7 @@ async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
 
     async def recall(query, recall_settings):
         assert query == "active task"
-        return ["Cognee continuity marker"]
+        return ["Replica continuity marker"]
 
     external_memory = "external " * 50
     settings.codex_memory_budget_tokens = count_text(external_memory.strip())
@@ -558,11 +557,12 @@ async def test_eligible_cloud_failure_uses_fresh_cognee_backed_qwen_request(
     rendered = json.dumps(local_payload)
     assert local_payload["model"] == "qwen3.8:27b-obliterated"
     assert "active task" in rendered
-    assert "Cognee continuity marker" in rendered
+    assert "Replica continuity marker" in rendered
     assert "bounded result" in rendered
-    assert "older task" not in rendered
+    # History is replayed now (see test_codex_context), so the older turn is
+    # expected. The cloud-only identifiers still must not be.
     assert "prompt_cache_key" not in rendered
-    assert "reasoning" not in rendered
+    assert local_payload["reasoning"] == {"effort": "none"}
     assert "authorization" not in local_calls[0].headers
     assert "chatgpt-account-id" not in local_calls[0].headers
     assert breaker.open is True
@@ -689,8 +689,6 @@ async def test_disabling_local_failover_always_relays_trigger_statuses(
 
 
 class _GateClock:
-    """Fake monotonic clock so a duration gate needs no real sleeping."""
-
     def __init__(self):
         self.t = 1000.0
 
@@ -703,20 +701,7 @@ class _GateClock:
 async def test_trigger_failure_uses_qwen_once_the_gate_elapses(
     codex_app, monkeypatch, failure
 ):
-    """Production policy: relay while the gate holds, then serve from Qwen.
-
-    Asserted immediate failover when PR #91 wrote it, on the reasoning that
-    Codex Desktop surfaces a 502 rather than retrying, so any hold-down is a
-    visible error. On 2026-09-03 the Claude gate came down from 30s to 10s and
-    Codex was aligned to it: the gap between the paths became 10s of visible
-    errors against 10s of retried ones rather than 60s against none, and the
-    gate buys both paths the same thing — not loading a 17GB local tier for a
-    blip, when 48% of measured outage bursts are under two seconds.
-
-    Both halves are asserted here, because the failure mode this replaces is
-    real: if the gate ever stops elapsing, this must fail rather than quietly
-    relay forever.
-    """
+    """Codex relays failures for 20 seconds, then serves through Qwen."""
     app, settings, breaker = codex_app
     local_calls = 0
 
@@ -758,15 +743,13 @@ async def test_trigger_failure_uses_qwen_once_the_gate_elapses(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://backdoor.test"
     ) as client:
-        # While the gate holds, the failure is relayed rather than failed over.
         first = await client.post(
             "/backend-api/codex/responses", content=FIXTURE.read_bytes()
         )
-        assert first.status_code != 200, "the gate must not serve locally yet"
+        assert first.status_code != 200
         assert local_calls == 0
         assert not breaker.open
 
-        # Once it has elapsed, the next trigger-class failure goes to Qwen.
         clock.t += settings.codex_failover_min_outage_seconds + 1
         response = await client.post(
             "/backend-api/codex/responses", content=FIXTURE.read_bytes()
@@ -779,7 +762,7 @@ async def test_trigger_failure_uses_qwen_once_the_gate_elapses(
 
 
 @pytest.mark.asyncio
-async def test_empty_cognee_recall_still_serves_current_task_from_qwen(
+async def test_empty_memory_recall_still_serves_current_task_from_qwen(
     codex_app, monkeypatch, tmp_path
 ):
     local_payloads = []
@@ -794,7 +777,7 @@ async def test_empty_cognee_recall_still_serves_current_task_from_qwen(
 
     assert response.status_code == 200
     assert "active task" in json.dumps(local_payloads[0])
-    assert "Relevant context recalled from local Cognee" not in json.dumps(local_payloads[0])
+    assert "Relevant context recalled from local memory" not in json.dumps(local_payloads[0])
 
 
 @pytest.mark.asyncio
@@ -1596,11 +1579,11 @@ async def test_local_request_reserves_qwen_before_its_stream_is_iterated(
 
 
 @pytest.mark.asyncio
-async def test_local_route_skips_all_cognee_recall_when_disabled(
+async def test_local_route_skips_all_memory_recall_when_disabled(
     codex_app, monkeypatch, tmp_path
 ):
     _, settings, _ = codex_app
-    settings.qwen_cognee = False
+    settings.qwen_memory = False
     breaker = one_shot_breaker(tmp_path)
     assert breaker.record_failure("HTTP 503") is True
 
@@ -1611,7 +1594,7 @@ async def test_local_route_skips_all_cognee_recall_when_disabled(
         return payload
 
     async def forbidden_recall(*_args):
-        raise AssertionError("Cognee recall must stay off")
+        raise AssertionError("memory recall must stay off")
 
     async def send_local(_payload, _settings):
         return httpx.Response(200, stream=BytesStream(SSE))
@@ -1638,7 +1621,7 @@ async def test_local_route_skips_all_cognee_recall_when_disabled(
 
 
 @pytest.mark.asyncio
-async def test_oversized_local_instruction_is_rejected_before_cognee(
+async def test_oversized_local_instruction_is_rejected_before_memory(
     codex_app, monkeypatch, tmp_path
 ):
     _, settings, _ = codex_app
@@ -1653,7 +1636,7 @@ async def test_oversized_local_instruction_is_rejected_before_cognee(
 
     async def forbidden(*_args):
         calls.append("called")
-        raise AssertionError("oversized instructions must not reach Cognee")
+        raise AssertionError("oversized instructions must not reach memory recall")
 
     monkeypatch.setattr(codex_routes.mlx_admin, "resolve_profile", resolve)
     monkeypatch.setattr(codex_routes, "prepare_codex_external_context", forbidden)
@@ -1835,3 +1818,34 @@ async def test_half_open_probe_closes_breaker_when_the_client_disconnects(
 
     assert started == [200]
     assert breaker.open is False
+
+
+@pytest.mark.asyncio
+async def test_the_codex_local_path_hands_its_tier_back():
+    """A Codex turn takes the same lock a Claude turn does, and returns it.
+
+    Measured 2026-09-05: two sessions alternating on one model cost 105.8s and
+    116.3s per turn against 0.7s for one session repeating, because each
+    request evicts the other's KV cache. A Codex turn and a Claude turn on the
+    same 27B do that to each other, so both paths serialize on the tier — and a
+    lock that is taken and not returned would queue every later turn until the
+    timeout.
+    """
+    from src.proxy import codex_routes, tier_lock
+    from src.proxy.config import Settings
+    from src.proxy.failover import FailoverBreaker
+
+    tier_lock.reset()
+    settings = Settings()
+    await codex_routes._hold_tier(settings)
+    assert codex_routes._held_tier is not None, "the Codex path took no lock"
+    held = codex_routes._held_tier
+    assert tier_lock.waiting(*held)
+
+    await codex_routes._release_local_slot(
+        FailoverBreaker(threshold=1, online_fn=lambda: False)
+    )
+
+    assert codex_routes._held_tier is None
+    assert not tier_lock.waiting(*held), "the Codex path kept the tier locked"
+    tier_lock.reset()
