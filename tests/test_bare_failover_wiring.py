@@ -700,6 +700,47 @@ def test_the_window_guard_leaves_room_for_a_request_s_fixed_overhead():
     assert guard < 32_768, "the guard must still be under the provider window"
 
 
+def test_the_window_guard_holds_at_the_top_of_the_measured_ratio():
+    """A guard calibrated on the average of a range does not guard.
+
+    Regression cover for 2026-09-06. The deployed router measured 0.99-1.12
+    provider tokens per estimated token, and the default sat at 1.0 — the
+    middle of that range. The guard therefore returned 27,172, ABOVE
+    ROUTE_MAX_INPUT_TOKENS (27,000), so it never bound on anything: a 27,000
+    estimate is 30,240 provider tokens at 1.12, and with the 4,096 reply
+    reserve that is 34,336 against a 32,768 window. Ollama truncates the
+    overflow from the front silently.
+
+    Nothing had truncated yet — the largest local prompt seen was 24,888,
+    clearing by 798 tokens — but the backstop could not catch the case it
+    exists for.
+    """
+    from src.proxy.config import Settings
+    from src.proxy.routes import _window_guard
+
+    WINDOW, RESERVE = 32_768, 4_096
+    WORST_OBSERVED_RATIO = 1.12  # deployed router, 2026-09-06
+
+    local = Settings(provider_base_url="http://localhost:11434/v1",
+                     provider_context_tokens=WINDOW, provider_max_tokens=RESERVE)
+    guard = _window_guard(local)
+
+    # A prompt sized right at the guard must still fit once the provider counts
+    # it at the worst ratio actually seen, with the reply reserve on top.
+    landed = guard * WORST_OBSERVED_RATIO + RESERVE
+    assert landed <= WINDOW, (
+        f"a prompt at the guard ({guard}) lands at {landed:.0f} provider tokens "
+        f"against a {WINDOW} window — the guard permits its own overflow"
+    )
+
+    # And it has to bind before the escalation ceiling, or it is never consulted.
+    route_ceiling = 27_000  # ROUTE_MAX_INPUT_TOKENS, profiles/local-qwen38-obliterated.env
+    assert guard < route_ceiling, (
+        f"guard {guard} sits above the {route_ceiling} escalation ceiling, so "
+        "the ladder always fires first and the guard never binds"
+    )
+
+
 def test_a_narrow_tier_still_binds_the_ceiling():
     """The guard exists for a tier whose window is genuinely smaller."""
     from src.proxy.config import Settings

@@ -544,8 +544,16 @@ def _window_guard(settings: Settings) -> int:
     """The largest router-side estimate that still fits the provider's window.
 
     (window - output reserve - template slack) / estimate ratio. For the 27B at
-    32,768 with a 4,096 reserve and the measured 1.8 ratio that is 15,095 — well
-    under the configured 22K ceiling, which is why the ceiling alone overflowed.
+    32,768 with a 4,096 reserve and the measured 1.15 ratio that is 23,627 —
+    under the configured 22K working ceiling only for oversized tails, which is
+    the case the ceiling alone could not catch.
+
+    The ratio has to cover the TOP of the measured range, not its average. At
+    1.0 this returned 27,172, above ROUTE_MAX_INPUT_TOKENS (27,000), so the
+    guard never bound at all: a 27,000-token estimate is ~30,240 provider
+    tokens at the observed 1.12, and with the 4,096 reply reserve that is 34,336
+    against a 32,768 window. Ollama truncates the overflow from the front
+    without saying so, and the symptom is a model that answers nothing.
     """
     # A local tier's window is a property of this machine and its Modelfile.
     # A hosted provider's is neither known here nor ours to second-guess.
