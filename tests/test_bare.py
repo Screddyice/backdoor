@@ -5,6 +5,7 @@ from src.proxy.bare import (
     DEFAULT_KEEP_TOOLS,
     DEFAULT_SYSTEM,
     OFFLINE_SYSTEM,
+    apply_outage_tool_policy,
     make_bare,
     parse_keep,
 )
@@ -79,6 +80,45 @@ def test_empty_keep_list_still_drops_everything():
     """The escape hatch for a tier that cannot accept tools at all."""
     out = make_bare(req(tools=[Tool(name="Read"), Tool(name="Bash")]), keep=())
     assert out.tools is None
+
+
+def test_outage_policy_keeps_only_local_inspection_tools():
+    request = req(tools=[
+        Tool(name="Read"), Tool(name="Glob"), Tool(name="Grep"),
+        Tool(name="Bash"), Tool(name="Edit"), Tool(name="WebFetch"),
+        Tool(name="mcp__remote__lookup"),
+    ])
+
+    output = apply_outage_tool_policy(request)
+
+    assert [tool.name for tool in output.tools or []] == ["Read", "Glob", "Grep"]
+    assert [tool.name for tool in request.tools or []] == [
+        "Read", "Glob", "Grep", "Bash", "Edit", "WebFetch", "mcp__remote__lookup"
+    ]
+
+
+def test_outage_policy_clears_tool_choice_when_no_tool_survives():
+    from src.proxy.models import ToolChoice
+
+    output = apply_outage_tool_policy(req(
+        tools=[Tool(name="Bash")],
+        tool_choice=ToolChoice(type="tool", name="Bash"),
+    ))
+
+    assert output.tools is None
+    assert output.tool_choice is None
+
+
+def test_outage_policy_clears_choice_for_removed_tool_when_one_survives():
+    from src.proxy.models import ToolChoice
+
+    output = apply_outage_tool_policy(req(
+        tools=[Tool(name="Read"), Tool(name="Bash")],
+        tool_choice=ToolChoice(type="tool", name="Bash"),
+    ))
+
+    assert [tool.name for tool in output.tools or []] == ["Read"]
+    assert output.tool_choice is None
 
 
 # ── system prompt ────────────────────────────────────────────────────────────

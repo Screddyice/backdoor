@@ -15,7 +15,17 @@ from .config import (
     MODEL_ROUTES, Settings, get_settings, load_profile_settings, load_route_system_extra,
     pick_failover_profile, resolve_model_route,
 )
-from .bare import OFFLINE_SYSTEM, make_bare, parse_keep, route_system
+from .bare import (
+    OFFLINE_SYSTEM,
+    apply_outage_tool_policy,
+    make_bare,
+    parse_keep,
+    route_system,
+)
+from .claude_context_adapter import ClaudeContextAdapter
+from .context_runtime import ContextRuntime, PreparedContext, normalized_request_hash
+from .context_store import ContextStore, ContextStoreUnavailable
+from .context_tokenizer import ContextLimitError, QwenTokenGate
 from .external_context import prepare_external_context
 from .failover import FAILOVER_STATUSES, FailoverBreaker
 from .provider_errors import is_provider_edge_404
@@ -34,6 +44,124 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _client: ProviderClient | None = None
+_claude_context_runtime: ContextRuntime | None = None
+_claude_context_runtime_config: tuple[object, ...] | None = None
+
+
+class _UnavailableContextStore:
+    """Let the runtime use its stateless fallback when SQLite cannot open."""
+
+    @staticmethod
+    def _raise(*_args, **_kwargs):
+        raise ContextStoreUnavailable("private transcript archive is unavailable")
+
+    archive = _raise
+    prune_if_needed = _raise
+    search = _raise
+    segments = _raise
+    put_cached_response = _raise
+    get_cached_response = _raise
+
+
+def _context_config(settings: Settings) -> tuple[object, ...]:
+    return (
+        settings.context_archive_path,
+        settings.context_archive_max_bytes,
+        settings.context_archive_inactive_days,
+        settings.context_tokenizer_executable,
+        settings.context_tokenizer_model_path,
+        settings.context_response_cache_seconds,
+        settings.context_archive_timeout_seconds,
+        settings.context_assembly_timeout_seconds,
+    )
+
+
+def _get_claude_context_runtime(settings: Settings) -> ContextRuntime:
+    global _claude_context_runtime, _claude_context_runtime_config
+    config = _context_config(settings)
+    if _claude_context_runtime is not None and _claude_context_runtime_config == config:
+        return _claude_context_runtime
+    if _claude_context_runtime is not None:
+        _claude_context_runtime.close()
+    try:
+        store = ContextStore(
+            settings.context_archive_path,
+            max_bytes=settings.context_archive_max_bytes,
+            inactive_days=settings.context_archive_inactive_days,
+        )
+    except ContextStoreUnavailable:
+        store = _UnavailableContextStore()
+    gate = QwenTokenGate(
+        executable=settings.context_tokenizer_executable,
+        model_path=settings.context_tokenizer_model_path,
+    )
+    _claude_context_runtime = ContextRuntime(store, gate, settings)  # type: ignore[arg-type]
+    _claude_context_runtime_config = config
+    return _claude_context_runtime
+
+
+def _profile_context_settings(profile: Settings, router_settings: Settings) -> Settings:
+    """Carry router-level context controls into a selected local profile."""
+    names = (
+        "context_virtualization",
+        "context_target_input_tokens",
+        "context_hard_input_tokens",
+        "context_archive_path",
+        "context_archive_max_bytes",
+        "context_archive_inactive_days",
+        "context_response_cache_seconds",
+        "context_archive_timeout_seconds",
+        "context_assembly_timeout_seconds",
+        "context_tokenizer_executable",
+        "context_tokenizer_model_path",
+    )
+    return profile.model_copy(
+        update={name: getattr(router_settings, name) for name in names}
+    )
+
+
+async def _prepare_claude_local(
+    req: MessagesRequest,
+    settings: Settings,
+    failed_over: bool,
+) -> PreparedContext:
+    """Prepare a bounded Claude request after routing has selected local Qwen."""
+    if not settings.context_virtualization:
+        return PreparedContext(
+            payload=req,
+            request_hash=normalized_request_hash("claude", req),
+            lineage_id=None,
+            token_count=count_messages(req.messages, req.system, req.tools),
+            used_store=False,
+        )
+    if failed_over:
+        req = apply_outage_tool_policy(req)
+    adapter = ClaudeContextAdapter()
+    context = adapter.normalize(req)
+    runtime = _get_claude_context_runtime(settings)
+    estimate = count_messages(req.messages, req.system, req.tools)
+    if estimate > settings.context_hard_input_tokens:
+        return await runtime.prepare_local(context, adapter, settings)
+    runtime.archive_cloud(context)
+    return PreparedContext(
+        payload=req,
+        request_hash=normalized_request_hash(context.client_kind, context.native),
+        lineage_id=None,
+        token_count=estimate,
+        used_store=False,
+    )
+
+
+def _archive_claude_cloud(body: bytes, settings: Settings) -> None:
+    """Queue one accepted cloud request without changing the relayed bytes."""
+    if not settings.context_virtualization:
+        return
+    try:
+        adapter = ClaudeContextAdapter()
+        context = adapter.normalize(MessagesRequest.model_validate_json(body))
+        _get_claude_context_runtime(settings).archive_cloud(context)
+    except Exception:
+        logger.exception("Claude cloud context archive skipped")
 
 
 def set_provider_client(c: ProviderClient):
@@ -807,6 +935,7 @@ async def create_message(
     # `/model qwen`. Decides whether the tier this request loads is one the
     # router may clamp and later evict on its own — see ollama_admin.
     failed_over = False
+    context_prepared: PreparedContext | None = None
     # Set by the two early bounding sites so the backstop below does not bound
     # the same request twice — harmless but it would log twice and re-count.
     bounded = False
@@ -820,10 +949,12 @@ async def create_message(
                 relayed = await _guarded_passthrough(request, body, settings)
                 if relayed is None:
                     raise HTTPException(status_code=502, detail="Anthropic unreachable")
+                _archive_claude_cloud(body, settings)
                 return relayed
             relay = await _try_upstream(request, body, settings)
             if relay is not None:
                 logger.info("→ passthrough [%s] %s", model or "?", request.url.path)
+                _archive_claude_cloud(body, settings)
                 return relay
             # Failed over. Strip the harness FIRST, then size the tier: what the
             # local model has to prefill is the STRIPPED request, so that is what
@@ -836,7 +967,9 @@ async def create_message(
             try:
                 fr = MessagesRequest.model_validate_json(body)
                 raw_est = count_messages(fr.messages, fr.system, fr.tools)
-                context_settings = load_profile_settings(profile)
+                context_settings = _profile_context_settings(
+                    load_profile_settings(profile), router_settings
+                )
                 # The router-level QWEN_MEMORY=0 escape hatch must survive the
                 # profile load, including true offline failover.
                 if not settings.qwen_memory:
@@ -855,8 +988,18 @@ async def create_message(
                 # Bound before sizing: a session trimmed to the working set
                 # usually fits the strong tier, and picking the tier from the
                 # untrimmed count would send it to the wide 4B for tokens the
-                # local model is never going to be shown.
-                fr, est = _bound_working_set(fr, profile, settings)
+                # local model is never going to be shown. Virtualization does the
+                # same job by a different route, so it replaces the working-set
+                # bound rather than stacking on it; either way the request is
+                # bounded and `est` reflects what the local model will prefill.
+                if context_settings.context_virtualization:
+                    context_prepared = await _prepare_claude_local(
+                        fr, context_settings, failed_over=True
+                    )
+                    fr = context_prepared.payload
+                    est = context_prepared.token_count
+                else:
+                    fr, est = _bound_working_set(fr, profile, settings)
                 bounded = True
                 # Write the bound result back to whichever object the dispatch
                 # below actually sends: bare mode's copy when stripping ran,
@@ -866,6 +1009,12 @@ async def create_message(
                 else:
                     prepared_req = fr
                 profile = pick_failover_profile(est)
+            except ContextLimitError:
+                logger.warning("Claude failover context cannot fit the local hard limit")
+                return _mock_response(
+                    fr,
+                    "local inference could not fit this turn; retry when the cloud route recovers",
+                )
             except Exception:
                 # Never let stripping break the failover itself — an unstripped
                 # answer beats no answer. The floor profile still serves it.
@@ -875,7 +1024,9 @@ async def create_message(
                 model or "?", profile, est, raw_est, request.url.path,
                 get_breaker(settings).reason,
             )
-        settings = load_profile_settings(profile)
+        settings = _profile_context_settings(
+            load_profile_settings(profile), router_settings
+        )
 
         # An explicit `/model <name>` hit MODEL_ROUTES and so skipped the
         # failover branch above — the only place that stripped. Tiers whose
@@ -904,6 +1055,14 @@ async def create_message(
                 bounded = True
                 bare_req = stripped  # only on success: make_bare is pure
 
+                if settings.context_virtualization:
+                    context_prepared = await _prepare_claude_local(
+                        stripped, settings, failed_over=False
+                    )
+                    stripped = context_prepared.payload
+                    bare_req = stripped
+                    est = context_prepared.token_count
+
                 # Size the tier AFTER stripping, the same ordering and the same
                 # ladder the failover branch uses. Stripping bounds the prompt but
                 # not the transcript, so a long-lived route session outgrows its
@@ -925,7 +1084,9 @@ async def create_message(
                         # bigger-window tier loads beside it.
                         outgoing = (settings.provider_base_url, settings.provider_model)
                         profile = escalated
-                        settings = load_profile_settings(profile)
+                        settings = _profile_context_settings(
+                            load_profile_settings(profile), router_settings
+                        )
                         if outgoing != (settings.provider_base_url, settings.provider_model):
                             try:
                                 await _evict_outgoing_tier(*outgoing)
@@ -942,6 +1103,14 @@ async def create_message(
                     "→ local [%s → %s] bare in≈%s (raw %s)",
                     model, profile, est, raw_est,
                 )
+            except ContextLimitError as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "Local Qwen cannot fit the current instruction. "
+                        "Start a fresh task with a shorter instruction."
+                    ),
+                ) from exc
             except Exception:
                 # Same rule as failover: stripping must never break the request.
                 # Unstripped may overflow the window, but that surfaces as an
@@ -996,6 +1165,29 @@ async def create_message(
             # surfaces as an honest provider error rather than one we invented.
             logger.exception("profile bare-mode failed; sending unstripped")
 
+    if (
+        context_prepared is None
+        and settings.context_virtualization
+        and "qwen" in settings.provider_model.lower()
+    ):
+        try:
+            context_prepared = await _prepare_claude_local(
+                req, settings, failed_over=failed_over
+            )
+        except ContextLimitError as exc:
+            if failed_over:
+                return _mock_response(
+                    req,
+                    "local inference could not fit this turn; retry when the cloud route recovers",
+                )
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Local Qwen cannot fit the current instruction. "
+                    "Start a fresh task with a shorter instruction."
+                ),
+            ) from exc
+        req = context_prepared.payload
 
     fast = _check_optimizations(req, settings)
     if fast:
@@ -1042,7 +1234,9 @@ async def create_message(
     if tier_limit and est_in > tier_limit:
         try:
             escalated = pick_failover_profile(est_in)
-            esettings = load_profile_settings(escalated)
+            esettings = _profile_context_settings(
+                load_profile_settings(escalated), router_settings
+            )
             if esettings.provider_model != settings.provider_model:
                 logger.warning(
                     "⇢ TIER ESCALATE [%s → %s] in≈%s over %s",
@@ -1125,24 +1319,37 @@ async def create_message(
 
     if req.stream:
         input_tokens = est_in
-        body = _stream(client, payload, msg_id, req, input_tokens, provider,
-                       settings.provider_strip_inline_thinking, window_settings=settings)
-        # Every local stream, not only the failover ones. A deliberate
-        # `/model qwen` route holds no breaker claim — closing must not release
-        # a tier it never claimed — but it does hold the GPU, and an escalation
-        # on a second session must not evict the model this one is generating
-        # on. The claim and the in-flight count answer different questions.
-        body = _tracked_local_stream(
-            body,
-            get_settings(),
-            tier=(
-                (settings.provider_base_url, provider)
-                if ollama_admin.is_ollama(settings.provider_base_url)
-                else None
-            ),
-            lock_timeout=settings.local_tier_lock_timeout_seconds,
-            keep_alive=settings.provider_keep_alive,
-        )
+        def _local_stream_body() -> AsyncIterator[str]:
+            # Tracking and the tier lock belong to the generation, so they sit
+            # inside the factory. `stream_once` runs this for the first caller of
+            # a request hash only; every other caller replays that caller's
+            # events and must not take the lock, or it would wait on a tier the
+            # leader still needs to finish producing.
+            #
+            # Every local stream, not only the failover ones. A deliberate
+            # `/model qwen` route holds no breaker claim — closing must not
+            # release a tier it never claimed — but it does hold the GPU, and an
+            # escalation on a second session must not evict the model this one is
+            # generating on. The claim and the in-flight count answer different
+            # questions.
+            return _tracked_local_stream(
+                _stream(client, payload, msg_id, req, input_tokens, provider,
+                        settings.provider_strip_inline_thinking, window_settings=settings),
+                get_settings(),
+                tier=(
+                    (settings.provider_base_url, provider)
+                    if ollama_admin.is_ollama(settings.provider_base_url)
+                    else None
+                ),
+                lock_timeout=settings.local_tier_lock_timeout_seconds,
+                keep_alive=settings.provider_keep_alive,
+            )
+
+        if context_prepared is not None:
+            runtime = _get_claude_context_runtime(settings)
+            body = runtime.stream_once(context_prepared.request_hash, _local_stream_body)
+        else:
+            body = _local_stream_body()
         return StreamingResponse(
             body,
             media_type="text/event-stream",
@@ -1154,15 +1361,26 @@ async def create_message(
     # would like to evict the model it is prefilling on.
     _local_stream_started()
     try:
-        if ollama_admin.is_ollama(settings.provider_base_url):
-            async with tier_lock.hold(
-                settings.provider_base_url,
-                provider,
-                timeout=settings.local_tier_lock_timeout_seconds,
-            ):
-                resp = await client.complete(payload)
+        async def _complete_local() -> dict:
+            # The tier lock is the generation's, so it sits inside the factory:
+            # run_complete_once gives every caller of a request hash the SAME
+            # task, and only the one that created it runs this.
+            if ollama_admin.is_ollama(settings.provider_base_url):
+                async with tier_lock.hold(
+                    settings.provider_base_url,
+                    provider,
+                    timeout=settings.local_tier_lock_timeout_seconds,
+                ):
+                    return await client.complete(payload)
+            return await client.complete(payload)
+
+        if context_prepared is not None:
+            runtime = _get_claude_context_runtime(settings)
+            resp = await runtime.run_complete_once(
+                context_prepared.request_hash, _complete_local
+            )
         else:
-            resp = await client.complete(payload)
+            resp = await _complete_local()
     except ProviderError as e:
         logger.error("Provider error %s: %s", e.status_code, e.message)
         raise HTTPException(status_code=e.status_code, detail=e.message)

@@ -188,6 +188,21 @@ class Settings(BaseSettings):
     codex_failover_statuses: str = "429,500,502,503,504,529"
     codex_failover_require_offline: bool = False
 
+    # Automatic context virtualization for local Qwen requests. This is
+    # deliberately opt-in: healthy cloud traffic and deliberate local routes
+    # retain their existing behavior until an operator enables it.
+    context_virtualization: bool = False
+    context_target_input_tokens: int = Field(default=18_000, gt=0)
+    context_hard_input_tokens: int = Field(default=22_000, gt=0)
+    context_archive_path: str = "~/.backdoor/context/transcripts.sqlite3"
+    context_archive_max_bytes: int = Field(default=1_073_741_824, ge=1_048_576)
+    context_archive_inactive_days: int = Field(default=30, gt=0)
+    context_response_cache_seconds: int = Field(default=600, ge=0)
+    context_archive_timeout_seconds: float = Field(default=0.5, gt=0)
+    context_assembly_timeout_seconds: float = Field(default=2.5, gt=0)
+    context_tokenizer_executable: str = "/opt/homebrew/bin/llama-tokenize"
+    context_tokenizer_model_path: str = ""
+
     @model_validator(mode="after")
     def validate_codex_context_allocation(self):
         allocated = (
@@ -199,6 +214,8 @@ class Settings(BaseSettings):
         )
         if allocated > self.codex_context_window:
             raise ValueError("Codex context component budgets exceed the context window")
+        if self.context_target_input_tokens > self.context_hard_input_tokens:
+            raise ValueError("Context target input tokens exceed the hard input limit")
         return self
 
     # Large pages and attachments fetched by any client are reduced before a
