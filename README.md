@@ -1674,6 +1674,54 @@ For OAuth mode, proxy these paths to the same bridge process: `/mcp`, `/login`,
 custom connector needs only the public `https://.../mcp` URL; leave its advanced client
 credential fields empty so Claude uses dynamic registration.
 
+### Account-synced product connectors
+
+`src/products_mcp/` runs three OAuth MCP instances for Claude desktop, web, and mobile:
+
+| Connector | Owner | Public endpoint | Tools |
+| --- | --- | --- | --- |
+| HyperCrawl | Team Nebula | `https://hypercrawl-mcp.5-161-126-205.sslip.io/mcp` | `hypercrawl_status`, `hypercrawl_list_tools`, `hypercrawl_call` |
+| HyperScale | Team Nebula | `https://hyperscale-mcp.5-161-126-205.sslip.io/mcp` | `hyperscale_status`, `hyperscale_list_tools`, `hyperscale_call` |
+| EngageMate | Shawn Reddy Consulting (SRC), Screddyice GitHub organization | `https://engagemate-mcp.5-161-126-205.sslip.io/mcp` | `engagemate_status`, `engagemate_list_tools`, `engagemate_call` |
+
+Each server advertises product-specific instructions during MCP initialization so clients can
+route requests without relying on the connector name alone:
+
+| Request intent | Connector | Exclusions |
+| --- | --- | --- |
+| Public web research, site search, crawling, URL mapping, page extraction, browser sessions, or structured website data | HyperCrawl | LinkedIn outreach and Instagram engagement |
+| LinkedIn prospects, connections, outbound campaigns, sequences, outreach status, or templates | HyperScale | General web crawling and Instagram engagement |
+| Instagram onboarding, audience discovery, engagement settings, account status, or service health | EngageMate | LinkedIn outreach and general web crawling |
+
+The instructions direct clients to call the product's read-only status or list tool first. Clients
+reserve account connections, campaign launches, messages, form submissions, and social engagement
+for an explicit user request.
+
+Set `PRODUCTS_MCP_PRODUCT` to one product for each process. The server refuses a missing or unknown
+value and registers only that product's three tools. The list tool returns upstream operation names
+and schemas. The call tool accepts only an advertised operation, which prevents callers from using
+the bridge as an open HTTP proxy.
+
+The bridge reuses `src/hermes_mcp/oauth.py` for dynamic client registration, PKCE, one-hour access
+tokens, and rotating refresh tokens. It keeps product authorization separate behind the bridge:
+HyperCrawl uses its tenant REST token, HyperScale uses its organization API key, and EngageMate
+uses its internal key plus explicit user ID. Store each product's credentials in a protected
+Hermes-owned `%h/.config/products-mcp/<name>.env` file. The Claude connector receives only the
+public MCP URL.
+
+Deploy this branch in `~/backdoor-products-mcp`, then install
+[`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start
+the `hypercrawl`, `hyperscale`, and `engagemate` instances. Each instance loads its matching
+`%h/.config/products-mcp/<name>.env` credential file before `deploy/products-mcp-<name>.env`, so
+its bind address, port, OAuth issuer, state path, and product selection take precedence. The
+separate checkout keeps connector updates from changing the live router or Hermes bridge.
+
+Merge [`deploy/products-mcp.Caddyfile`](deploy/products-mcp.Caddyfile) into the host Caddyfile and
+add each public `/mcp` URL as a separate Claude custom connector. For each endpoint, complete OAuth,
+confirm three tools in `tools/list`, run the matching read-only `*_status` tool, and reload Claude to
+confirm persistence. Keep both the bare hostname and its `:443` form in each
+`HERMES_MCP_ALLOWED_HOSTS` value because Caddy may forward either form after TLS termination.
+
 ---
 
 <div align="center">
