@@ -1,4 +1,4 @@
-# Automatic Qwen Context Compaction Implementation Plan
+# Automatic Qwen Context Virtualization Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -17,8 +17,8 @@
 - Keep the current instruction in full and preserve tool/function call pairs as indivisible units.
 - Store transcripts under `~/.backdoor/context/` with directory mode `0700` and files mode `0600`.
 - Keep the archive under a 1GiB soft cap and prune inactive lineages after 30 days.
-- Never upload private transcript segments to Cognee.
-- Keep Cognee fail-open and optional with its existing timeout.
+- Never upload private transcript segments to any remote memory service.
+- Keep claude-mem recall fail-open with its existing timeout.
 - Leave healthy Claude and Codex cloud request and response bytes unchanged.
 - Cap breaker-driven local output at 1,024 tokens; retain the profile's 4,096-token cap for deliberate Qwen routes.
 - Do not change the detached live checkout, launchd files, router process, ports, or dependencies.
@@ -602,7 +602,7 @@ Expected: current active-turn rebuilding omits archived older task state and can
 
 - [ ] **Step 4: Extend the current Codex builder**
 
-Keep existing tool normalization, reasoning sanitization, encoded-body bounds, and 4K reply reserve. Replace active-turn-only input selection with the adapter's selected native items. Add bounded Cognee memories after deterministic local selection, then drop Cognee memories first if the final exact token gate exceeds 22K.
+Keep existing tool normalization, reasoning sanitization, encoded-body bounds, and 4K reply reserve. Replace active-turn-only input selection with the adapter's selected native items. Add bounded claude-mem recall after deterministic local selection, then drop recalled memories first if the final exact token gate exceeds 22K.
 
 Route both an already-open breaker and the failure that opens it through the shared runtime. Keep `codex_compact` as a direct cloud relay; Backdoor's local virtualization must not rewrite that endpoint.
 
@@ -634,7 +634,7 @@ git commit -m "feat(context): compact Codex tasks on Qwen routes"
 
 ---
 
-### Task 8: Internal historical retrieval and Cognee boundary
+### Task 8: Internal historical retrieval and local-memory boundary
 
 **Files:**
 
@@ -664,15 +664,15 @@ def test_internal_search_runs_once_and_caps_results(adapter, runtime):
     assert runtime.internal_rounds(prepared.request_hash) == 1
 ```
 
-- [ ] **Step 2: Write failing Cognee privacy and outage tests**
+- [ ] **Step 2: Write failing memory privacy and outage tests**
 
 ```python
-async def test_private_transcript_segments_are_never_sent_to_cognee(runtime, cognee):
+async def test_private_transcript_segments_are_never_sent_to_remote_memory(runtime, memory_worker):
     await runtime.prepare_local(private_context(), ClaudeContextAdapter(), settings())
-    assert cognee.remembered == []
+    assert memory_worker.remembered == []
 
-async def test_cognee_failure_keeps_local_compaction_working(runtime, cognee):
-    cognee.recall.side_effect = httpx.ConnectError("offline")
+async def test_memory_failure_keeps_local_selection_working(runtime, memory_worker):
+    memory_worker.recall.side_effect = httpx.ConnectError("offline")
     prepared = await runtime.prepare_local(oversized_context(), ClaudeContextAdapter(), settings())
     assert prepared.token_count <= 22_000
 ```
@@ -689,7 +689,7 @@ Expose the internal tool only to the local provider payload. Intercept its call 
 
 - [ ] **Step 5: Preserve the current external-source policy**
 
-Keep `prepare_external_context` and `prepare_codex_external_context` limited to approved public fetched sources. Do not call `remember_document` for transcript segments. Inject Cognee recall after local selection and remove it before selected transcript content when enforcing the hard limit.
+Keep `prepare_external_context` and `prepare_codex_external_context` limited to approved public fetched sources. Do not call `remember_document` for transcript segments. Inject claude-mem recall after local selection and remove it before selected transcript content when enforcing the hard limit.
 
 - [ ] **Step 6: Run search and external-context tests**
 
@@ -736,7 +736,7 @@ def test_readme_names_both_clients_and_live_control_boundary():
 
 - [ ] **Step 2: Build the isolated canary**
 
-The script must start an in-process or temporary-port source router and use temporary archive files. It must not call service-manager commands or write under the detached service checkout. Generate synthetic 142K Claude and Codex histories, assert local provider inputs at or below 22K, run two identical concurrent requests, disable Cognee, corrupt the temporary SQLite path, and replay one healthy cloud request byte-for-byte.
+The script must start an in-process or temporary-port source router and use temporary archive files. It must not call service-manager commands or write under the detached service checkout. Generate synthetic 142K Claude and Codex histories, assert local provider inputs at or below 22K, run two identical concurrent requests, disable local memory, corrupt the temporary SQLite path, and replay one healthy cloud request byte-for-byte.
 
 Print one line per result:
 
@@ -744,7 +744,7 @@ Print one line per result:
 PASS claude-142k-bounded
 PASS codex-142k-bounded
 PASS retry-coalesced
-PASS cognee-offline
+PASS memory-offline
 PASS sqlite-fallback
 PASS cloud-byte-faithful
 PASS live-boundary-untouched
@@ -752,7 +752,7 @@ PASS live-boundary-untouched
 
 - [ ] **Step 3: Document behavior and operator boundary**
 
-Document the 18K target, 22K hard limit, private archive location, 1GiB/30-day retention, deliberate-versus-breaker tool policy, Cognee boundary, and the fact that the client context gauge may still reflect full cloud history. State that 32K remains the supported 27B profile and 64K requires a separate isolated GGUF acceptance test.
+Document the 18K target, 22K hard limit, private archive location, 1GiB/30-day retention, deliberate-versus-breaker tool policy, local-memory boundary, and the fact that the client context gauge may still reflect full cloud history. State that 32K remains the supported 27B profile and 64K requires a separate isolated GGUF acceptance test.
 
 - [ ] **Step 4: Run focused context suites**
 
