@@ -276,6 +276,29 @@ class Settings(BaseSettings):
     # proceeds unlocked rather than failing the request. 0 disables queueing.
     local_tier_lock_timeout_seconds: float = 900.0
 
+    # The provider's window in ITS tokens, and how the router's tiktoken estimate
+    # relates to the provider's own count.
+    #
+    # Measured 2026-09-05 on a real routed Claude Code session, logging both
+    # numbers per request: estimate 66,016 -> provider 26,832 (0.41), estimate
+    # 90,286 -> 16,386 (0.18), estimate 89,530 -> 18,492 (0.21). The router
+    # OVER-counts, because count_messages prices the whole tool array and system
+    # block while the provider prices the rendered chat template.
+    #
+    # An earlier revision of this setting shipped 1.8, inflating the estimate on
+    # the belief that the provider counted more. It came from comparing two
+    # different requests, and it made things worse in a way worth recording: at
+    # 1.8 the guard is 15,095, which is BELOW the fixed cost of the system block
+    # plus tool schemas (~19K by the same estimate), so the working set could
+    # never fit and every session fell through to the ladder. A guard smaller
+    # than a request's irreducible overhead is not a guard, it is an off switch.
+    #
+    # 1.0 leaves the estimate alone. Raise it only from logged pairs — every
+    # local response now records "prompt: N provider tokens for an estimate of
+    # M (ratio R)", so the number can be set from evidence instead of belief.
+    provider_context_tokens: int = 32_768
+    local_token_estimate_ratio: float = 1.0
+
     # Optional runtime identity for profiles whose server lifecycle must be
     # supervised before a request can load weights. Unlike the hybrid router's
     # local `profile` variable, this survives `bd switch` into profile mode.

@@ -319,6 +319,11 @@ async def test_profile_mode_runs_the_runtime_interlock_before_provider_call(monk
         # This test isolates runtime supervision. Tier escalation has separate
         # coverage and would replace the runtime profile before this assertion.
         route_max_input_tokens=0,
+        # The window guard is physical, not a policy, so opting out of the soft
+        # limit above does not opt out of it — and the unstripped harness system
+        # prompt alone is ~20K, past a 32K window at the measured 1.8 ratio.
+        # Every real local profile strips it; so does this test now.
+        route_bare=True,
     )
     try:
         resp = await _post(app, _route_request(turns=1))
@@ -381,23 +386,52 @@ async def test_a_session_that_cannot_be_trimmed_still_escalates(route_app):
 # Ollama 0.32 rejects any system message that is not at index 0.
 # ---------------------------------------------------------------------------
 
-def test_system_messages_are_hoisted_to_the_front():
-    """Ollama 0.32 500s on a system message at index > 0, including when the
-    payload already opens with a valid one. 0.23.4 accepted both, so every
-    tool-using local session broke on the daemon upgrade (2026-08-16). The proxy
-    now normalises instead of trusting the provider to be lenient."""
+def test_stray_system_messages_fold_into_the_next_user_turn():
+    """Ollama 0.32 500s on a system message at index > 0. Until 2026-09-05 the
+    fix hoisted every stray one to the front, which satisfied Ollama and moved
+    the prompt HEAD on every turn — Claude Code attaches a fresh system-reminder
+    to most turns, so the cached prefix never matched again and a 7.7K-token
+    turn cold prefilled in 29s instead of appending in 5-10s (`hoisting 3 system
+    message(s) from position(s) [1, 4, 7]`, measured on a real routed session).
+    The stray content is kept, folded into the turn it accompanies."""
     from src.proxy.translate import _hoist_system_messages
 
     out = _hoist_system_messages([
         {"role": "system", "content": "first"},
         {"role": "user", "content": "hi"},
         {"role": "system", "content": "stray"},
+        {"role": "user", "content": "next"},
     ])
 
-    assert [m["role"] for m in out] == ["system", "user"], (
+    assert [m["role"] for m in out] == ["system", "user", "user"], (
         f"a system message survived at index > 0: {[m['role'] for m in out]}"
     )
-    assert out[0]["content"] == "first\n\nstray", "stray system content must be kept, not dropped"
+    assert out[0]["content"] == "first", "the head must not change between turns"
+    assert out[1]["content"] == "hi", "an earlier turn was rewritten"
+    assert "stray" in out[2]["content"] and out[2]["content"].endswith("next"), (
+        "stray system content must be kept, attached to the turn it precedes"
+    )
+
+
+def test_folding_keeps_the_prefix_stable_as_reminders_accumulate():
+    """The property the fold exists for: turn N+1's prompt must open with turn
+    N's, even though the client sent one more system-reminder."""
+    from src.proxy.translate import _hoist_system_messages
+
+    turn_n = [
+        {"role": "system", "content": "first"},
+        {"role": "system", "content": "reminder 1"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    turn_n1 = turn_n + [
+        {"role": "system", "content": "reminder 2"},
+        {"role": "user", "content": "q2"},
+    ]
+    a = _hoist_system_messages(list(turn_n))
+    b = _hoist_system_messages(list(turn_n1))
+
+    assert b[: len(a)] == a, "the prefix moved; every turn would be a cold prefill"
 
 
 def test_hoist_leaves_a_conforming_payload_untouched():
@@ -419,8 +453,11 @@ def test_hoist_handles_system_with_no_leading_system():
         {"role": "user", "content": "hi"},
         {"role": "system", "content": "late"},
     ])
-    assert [m["role"] for m in out] == ["system", "user"]
-    assert out[0]["content"] == "late"
+    # Nothing follows it, so it becomes a trailing user note rather than a new
+    # head — the head is the one place a late arrival must never land.
+    assert [m["role"] for m in out] == ["user", "user"]
+    assert out[0]["content"] == "hi"
+    assert "late" in out[1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -630,3 +667,89 @@ async def test_a_hosted_provider_is_never_bounded(monkeypatch):
     assert len(recorder.payload["messages"]) == 21, (
         "trimmed a hosted provider's request for a local window it does not have"
     )
+
+
+# ---------------------------------------------------------------------------
+# The provider's window, in the provider's tokens
+# ---------------------------------------------------------------------------
+# Measured 2026-09-05 on a real routed session: a request the router estimated
+# at 16,706 tokens arrived at Ollama as 29,640 (ratio 1.77). The 22K working set
+# at that ratio is 39K, past the 27B's 32K window; Ollama truncated from the
+# front, the model lost its instructions, and two turns came back empty.
+
+
+def test_the_window_guard_leaves_room_for_a_request_s_fixed_overhead():
+    """A guard below the irreducible cost of a request is an off switch.
+
+    Shipped at ratio 1.8 for one revision, the guard came to 15,095 — under the
+    ~19K the system block and tool schemas cost by the same estimate — so the
+    working set could never fit and every session fell through to the ladder.
+    Observed on a real session: "cannot reach 15095 tokens (tail alone is
+    19877)", five turns in a row.
+    """
+    from src.proxy.config import Settings
+    from src.proxy.routes import _window_guard
+
+    local = Settings(provider_base_url="http://localhost:11434/v1",
+                     provider_context_tokens=32_768, provider_max_tokens=4_096)
+    guard = _window_guard(local)
+    assert guard >= 20_000, (
+        f"guard {guard} is at or under the fixed overhead of a tool-carrying "
+        "request; the working set could never fit inside it"
+    )
+    assert guard < 32_768, "the guard must still be under the provider window"
+
+
+def test_a_narrow_tier_still_binds_the_ceiling():
+    """The guard exists for a tier whose window is genuinely smaller."""
+    from src.proxy.config import Settings
+    from src.proxy.routes import _window_guard
+
+    narrow = Settings(provider_base_url="http://localhost:11434/v1",
+                      provider_context_tokens=16_384, provider_max_tokens=4_096)
+    assert _window_guard(narrow) < Settings().local_working_set_max_tokens
+
+
+def test_a_wide_tier_keeps_the_configured_ceiling():
+    from src.proxy.config import Settings
+    from src.proxy.routes import _window_guard
+
+    wide = Settings(provider_base_url="http://localhost:11434/v1",
+                    provider_context_tokens=262_144, provider_max_tokens=8_192)
+    assert _window_guard(wide) > Settings().local_working_set_max_tokens
+
+
+def test_a_hosted_provider_has_no_window_guard():
+    from src.proxy.config import Settings
+    from src.proxy.routes import _window_guard
+
+    assert _window_guard(Settings(provider_base_url="https://integrate.api.nvidia.com/v1")) == 0
+
+
+def test_reaching_the_window_is_logged_loudly(caplog):
+    import logging
+    from src.proxy.config import Settings
+    from src.proxy.routes import _note_provider_count
+
+    s = Settings(provider_base_url="http://localhost:11434/v1",
+                 provider_context_tokens=32_768, provider_max_tokens=4_096)
+    with caplog.at_level(logging.WARNING, logger="src.proxy.routes"):
+        _note_provider_count("qwen3.8:27b-obliterated", 20_000, 29_640, s)
+    assert any("reached the window" in r.message for r in caplog.records), (
+        "an overflow must name itself; Ollama truncates from the front silently"
+    )
+
+
+def test_an_ordinary_prompt_records_the_ratio_without_warning(caplog):
+    """The pairs this logs are how the ratio gets set from evidence rather than
+    belief — the previous default was wrong precisely because it was not."""
+    import logging
+    from src.proxy.config import Settings
+    from src.proxy.routes import _note_provider_count
+
+    s = Settings(provider_base_url="http://localhost:11434/v1",
+                 provider_context_tokens=32_768, provider_max_tokens=4_096)
+    with caplog.at_level(logging.INFO, logger="src.proxy.routes"):
+        _note_provider_count("qwen3.8:27b-obliterated", 66_016, 26_832, s)
+    assert any("ratio 0.41" in r.message for r in caplog.records), [r.message for r in caplog.records]
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)

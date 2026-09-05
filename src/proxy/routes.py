@@ -496,6 +496,50 @@ _TRIM_NOTE = (
 )
 
 
+# Chat template, role markers and the injected memory block are not in the
+# router's count and come to roughly this much at the provider.
+_TEMPLATE_SLACK = 1_500
+
+
+def _window_guard(settings: Settings) -> int:
+    """The largest router-side estimate that still fits the provider's window.
+
+    (window - output reserve - template slack) / estimate ratio. For the 27B at
+    32,768 with a 4,096 reserve and the measured 1.8 ratio that is 15,095 — well
+    under the configured 22K ceiling, which is why the ceiling alone overflowed.
+    """
+    # A local tier's window is a property of this machine and its Modelfile.
+    # A hosted provider's is neither known here nor ours to second-guess.
+    if not ollama_admin.is_ollama(settings.provider_base_url):
+        return 0
+    window = max(0, settings.provider_context_tokens)
+    reserve = settings.provider_max_tokens if 0 < settings.provider_max_tokens < window else 4_096
+    ratio = max(1.0, float(settings.local_token_estimate_ratio or 1.0))
+    return max(0, int((window - reserve - _TEMPLATE_SLACK) / ratio))
+
+
+def _note_provider_count(provider: str, estimate: int, real: int | None, settings: Settings) -> None:
+    """Make an overflow loud. The provider's count is the truth; log the ratio
+    every time so the estimate can be tuned from evidence, and warn when the
+    prompt reached the window — Ollama truncates from the front without saying
+    so, and the symptom is a model that answers nothing."""
+    if not real:
+        return
+    ratio = real / estimate if estimate else 0.0
+    window = settings.provider_context_tokens
+    reserve = settings.provider_max_tokens if 0 < settings.provider_max_tokens < window else 4_096
+    if window and real >= window - reserve:
+        logger.warning(
+            "%s prompt reached the window: %d provider tokens against %d (estimate %d, "
+            "ratio %.2f) — expect truncation from the front; raise "
+            "LOCAL_TOKEN_ESTIMATE_RATIO or lower the working set",
+            provider, real, window - reserve, estimate, ratio,
+        )
+    else:
+        logger.info("%s prompt: %d provider tokens for an estimate of %d (ratio %.2f)",
+                    provider, real, estimate, ratio)
+
+
 def _bound_working_set(req, profile: str, settings: Settings):
     """Trim the transcript to a sticky local window. Returns (request, tokens).
 
@@ -506,20 +550,23 @@ def _bound_working_set(req, profile: str, settings: Settings):
     est = count_messages(req.messages, req.system, req.tools)
     if not settings.local_working_set:
         return req, est
+    guard = _window_guard(settings)
+    ceiling = min(settings.local_working_set_max_tokens, guard) if guard else settings.local_working_set_max_tokens
+    target = min(settings.local_working_set_target_tokens, int(ceiling * 0.8))
     res = working_set.bound(
         req.messages,
         req.system,
         req.tools,
         profile=profile,
-        target=settings.local_working_set_target_tokens,
-        ceiling=settings.local_working_set_max_tokens,
+        target=target,
+        ceiling=ceiling,
     )
     if res.keep_from == 0 or res.overflow:
         if res.overflow:
             logger.warning(
                 "working set for %s cannot reach %s tokens (tail alone is %s) — "
                 "leaving it to the ladder",
-                profile, settings.local_working_set_max_tokens, res.tokens,
+                profile, ceiling, res.tokens,
             )
         return req, est
     trimmed = req.model_copy(deep=False)
@@ -598,6 +645,7 @@ async def _tracked_local_stream(
     *,
     tier: tuple[str, str] | None = None,
     lock_timeout: float = 0.0,
+    keep_alive: str = "",
 ) -> AsyncIterator[str]:
     """Hold a local response's tier open for as long as it generates.
 
@@ -627,6 +675,12 @@ async def _tracked_local_stream(
             if due:
                 await _release_deferred(due, settings)
             await _drain_deferred_evictions()
+            # Re-clamped AFTER the response as well as before it. The clamp
+            # before is what the tests exercise; this one is what a session
+            # measured on 2026-09-05 needed, when the residency timer read the
+            # global default right after a routed stream finished.
+            if tier is not None and keep_alive:
+                await ollama_admin.set_keep_alive(tier[0], tier[1], keep_alive)
         except Exception:  # release is housekeeping; never mask the response
             logger.exception("deferred tier release failed")
 
@@ -855,7 +909,11 @@ async def create_message(
                 # not the transcript, so a long-lived route session outgrows its
                 # window; MODEL_ROUTES is static and would keep sending it there
                 # forever. Escalate instead of failing.
-                if settings.route_max_input_tokens and est > settings.route_max_input_tokens:
+                limit = settings.route_max_input_tokens
+                guard = _window_guard(settings)
+                if guard:
+                    limit = min(limit, guard) if limit else guard
+                if limit and est > limit:
                     escalated = pick_failover_profile(est)
                     if escalated != profile:
                         logger.warning(
@@ -977,7 +1035,11 @@ async def create_message(
     # wide 64K/256K ones) are unaffected, which also stops a second escalation
     # firing on top of the hybrid branch's.
     evicting: tuple[str, str] | None = None
-    if settings.route_max_input_tokens and est_in > settings.route_max_input_tokens:
+    tier_limit = settings.route_max_input_tokens
+    tier_guard = _window_guard(settings)
+    if tier_guard:
+        tier_limit = min(tier_limit, tier_guard) if tier_limit else tier_guard
+    if tier_limit and est_in > tier_limit:
         try:
             escalated = pick_failover_profile(est_in)
             esettings = load_profile_settings(escalated)
@@ -985,7 +1047,7 @@ async def create_message(
                 logger.warning(
                     "⇢ TIER ESCALATE [%s → %s] in≈%s over %s",
                     settings.provider_model, esettings.provider_model,
-                    est_in, settings.route_max_input_tokens,
+                    est_in, tier_limit,
                 )
                 evicting = (settings.provider_base_url, settings.provider_model)
                 settings = esettings
@@ -1064,7 +1126,7 @@ async def create_message(
     if req.stream:
         input_tokens = est_in
         body = _stream(client, payload, msg_id, req, input_tokens, provider,
-                       settings.provider_strip_inline_thinking)
+                       settings.provider_strip_inline_thinking, window_settings=settings)
         # Every local stream, not only the failover ones. A deliberate
         # `/model qwen` route holds no breaker claim — closing must not release
         # a tier it never claimed — but it does hold the GPU, and an escalation
@@ -1079,6 +1141,7 @@ async def create_message(
                 else None
             ),
             lock_timeout=settings.local_tier_lock_timeout_seconds,
+            keep_alive=settings.provider_keep_alive,
         )
         return StreamingResponse(
             body,
@@ -1134,6 +1197,11 @@ async def create_message(
             usage.get("output_tokens"),
             usage.get("input_tokens"),
         )
+        _note_provider_count(provider, est_in, usage.get("input_tokens"), settings)
+        if settings.provider_keep_alive and ollama_admin.is_ollama(settings.provider_base_url):
+            await ollama_admin.set_keep_alive(
+                settings.provider_base_url, provider, settings.provider_keep_alive
+            )
         return result
     finally:
         due = _local_stream_ended()
@@ -1153,6 +1221,7 @@ async def _stream(
     input_tokens: int,
     provider: str,
     strip_inline_thinking: bool = False,
+    window_settings: Settings | None = None,
 ) -> AsyncIterator[str]:
     # Backends that leave <think> tags in `content` rather than filling
     # `reasoning`; see Settings.provider_strip_inline_thinking.
@@ -1179,9 +1248,14 @@ async def _stream(
                 pending = None
                 break
             pending = None
+            if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+                state["provider_prompt_tokens"] = chunk["usage"].get("prompt_tokens")
             for event in stream_openai_to_anthropic(chunk, state, msg_id, req, input_tokens):
                 yield event
-        logger.info("← %s [stream] done in_tokens=%s", provider, input_tokens)
+        logger.info("← %s [stream] done in_tokens=%s provider_in=%s", provider, input_tokens,
+                    state.get("provider_prompt_tokens"))
+        if window_settings is not None:
+            _note_provider_count(provider, input_tokens, state.get("provider_prompt_tokens"), window_settings)
     except ProviderError as e:
         logger.error("Provider stream error %s: %s", e.status_code, e.message)
         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':e.message}})}\n\n"
