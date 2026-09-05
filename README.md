@@ -1239,12 +1239,24 @@ Turn two is the same size and 8.6x faster, and the provider accepts the replayed
 
 Memories sit between the history and the active turn on purpose: the block is rebuilt from a fresh recall query every turn, so anything placed after it is new work anyway, and putting it ahead of the history would make the history unreusable.
 
+#### The provider counts differently, so measure it
+
+The router sizes a request with tiktoken; Ollama prices the rendered chat template. Every local response now logs both — `prompt: 17677 provider tokens for an estimate of 19905 (ratio 0.89)` — and warns when a prompt reaches the window, because Ollama truncates from the front silently and the symptom is a model that answers nothing.
+
+Measured across a real routed Claude Code session on 2026-09-05, the ratio sat at **0.89–0.90** on ordinary traffic and fell to 0.18–0.41 when a single enormous message dominated. The router over-counts, mildly. `LOCAL_TOKEN_ESTIMATE_RATIO` therefore defaults to **1.0**, and `PROVIDER_CONTEXT_TOKENS` records each tag's real `num_ctx` so `_window_guard` can cap the working set at `(window − reply reserve − template slack) ÷ ratio`.
+
+This setting shipped at 1.8 for one revision, on the belief the provider counted more. That number came from comparing two different requests, and the session that caught it is worth keeping: at 1.8 the guard is 15,095, which is **below** the ~19K that the system block and tool schemas cost on their own, so the working set could never fit inside it and five turns in a row logged `cannot reach 15095 tokens (tail alone is 19877)` and fell through to the ladder. A guard smaller than a request's irreducible overhead is not a guard, it is an off switch. Raise the ratio only from logged pairs.
+
+**A harness note worth more than it looks.** Driving a dev router with `set -a; . profiles/<tier>.env` exports `PROVIDER_MODEL` into the process, and process env beats `env_file` in pydantic-settings — so every ESCALATED profile silently resolves back to that model, and a run that logs `ROUTE ESCALATE [... → local-failover-256k]` is still served by the 27B. Export only the router-level knobs when testing escalation. The live router carries no `PROVIDER_*` in its environment, so this is a test artifact rather than a deployed one; `ps -wwE` on the running process is how to confirm that.
+
 | Setting | Default | What it does |
 |---|---|---|
 | `LOCAL_WORKING_SET` | `true` | Bound the transcript for local tiers |
 | `LOCAL_WORKING_SET_TARGET_TOKENS` | `18000` | What a rebuild aims for |
 | `LOCAL_WORKING_SET_MAX_TOKENS` | `22000` | What triggers one |
 | `LOCAL_TIER_LOCK_TIMEOUT_SECONDS` | `900` | How long a second session waits before proceeding unlocked |
+| `PROVIDER_CONTEXT_TOKENS` | per tag | The tier's real `num_ctx`, which the window guard sizes against |
+| `LOCAL_TOKEN_ESTIMATE_RATIO` | `1.0` | Provider tokens per estimated token; raise only from logged pairs |
 
 Bounding applies only where the provider is a local Ollama tier. The ceiling is a property of this machine's GPU, so applying it to a hosted provider would discard context for nothing. The client keeps its full transcript either way — this decides what is forwarded, exactly as bare mode decides how much of each message is forwarded.
 
