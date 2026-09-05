@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 
 from .config import get_settings
+from .resolver import install as install_dns_cache
 from .client import ProviderClient
 from .logging_config import configure_logging as _configure_logging
 from .routes import failover_recovery_loop, router, set_provider_client
@@ -18,6 +19,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     _configure_logging(settings.log_file)
+    # Before any client is built: a gateway that stops answering DNS while it
+    # keeps routing is the single most common upstream failure on this host
+    # (722 of 731 transport failures in the log), and a remembered address gets
+    # the request through without the breaker having to claim the GPU.
+    install_dns_cache()
     logger.info("Starting backdoor → %s (%s)", settings.provider_base_url, settings.provider_model)
 
     client = ProviderClient(settings)

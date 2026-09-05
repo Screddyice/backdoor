@@ -3,9 +3,10 @@
 The client owns browsing. Once Claude Code, Codex, or another GUI has fetched a
 page, its tool result crosses Backdoor like any other transcript block. This
 module replaces a large result with a small question-relevant capsule and
-submits the original document to Cognee. Later turns recall a bounded slice.
+submits the original document to the local claude-mem worker. Later turns recall a bounded slice.
 
-Every network operation is fail-open. Cognee is reached through an SSH tunnel
+Every network operation is fail-open. Memory lives in the local claude-mem replica,
+so recall works with the network gone.
 on this machine, and that tunnel is unavailable during true offline failover.
 Qwen still gets the locally ranked capsule in that case.
 """
@@ -17,7 +18,6 @@ import copy
 import hashlib
 import json
 import logging
-import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -36,7 +36,6 @@ CONTEXT_CLOSE = "</qwen-external-context>"
 RECALL_OPEN = "<qwen-external-recall>"
 RECALL_CLOSE = "</qwen-external-recall>"
 
-DEFAULT_DATASET = "qwen_external_context"
 MAX_RECALLED_ITEM_CHARS = 2_000
 
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,}")
@@ -311,7 +310,7 @@ def _ranked_capsule(text: str, query: str, budget: int) -> str:
 
 
 def safe_to_remember(text: str) -> bool:
-    """Reject high-confidence credential material before any Cognee write."""
+    """Reject high-confidence credential material before any memory write."""
     return not any(pattern.search(text or "") for pattern in _SECRET_PATTERNS)
 
 
@@ -492,33 +491,6 @@ def compact_codex_tool_outputs(
     return out, documents
 
 
-def _load_cognee_credentials() -> tuple[str, str]:
-    base = str(os.environ.get("COGNEE_BASE_URL") or "").strip().rstrip("/")
-    key = str(os.environ.get("COGNEE_API_KEY") or "").strip()
-    for path in (Path.home() / ".cognee" / ".env", Path.home() / "projects" / ".env"):
-        if base and key:
-            break
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
-        for raw in lines:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, value = line.split("=", 1)
-            value = value.strip().strip("\"'")
-            if name.strip() == "COGNEE_BASE_URL" and not base:
-                base = value.rstrip("/")
-            elif name.strip() == "COGNEE_API_KEY" and not key:
-                key = value
-    return base, key
-
-
-def _dataset() -> str:
-    return str(os.environ.get("QWEN_COGNEE_DATASET") or DEFAULT_DATASET).strip()
-
-
 async def remember_document(document: ExternalDocument, settings: Any) -> bool:
     if (
         document.digest in _remembered_hashes
@@ -526,31 +498,21 @@ async def remember_document(document: ExternalDocument, settings: Any) -> bool:
         or not _source_safe_to_remember(document.source)
     ):
         return False
-    file_base, file_key = _load_cognee_credentials()
-    base = str(getattr(settings, "cognee_base_url", "") or file_base).strip().rstrip("/")
-    key = str(getattr(settings, "cognee_api_key", "") or file_key).strip()
-    if not base:
-        return False
-    headers = {"X-Api-Key": key} if key else {}
+    base = str(getattr(settings, "memory_worker_url", "") or "http://127.0.0.1:37701").rstrip("/")
     timeout = float(getattr(settings, "external_context_timeout_seconds", 1.5))
     payload = (
         f"Source URL: {document.source}\nSource ID: {document.digest}\n\n{document.text}"
     )
+    # The worker queues durably before any AI work; a verbatim prompt is searchable at
+    # once and syncs to every device.
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
-            f"{base}/api/v1/remember",
-            headers=headers,
-            data={
-                "datasetName": _dataset(),
-                "node_set": "qwen_external_sources",
-                "run_in_background": "true",
-            },
-            files={
-                "data": (
-                    f"source-{document.digest}.txt",
-                    payload.encode("utf-8"),
-                    "text/plain",
-                )
+            f"{base}/api/sessions/init",
+            json={
+                "contentSessionId": f"external-{document.digest[:24]}",
+                "project": "qwen-external-sources",
+                "platformSource": "backdoor",
+                "prompt": payload,
             },
         )
         response.raise_for_status()
@@ -581,30 +543,17 @@ def _collect_recalled_strings(value: Any) -> list[str]:
 
 
 async def recall_context(query: str, settings: Any) -> list[str]:
-    file_base, file_key = _load_cognee_credentials()
-    base = str(getattr(settings, "cognee_base_url", "") or file_base).strip().rstrip("/")
-    key = str(getattr(settings, "cognee_api_key", "") or file_key).strip()
-    if not base:
-        return []
-    headers = {"Content-Type": "application/json"}
-    if key:
-        headers["X-Api-Key"] = key
-    timeout = float(getattr(settings, "external_context_timeout_seconds", 1.5))
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            f"{base}/api/v1/recall",
-            headers=headers,
-            json={
-                "query": query,
-                "top_k": int(getattr(settings, "external_context_top_k", 6)),
-                "only_context": True,
-                "scope": ["graph"],
-                "datasets": [_dataset()],
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-    return _collect_recalled_strings(data)
+    """Recall from the local claude-mem replica; fail open."""
+    from . import memory as _memory
+
+    db = Path(str(getattr(settings, "memory_db_path", "") or "~/.claude-mem/claude-mem.db")).expanduser()
+    return await asyncio.to_thread(
+        _memory.recall,
+        query,
+        k=int(getattr(settings, "external_context_top_k", 6)),
+        char_budget=int(getattr(settings, "external_context_char_budget", 1200) or 1200),
+        cache=db,
+    )
 
 
 def _inject_recall(req: MessagesRequest, recalled: list[str], budget: int) -> MessagesRequest:
@@ -657,7 +606,7 @@ async def prepare_external_context(req: MessagesRequest, settings: Any) -> Messa
                 getattr(settings, "external_context_public_url_prefixes", "")
             ),
         )
-        if not bool(getattr(settings, "qwen_cognee", True)):
+        if not bool(getattr(settings, "qwen_memory", True)):
             return compacted
         if documents:
             documents = documents[
@@ -669,7 +618,7 @@ async def prepare_external_context(req: MessagesRequest, settings: Any) -> Messa
             )
             for result in results:
                 if isinstance(result, Exception):
-                    logger.warning("Cognee source write skipped: %s", type(result).__name__)
+                    logger.warning("memory source write skipped: %s", type(result).__name__)
             return compacted
 
         query = _last_user_text(compacted.messages)
@@ -678,7 +627,7 @@ async def prepare_external_context(req: MessagesRequest, settings: Any) -> Messa
         try:
             recalled = await recall_context(query, settings)
         except Exception as exc:  # noqa: BLE001 - memory must fail open
-            logger.debug("Cognee source recall skipped: %s", type(exc).__name__)
+            logger.debug("memory source recall skipped: %s", type(exc).__name__)
             return compacted
         return _inject_recall(
             compacted,
@@ -706,7 +655,7 @@ async def prepare_codex_external_context(
                 getattr(settings, "external_context_public_url_prefixes", "")
             ),
         )
-        if not documents or not bool(getattr(settings, "qwen_cognee", True)):
+        if not documents or not bool(getattr(settings, "qwen_memory", True)):
             return compacted
         documents = documents[
             : int(getattr(settings, "external_context_max_documents", 4))
@@ -718,7 +667,7 @@ async def prepare_codex_external_context(
         for result in results:
             if isinstance(result, Exception):
                 logger.warning(
-                    "Cognee Codex source write skipped: %s", type(result).__name__
+                    "memory Codex source write skipped: %s", type(result).__name__
                 )
         return compacted
     except Exception as exc:  # noqa: BLE001 - never drop a Codex request
@@ -730,7 +679,7 @@ async def recall_codex_external_context(
     payload: dict[str, Any], settings: Any
 ) -> list[str]:
     """Recall prior fetched sources for the local builder's memory budget."""
-    if not bool(getattr(settings, "qwen_cognee", True)):
+    if not bool(getattr(settings, "qwen_memory", True)):
         return []
     query = _codex_last_user_text(payload)
     if not query:
@@ -738,5 +687,5 @@ async def recall_codex_external_context(
     try:
         return await recall_context(query, settings)
     except Exception as exc:  # noqa: BLE001 - memory must fail open
-        logger.debug("Cognee Codex source recall skipped: %s", type(exc).__name__)
+        logger.debug("memory Codex source recall skipped: %s", type(exc).__name__)
         return []

@@ -18,7 +18,7 @@ def test_codex_runtime_settings_accept_operator_environment(monkeypatch):
     monkeypatch.setenv("CODEX_CHATGPT_UPSTREAM", "https://cloud.test/backend-api/codex")
     monkeypatch.setenv("CODEX_LOCAL_RESPONSES_URL", "http://127.0.0.1:11434/v1/responses")
     monkeypatch.setenv("CODEX_LOCAL_MODEL", "qwen3.8:27b-obliterated")
-    monkeypatch.setenv("COGNEE_BASE_URL", "http://127.0.0.1:8001")
+    monkeypatch.setenv("MEMORY_WORKER_URL", "http://127.0.0.1:37701")
     monkeypatch.setenv("CODEX_CONTEXT_WINDOW", "32000")
     monkeypatch.setenv("CODEX_FAILOVER_THRESHOLD", "3")
     monkeypatch.setenv("CODEX_FAILOVER_STATUSES", "429,503,401")
@@ -29,7 +29,7 @@ def test_codex_runtime_settings_accept_operator_environment(monkeypatch):
     assert settings.codex_chatgpt_upstream == "https://cloud.test/backend-api/codex"
     assert settings.codex_local_responses_url == "http://127.0.0.1:11434/v1/responses"
     assert settings.codex_local_model == "qwen3.8:27b-obliterated"
-    assert settings.cognee_base_url == "http://127.0.0.1:8001"
+    assert settings.memory_worker_url == "http://127.0.0.1:37701"
     assert settings.codex_context_window == 32_000
     assert settings.codex_failover_threshold == 3
     assert settings.codex_max_request_bytes == 64 * 1024 * 1024

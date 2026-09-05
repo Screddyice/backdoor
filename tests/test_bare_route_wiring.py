@@ -77,8 +77,8 @@ def _harness_request(model: str = "qwen") -> dict:
             {"name": "Read", "description": "read a file", "input_schema": {}},
             {"name": "WebSearch", "description": "search the web", "input_schema": {}},
             {"name": "WebFetch", "description": "fetch a URL", "input_schema": {}},
-            {"name": "mcp__plugin_mem0_mem0__search_memories",
-             "description": "recall", "input_schema": {}},
+            {"name": "mcp__example__crm_lookup",
+             "description": "lookup", "input_schema": {}},
         ],
         "messages": [
             {"role": "user", "content": "why is qwen still the 4b?"},
@@ -98,7 +98,7 @@ def _pin(monkeypatch, **overrides):
         router_mode="hybrid",
         provider_base_url="http://localhost:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
-        qwen_cognee=False,
+        qwen_memory=False,
     )
     monkeypatch.setattr(
         routes, "load_profile_settings", lambda profile: Settings(**base, **overrides)
@@ -123,24 +123,6 @@ async def test_explicit_route_arrives_stripped(routed_app):
     assert not any(n.startswith("mcp__") for n in names), names
     assert "When current information would improve the answer" in sent
     assert "lost its network connection" not in sent
-
-
-async def test_explicit_route_externalizes_large_fetched_page(routed_app):
-    """The GUI may vary; the provider request crossing Backdoor is the seam."""
-    app, recorder, monkeypatch = routed_app
-    _pin(monkeypatch, route_bare=True)
-    body = _harness_request()
-    body["messages"][1]["content"][0]["name"] = "WebFetch"
-    body["messages"][1]["content"][0]["input"] = {"url": "https://example.com/report"}
-    body["messages"].append({"role": "user", "content": "What does the report say?"})
-
-    resp = await _post(app, body)
-
-    assert resp.status_code == 200
-    sent = json.dumps(recorder.payload)
-    assert "<qwen-external-context" in sent
-    assert "https://example.com/report" in sent
-    assert "Z" * 10_000 not in sent
 
 
 async def test_explicit_route_externalizes_large_fetched_page(routed_app):
@@ -294,7 +276,7 @@ def profile_app(monkeypatch):
         route_bare=True,
         provider_base_url="http://localhost:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
-        qwen_cognee=False,
+        qwen_memory=False,
     )
     try:
         yield app, recorder
@@ -345,7 +327,7 @@ async def test_profile_mode_leaves_the_harness_alone_when_route_bare_is_off(monk
         route_bare=False,
         provider_base_url="http://localhost:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
-        qwen_cognee=False,
+        qwen_memory=False,
     )
     try:
         resp = await _post(app, _harness_request(model="claude-opus-4-1"))

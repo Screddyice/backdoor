@@ -275,6 +275,64 @@ GPU and routes a live session to a local model while the cloud was fine. If veri
 misbehaves on a network this was not tested against, it can be switched off without a deploy.
 Leaving it set re-opens the hole.
 
+### The probe also asks whether DNS answers
+
+`internet_usable` is what the offline-gated breaker calls, and it asks two questions in order: does
+a link probe verify a peer, and does `name_resolution_works` get an address back for
+`one.one.one.one` or `dns.google`. Either half missing means offline. Resolution goes second, so the
+common outage still costs one TCP probe and no lookup, and a dead link never gets logged as a DNS
+fault.
+
+The literal-IP probes left DNS unmeasured, and that was its own silent hole. On 2026-09-04 between
+23:36:32 and 23:39:41 every upstream request failed with `[Errno 8] nodename nor servname provided`
+while the link stayed up. `internet_reachable` verified a peer on the first probe each time, so the
+Anthropic breaker read the host as online, logged `Anthropic failing (ConnectError) but this host is
+online`, and handed roughly 200 requests a `502` apiece across three and a half minutes. The Codex
+breaker never consults connectivity, opened at 23:36:39, and served the same outage from the local
+model. One host, one outage, opposite outcomes.
+
+`getaddrinfo` takes no timeout and `socket.setdefaulttimeout` does not reach it, so the lookup runs
+on a daemon thread the router stops waiting for after `RESOLUTION_TIMEOUT` (8 s, the same patient
+budget the ambiguous handshake gets). A resolver that accepts queries and never replies reads as
+broken without stalling the turn, and the abandoned thread cannot block a restart.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RESOLUTION_PROBE_NAMES` | probe cert names | Names tried; any one answering proves the resolver works |
+| `RESOLUTION_TIMEOUT` | `CONNECTIVITY_TIMEOUT × CONNECTIVITY_SLOW_FACTOR` | How long a lookup gets before DNS reads as broken |
+
+### Last-known-good DNS
+
+`src/proxy/resolver.py` wraps `socket.getaddrinfo` for the router process. A
+successful lookup is remembered for six hours; a lookup that fails with a resolver
+error is answered from that memory rather than raised. `install()` runs first thing
+in the app lifespan, before any client exists.
+
+This machine has one resolver, the LAN gateway DHCP hands out, and 722 of the 731
+upstream transport failures in the router log are `[Errno 8] nodename nor servname
+provided`. The link was up for all of them. An address the router already knows is
+enough to get those requests through.
+
+Serving an old address costs nothing in safety: the connection still verifies TLS
+against the hostname that was asked for, so an address that has moved on to someone
+else fails the handshake instead of being trusted. If it is simply dead, the request
+fails as it would have anyway and the breaker takes over.
+
+**This layer exists so the breaker does not have to fire.** Opening it loads a 17 GB
+tier into the Ollama server the llm-jury council needs, which `failover.py` allows
+only when local is the one way a session survives. A cached address that connects
+means it was not, so the session stays on the cloud model and the GPU stays free.
+
+The failover DNS probe is deliberately exempt. `name_resolution_works` calls
+`resolver.system_getaddrinfo()` to reach the stdlib directly, because a probe asking
+whether DNS answers cannot be answered from a cache of the times it did.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `BACKDOOR_DNS_CACHE` | unset | Set to `0` to disable and leave `socket.getaddrinfo` alone |
+| `CACHE_TTL` | 6 h | How long a remembered address stays usable |
+| `CACHE_MAX` | 256 | Entries kept before the oldest is dropped |
+
 ## Troubleshooting
 
 **`500 ... "system message must be at the beginning"`**
@@ -409,17 +467,24 @@ While ChatGPT inference works, Backdoor relays the original request, OAuth heade
 
 The relay accepts request bodies up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must send a larger encoded request.
 
-After three eligible failures inside 120 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+After an eligible failure persists for 20 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+
+Cloudflare can also lose a valid provider route and return a bare `404` with a
+`cf-ray` header. Backdoor counts that unstructured response as outage evidence
+for both Codex and Claude, even when other internet hosts remain reachable. It
+still relays structured JSON `404` errors, such as an invalid model, so failover
+does not conceal a real client or API error. Claude transport failures keep the
+existing whole-machine connectivity gate.
 
 The visible Codex thread does not change. Qwen receives a fresh internal request containing:
 
 - the latest user instruction and the active local tool loop, including a paired tool continuation that does not repeat the user message;
-- a bounded recall from Cognee when `QWEN_COGNEE` is enabled;
+- a bounded recall from the local claude-mem replica when `QWEN_MEMORY` is enabled;
 - local Code Mode tools converted from Codex's Responses Lite namespace format.
 
-It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Cognee can provide continuity without forcing the 27B model to prefill the session that caused the outage or compaction failure. Backdoor reads agent recall through `POST /api/v1/recall`. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_COGNEE=0` to suppress every Cognee read and write on the local path.
+It does not receive the old cloud transcript, cloud reasoning context, prompt-cache identifiers, OAuth headers, remote MCP schemas, hosted web-search tools, or image and file attachments. Backdoor reads the synced local replica at `~/.claude-mem/claude-mem.db`, so recall works without a network call or memory tunnel. Durable fetched-source storage remains off unless an operator configures reviewed public URL prefixes; authenticated, browser-session, malformed, and unpaired tool results remain ephemeral. Set `QWEN_MEMORY=0` to suppress memory reads and writes on the local path.
 
-Cognee authentication resolves from the running process, `~/.cognee/.env`, then the existing `~/.cognee-plugin/api_key.json` cache when its server URL matches. The key is not copied into the Backdoor LaunchAgent.
+Backdoor sets `reasoning.effort=none` on the local Responses request so Ollama answers with a plain assistant message. Ollama's own reasoning items carry `encrypted_content` signed locally, which ChatGPT cannot verify once the breaker closes; a thread carrying them cannot go back to cloud inference. Keeping them out of Codex history is what lets the same task return to cloud.
 
 The breaker permits one ChatGPT probe every 60 seconds while open. A probe closes it the moment ChatGPT returns response headers, the same point the Anthropic path uses: a status line proves this host can still reach the upstream, and reachability is the only question the breaker asks. Later turns return to cloud immediately. Qwen is released separately, once a relayed stream finishes, because a probe whose body dies mid-flight is about to be retried and unloading the tier that will serve that retry only buys a reload.
 
@@ -436,7 +501,7 @@ Backdoor enforces this allocation on the fresh request that it sends to Qwen:
 | Component | Limit |
 | --- | ---: |
 | Local guidance | 1,000 tokens |
-| Cognee recall | 2,000 tokens |
+| claude-mem recall | 2,000 tokens |
 | Local tool schemas | 4,000 tokens |
 | Current task and active tool results | 21,000 tokens |
 | Reply reserve | 4,000 tokens |
@@ -500,9 +565,19 @@ What each route does now when upstream will not answer:
 | `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage |
 | `/{path:path}` | `502` |
 
-Recording a failure never opens the breaker on its own. `internet_reachable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+Recording a failure never opens the breaker on its own. `internet_usable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
 
 ### Deploying: scripts/deploy-router.sh
+
+`DRY_RUN=1` prints the plan and skips the quiet-window wait, because a dry run restarts nothing and
+therefore has no in-flight requests to protect. That wait is also the one step a dry run could never
+finish: a live Claude session writes to the router log every few seconds, so the window never opens,
+and asking to see the plan would end in `ABORT: still busy after 180s` with the plan never printed.
+
+A real run still waits. When it cannot get a quiet window — another session is mid-turn, and on this
+machine one usually is — `FORCE=1` proceeds and drops whatever is in flight. There is no
+zero-downtime path here, so that is the honest trade rather than a workaround.
+
 
 Deploying the router is a fast-forward and a restart, and on 2026-09-03 doing it as a list of shell lines went wrong in the dullest way available: the two git steps failed, the restart at the bottom ran anyway, and the router came back on unchanged code having dropped every in-flight request. Every live session reported an API error. Nothing deployed, and something still broke.
 
@@ -536,32 +611,13 @@ It used to be asserted as `bounds[-1] == float("inf")` — the shape of the data
 
 Every Claude failover in the log used to read `after 1 consecutive failures`, and raising that number would not have helped. Requests are concurrent, so a consecutive-failure count is satisfied in a single instant — measured 2026-09-03 at `14:46:18.113`, four transport failures landed in the same millisecond, all `[Errno 8] nodename nor servname provided` from one DNS hiccup. Any threshold trips on that burst. Counting never told a two-second blip apart from an outage; elapsed time does.
 
-Both breakers require the upstream to have been failing for ten seconds
-(`failover_min_outage_seconds`, `codex_failover_min_outage_seconds`) before they
-may open. The gate runs before the connectivity probe, so a burst no longer
-fires one TLS handshake per failure.
+Both clients require the upstream to fail for 20 seconds before their breakers
+may open. The gate runs before the connectivity probe, so a burst does not fire
+one TLS handshake per failure.
 
-**Ten, and the number came from the logs rather than taste.** It shipped at 30 s
-on 2026-09-03 and came down the same day. During the gate the router hands the
-client a 502 — the *same* 502 on both paths, from symmetric code — and the one
-real outage after the gate went live cost 60 seconds of them: first failure
-17:50:08, breaker open 17:51:08. Measuring 79 outage bursts across the router
-logs settles it: median 3 s, and a 10 s gate absorbs 64% of bursts where 30 s
-absorbs 69%. Five points of extra protection for triple the user-visible error
-window is a bad trade, and 30% of bursts outlast any gate at all, where the wait
-is pure cost.
-
-**Codex was aligned to the same number, and that is the softer call.** Codex
-Desktop does not retry — it surfaces the 502 — so during the gate a Codex user
-sees a hard error where a Claude user sees a retry banner. PR #91 set its gate to
-zero for exactly that reason, against a 30 s Claude gate. Bringing Claude down to
-10 s removed the asymmetry's justification rather than its cost: the gap is now
-10 s of visible errors against 10 s of retried ones, not 60 s against none. What
-the gate buys on both paths is not loading a 17 GB local tier for a blip, and 48%
-of measured bursts are two seconds or shorter. If Codex 502s prove worse in
-practice than that GPU churn, revert `codex_failover_min_outage_seconds` to zero;
-it is one number and the reasoning is in `config.py`. Authentication and request
-errors still bypass failover on both paths.
+The shared 20-second gate is the operator policy for Codex and Claude. During
+that window, each client retains its normal retry or error behavior.
+Authentication and request errors still bypass failover on both paths.
 
 During the gate the real errors are relayed, and Claude Code retries through
 them. That avoids moving a live Claude session onto a local
@@ -575,11 +631,17 @@ Sixteen desktop popups on the evening of 2026-09-02. Every transition is still l
 
 This is load-bearing rather than politeness: the recovery ticker below makes transitions *more* frequent, so without rationing it would have made the noise worse.
 
+**A cooldown alone still let one outage speak twice.** It rations a single breaker over time, and a dropped link is not a single breaker — it takes every upstream at once. The outages at 22:13 and 23:43 on 2026-09-03 each produced four popups for one Wi-Fi blip: Anthropic open, Codex open, Anthropic closed, Codex closed. So a breaker also stays quiet when a peer on the same router is already open. Whichever gets there first says "routing to local model"; the rest log the transition and say nothing, and their closes stay silent under the same orphan rule. Replaying that night's real transitions turns 10 popups into 4.
+
+A breaker that fails while every peer is healthy still speaks — that is a report about one upstream, not a duplicate. Codex timing out on a working link at 23:57 that same night was the only news there was, and it still announces.
+
+Worth knowing when a burst of these shows up at once: **macOS holds notifications through a Focus or a scheduled summary and releases them in a batch**, stamped with the release time rather than the outage. A stack of popups reading "1m ago" can be a backlog going back days — 74 transitions accumulated between 2026-08-26 and 2026-09-04. Check `~/.backdoor/failover-state.json` for the truth: `failover_active` and an `updated_at` that only moves on a real transition.
+
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `failover_min_outage_seconds` | `10.0` | How long the upstream must stay broken before failover may open |
+| `failover_min_outage_seconds` | `20.0` | How long the Claude upstream must stay broken before failover may open |
 | `failover_notify_cooldown_seconds` | `900.0` | Minimum gap between failover notifications, per breaker |
-| `codex_failover_min_outage_seconds` | `10.0` | Same gate as Claude. Was `0.0` while Claude's gate was 30 s; see above for why aligning them was the better trade |
+| `codex_failover_min_outage_seconds` | `20.0` | How long the Codex upstream must stay broken before failover may open |
 | `codex_failover_notify_cooldown_seconds` | `900.0` | The same rationing for the Codex breaker |
 
 ### Recovery does not wait for traffic
@@ -618,6 +680,51 @@ Backdoor cannot rescue the truncated request. It now does the two things still a
 A dead stream still runs the connectivity probe before anything opens. If Anthropic dropped your stream while this host is online, Backdoor relays the failure and leaves the GPU alone.
 
 Hanging up yourself does not count. `CancelledError` and `GeneratorExit` are not `httpx.TransportError`, so pressing Ctrl-C never pushes the breaker toward claiming the GPU.
+
+
+### A local tier that stops answering
+
+`API Error: 500 Internal server error` is what Claude Code shows you when a server breaks, and until now Backdoor could write one itself.
+
+Both local-provider call sites caught `ProviderError`, which covers a status Ollama returned and nothing else. A transport failure matched neither clause. In practice that meant `httpx.ReadTimeout` against a tier still prefilling past the 600s read budget: the exception escaped to uvicorn, uvicorn answered `500`, and the router log named neither the tier nor the timeout. It fired 62 times between 2026-08-26 16:19 and 2026-09-02 23:56, the last stretch of them every ten minutes on a scheduled caller.
+
+Both paths now answer for themselves:
+
+| | |
+|---|---|
+| Completion | `504` on a timeout and `502` on anything else, with the tier name in the body, so your client keeps its own retry and backoff |
+| Stream | An SSE `error` event, because the headers left with the first heartbeat and no status remains to send |
+| Either | One `Provider transport failure on <tier>` line carrying the exception name |
+
+The cloud side had the quieter half of the same problem. A relayed upstream error carried no status into the log, so a `500` from Anthropic and a turn that worked both printed `→ passthrough [claude-opus-5] /v1/messages` and nothing more. One session hit that on 2026-09-03 at 21:24, and the log could not tell you which side wrote the error. Backdoor now logs `upstream POST /v1/messages → 500 (relayed verbatim)` at WARNING for every relayed status at or above 400. Healthy turns still cost one line each.
+
+
+### The breaker's verdict does not run on the event loop
+
+`record_failure` calls `internet_reachable`, a blocking socket probe against a public address. It
+is the thing that decides whether a run of failures means *this host is offline* or just *Anthropic
+is having a moment*, and it was called straight from the request coroutine. So every failed turn
+froze the router for the length of that probe, for every other session on it, at exactly the moment
+the router is busiest.
+
+Moving it to a worker thread fixes the stall and exposes a second fault underneath. A probe started
+by one request can finish after a NEWER request has already succeeded and closed the breaker, and it
+then writes its stale verdict over that success. The window is the probe's own duration, which on a
+degraded link is seconds.
+
+So one lock serialises every breaker verdict, failure and success alike, and the breaker sees them in
+the order the requests actually resolved. Cancellation gets its own rule: cancelling an `await` cannot
+stop the worker thread it is waiting on, so a cancelled caller keeps the lock until its probe finishes.
+Releasing early would let that thread mutate the breaker behind whoever took the lock next.
+
+| | |
+|---|---|
+| Probe | Runs in a worker thread, never on the event loop |
+| Ordering | One `asyncio.Lock` over failure and success, so a slow probe cannot overwrite a newer success |
+| Cancellation | The lock is held until the orphaned probe thread finishes |
+
+`DEFAULT_FAILOVER_THRESHOLD` replaces the bare `1` that `Settings.failover_threshold` and
+`FailoverBreaker.__init__` each carried, with a comment on each asking the other to stay in step.
 
 
 ### Forward-proxy mode: failover *and* Remote Control
@@ -683,10 +790,12 @@ Two behaviours are worth knowing before you rely on it:
 
 Settings `env` has no health gate of its own, so pair it with a wrapper that checks the port when you care about that degradation path.
 
-**Backdoor retries one transient Anthropic transport failure before surfacing it.** Connect,
-write, read, and protocol failures can clear between attempts. The router retries once on the
-same pool, then lets the circuit breaker decide whether the host is offline. Pool exhaustion uses
-a fresh pool as described below.
+**Backdoor retries one pre-send Anthropic transport failure before surfacing it.** A connect or
+pool failure means nothing reached Anthropic, so a second attempt cannot duplicate anything. The
+router retries those once on the same pool, then lets the circuit breaker decide whether the host
+is offline. Pool exhaustion uses a fresh pool as described below. Read, write and protocol errors
+are never replayed: the request may already be on Anthropic's side, and a blind retry would bill
+and run the turn twice.
 
 **Backdoor recovers the Anthropic pool after a dropped network.** Active streams can occupy every
 shared HTTP connection while Wi-Fi changes or DNS disappears. A later request then raises
@@ -733,6 +842,29 @@ create a second, unbounded copy under `/tmp`.
 | `FORWARD_CA_DIR` | `~/.backdoor/ca` | CA and minted leaves |
 
 Set `FORWARD_ROUTER_PORT` explicitly if you launch uvicorn with `--port`: that flag never reaches `Settings`, so `PORT` will not reflect it.
+
+#### What the proxy log tells you, and what it used to bury
+
+Three things can end an intercepted connection early, and `_intercept` caught all three in one clause and logged them under one message: `TLS interception for api.anthropic.com ended early`. The comment above it blamed a client that does not trust the router CA. Count them over the 8 days ending 2026-09-03 and that story falls apart:
+
+| Exception | Occurrences | What it means |
+|---|---|---|
+| `ConnectionResetError` | 33,092 | The client dropped a pooled tunnel with an RST |
+| `TimeoutError` | 465 | The client took the `200` and never sent a ClientHello |
+| `ssl.SSLError: TLSV1_ALERT_UNKNOWN_CA` | 25 | The client does not trust the router CA |
+
+Claude Code and Codex both pool their sockets, so the first two rows are pool churn and neither is a fault. They also cost about a third of a 10 MB rotation, and they buried the 25 lines that matter. A client hitting that third row cannot reach the router at all, which is worth reading on the day it happens rather than after `grep -c`.
+
+Each one now gets its own treatment:
+
+| | |
+|---|---|
+| CA distrust | WARNING every time, naming the host and the path to the CA the client needs to trust |
+| Dropped before TLS | Counted, then one INFO line per 5 minutes with the total and the split between resets and handshake timeouts |
+| Failure after the splice starts | WARNING, because `_pipe` swallows all three and `_splice` gathers with `return_exceptions=True`, so this should be unreachable. If it ever fires, that is news |
+
+There is no per-occurrence line for the dropped tunnels, DEBUG included. `configure_logging` puts the root logger at DEBUG, so a debug call would write all 33,557 of them to the same file under a quieter label.
+
 
 #### Do not run the service from your dev checkout
 
@@ -803,9 +935,7 @@ qwen mcp screddy-hermes -p "check the requested conversation"
 qwen mcp composio-tmn,atlassian
 ```
 
-`qwen mcp NAME` validates each name against `~/.claude.json`, runs the same certificate-verifying internet probe as the hybrid router, and writes a private session config under `~/.cache/backdoor/`. Only the named servers start, alongside the compact Cognee memory shim when Cognee is enabled. If the Mac is offline, Qwen skips the requested MCP connection and keeps working with local tools. `QWEN_MCP_ASSUME_ONLINE=1` bypasses the probe on a network that blocks its public endpoints while allowing the selected MCP.
-
-Mem0 sits on the dropped side and loses nothing. Its MCP tools call `mcp.mem0.ai` and cannot work offline, but local Mem0 recall still reaches the model, because the recall hook reads `~/.mem0-local/cache.db` client-side and injects memories into the prompt before the request leaves the machine. Bare mode keeps that text.
+`qwen mcp NAME` validates each name against `~/.claude.json`, runs the same certificate-verifying internet probe as the hybrid router, and writes a private session config under `~/.cache/backdoor/`. Only the named servers start. Memory stays independent of this switch because Backdoor reads the local claude-mem replica. If the Mac is offline, Qwen skips the requested MCP connection and keeps working with local tools. `QWEN_MCP_ASSUME_ONLINE=1` bypasses the probe on a network that blocks its public endpoints while allowing the selected MCP.
 
 **The tier must accept tool definitions.** This is a hard pairing, not a preference. `deepseek-r1` at any runnable size does not: Ollama answers a request carrying tools with `does not support tools`, HTTP 400, killing the session failover exists to save. If you swap the tier for a model without tool support, set `failover_keep_tools=""` at the same time.
 
@@ -923,17 +1053,11 @@ The backend must also return usable summary text. On 2026-08-28 the action-tuned
 
 #### Memory is the other half of a small window
 
-A short window is only workable if the facts have somewhere else to live. `QWEN_COGNEE` therefore defaults to **1** (flipped from opt-in on 2026-08-22), attaching Cognee memory over the two-tool stdio shim.
+A short window works only when durable facts live outside the prompt. Backdoor reads the local claude-mem SQLite replica before each local turn and injects a bounded result as background context. This adds no MCP schema and still works when the network is down. `QWEN_MEMORY=0` disables recall.
 
-This is the one documented exception to the MCP-off rule, and the token arithmetic is why it survives that rule. The global MCP set costs about 142K tokens of schema. The shim exposes `cognee_search` and `cognee_remember` and nothing else, so it costs hundreds. Against a 32K window the first is impossible and the second is affordable.
+Large fetched pages also bypass the model window at the proxy layer. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted to the local claude-mem worker. Browser-session tools never persist their output.
 
-Without memory, every durable fact has to be carried in-context, which is precisely what fills the window that the section above just finished bounding. Both failure modes have the same shape, so both fixes ship together.
-
-Large fetched pages also bypass the model window at the proxy layer, making the behavior independent of GUI plugins. Once Claude, Codex, or another client returns a page as a tool result, Backdoor replaces results over 12,000 characters with up to 6,000 characters of passages ranked against the current question. Durable storage is off by default. `EXTERNAL_CONTEXT_PUBLIC_URL_PREFIXES` accepts comma-separated, reviewed public URL prefixes whose unauthenticated fetch output may be submitted with its URL and content hash to the dedicated `qwen_external_context` Cognee dataset. Browser-session tools never persist their output. Later Qwen turns search that dataset and inject only a bounded set of recalled passages. The first turn does not wait for Cognee indexing: local ranking supplies its excerpts while Cognee processes an approved durable copy in the background.
-
-This boundary is client-independent because every local Qwen request crosses Backdoor. Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Unapproved, authenticated, intranet, and client sources remain ephemeral even when their content looks harmless. Approved source text is marked as untrusted data, high-confidence credential-shaped documents are not written, and stored source URLs exclude user information, query strings, and fragments. Individual documents are capped at 500,000 characters before ranking, and each request can enqueue at most four documents. Cognee calls time out after 1.5 seconds. A Cognee or SSH-tunnel failure never drops the request. `QWEN_COGNEE=0` disables writes and recall for true-offline work, while the local 6,000-character reduction still protects Qwen's window.
-
-The proxy resolves Cognee settings from its process environment, then `~/.cognee/.env`, then `~/projects/.env`. That makes the same behavior available to terminal launchers and Dock-launched clients that never source `.zshrc`. A missing key or unreachable service degrades to local reduction only.
+Backdoor does not fetch arbitrary URLs itself; the client remains responsible for browsing and authentication. Unapproved, authenticated, intranet, and client sources remain ephemeral. Approved source text is marked as untrusted data, high-confidence credential-shaped documents are not written, and stored source URLs exclude user information, query strings, and fragments. Individual documents are capped at 500,000 characters before ranking, and each request can enqueue at most four documents. Worker calls time out after 1.5 seconds and fail open, while the local 6,000-character reduction still protects Qwen's window.
 
 #### The guard has to sit below every routing branch
 
@@ -1032,9 +1156,167 @@ Backdoor now counts the failover responses that are still generating and holds t
 
 Recovery is not instant. While OPEN the breaker probes upstream once per `failover_probe_seconds` (60s), so it cannot notice Anthropic is back until it is allowed to try. Release lands within about a minute of real recovery, against the nine minutes above.
 
-`PROVIDER_KEEP_ALIVE` is set on `local-failover-256k` and `local-failover-128k` only. Do not set it on a tier reachable through `MODEL_ROUTES`: a deliberate `/model qwen` session that thinks for longer than the clamp would evict its own 17 GB model and reload it next turn, which is slower and more memory churn than leaving it resident. The same rule is why only breaker-diverted requests are claimed at all — the user asked for that tier, so it is not ours to evict.
+`PROVIDER_KEEP_ALIVE` does two opposite jobs, and which one depends on who asked for the tier.
+
+On `local-failover-256k` and `local-failover-128k` it is `45s`, to release EARLY: nobody asked for those tiers, and an outage that ends with its sessions abandoned leaves no successful call to close the breaker.
+
+On `local-qwen38-obliterated` it is `10m`, to release LATE. The rule here used to be "never set this on a tier reachable through `MODEL_ROUTES`", because a short clamp would make a `/model qwen` session evict its own 17 GB model while the user was still thinking. That reasoning was right about short clamps and it argues for a long one: the global `OLLAMA_KEEP_ALIVE` is five minutes, and the working set only pays while Ollama still holds the prefix, so any pause longer than five minutes silently costs a 70-100s cold prefill at an 18K window. Ten minutes rather than thirty because a resident 27B is 17 GB and every minute of it is a minute `llmjury solve` can collide with, Ollama capping by model count and never by bytes.
+
+Only breaker-diverted requests are CLAIMED, which is a different thing: a claim is released when the breaker closes, and the user asked for a routed tier, so it is not ours to evict on someone else's schedule. Escalation is the one exception, above.
+
+#### Escalating frees the tier it leaves
+
+The rule above says a tier the user deliberately asked for is not ours to evict. Escalation is the one case where it stops applying, because the session has already stopped using it. A `/model qwen` session that outgrows the 27B is moved to `qwen3.5:4b-256k` by `ROUTE ESCALATE` (hybrid) or `TIER ESCALATE` (profile mode, and the universal backstop). The user still asked for the 27B, but nothing is being served from it any more.
+
+Until 2026-09-05 nothing freed it. A route holds no breaker claim, so no close would ever release it, and Ollama keeps a model for the global `OLLAMA_KEEP_ALIVE` after its last request — so the two tiers overlap for five minutes by design.
+
+They do not fit. Measured 2026-09-05 with the 27B alone resident: **22.0 GB wired** of a ~27 GB ceiling on 36 GB of RAM. The 256K 4B wants roughly 13 GB more, and `OLLAMA_MAX_LOADED_MODELS=3` entitles Ollama to try holding both, because it caps by model count and never by bytes. `mlx_admin.resolve_profile` has guarded the MLX-versus-Ollama form of this collision since 2026-08-24, citing the two kernel panics; the Ollama-to-Ollama form had no equivalent.
+
+Since 2026-09-05 there is a byte-level guard at the one place every Ollama client shares. The scheduler trusts Metal's static 28.1 GiB budget on this host and ignores system free: at 15:56 that day it logged `free="8.9 GiB" free_swap="0 B"` and loaded a 16.5 GB model on top of a partly resident llm-jury council. `~/Library/LaunchAgents/com.screddy.ollama.plist` now sets `OLLAMA_GPU_OVERHEAD=4GiB`, so Ollama budgets 28.1 minus 4.0 minus the 0.5 GiB minimum, 23.6 GiB. Verified after the restart: the 27B still loads at its full 32K window (`context_length=32768`, 17.6 GB projected), the current council's measured top of 23.4 GiB still fits, and the two no longer stack; Ollama evicts the resident one instead. Peak wired on the host drops from roughly 34 GB to roughly 30 GB. llm-jury's memguard default moved from 0.70 to 0.65 in llm-jury #31 so the preflight refuses the same runs the server would evict. `OLLAMA_MAX_LOADED_MODELS` stays at 3 because the council is three models; the guard is the bytes, not the count.
+
+Both escalation sites now unload the outgoing model. The safety rule is the same one the 2026-08-26 stall bought: never evict a tier that is still generating. The in-flight count therefore covers **every** locally served response, streaming and not, failover and deliberate route — a route response holds no claim but does hold the GPU. When something is still open the eviction is deferred and runs as the last response finishes. Failing to evict is logged and never costs the request; the fallback is the old behaviour, one tier resident too long.
 
 Everything here is best-effort. A router that cannot reach Ollama's admin endpoint must still route, and the cost of failing is late release, which is the old behaviour rather than an outage.
+
+### The prefix is the budget, not the window
+
+Measured on this host, 2026-09-05, against `qwen3.8:27b-obliterated` at its 32K window:
+
+| | |
+|---|---|
+| Cold prefill 6,840 tokens | 26.3s (260 tok/s) |
+| Cold prefill 12,815 tokens | 49.1s (261 tok/s) |
+| Cold prefill 27,008 tokens | 135.6s (199 tok/s) |
+| Append ~800 tokens to a transcript the model just saw | **5–10s** |
+| Byte-identical repeat | 0.7s |
+| Decode | 8.9 tok/s |
+
+And against `qwen3.5:4b-256k` (8.8 GB resident at `num_ctx 262144`, not the ~13 GB estimated before it was measured):
+
+| Cold prefill 73,150 tokens | 181.9s |
+|---|---|
+| Cold prefill 103,277 tokens | 391.2s |
+| Append after either | 1.6–2.4s |
+
+The expensive event is not the size of a conversation. It is showing the model a prompt whose prefix it has not already processed. Ollama reuses the KV cache for a shared prefix, so an ordinary turn costs seconds while the same transcript presented cold costs minutes. Everything below follows from that one fact.
+
+**Trimming beats escalating.** The 2026-09-04 session that showed 100% context and appeared frozen was about 142K tokens on the 256K tier — roughly nine minutes of prefill on the curve above. Bounding the same session to 18K and keeping the 27B costs about 70 seconds, once, and leaves the stronger model answering. `LOCAL_WORKING_SET` is therefore tried before `FAILOVER_LADDER`, and the ladder becomes the fallback for a request that cannot be trimmed under the ceiling — one message larger than the ceiling has nothing to drop.
+
+**The boundary is sticky, and that is the whole design.** A window recomputed on every request moves the prefix on every request, which converts a 5–10s append into a 40–50s cold prefill — a context manager that costs five times what it saves. So the boundary is chosen when `LOCAL_WORKING_SET_MAX_TOKENS` is crossed and then reused unchanged for as long as the conversation keeps fitting under it. One turn per cycle pays a rebuild; every other turn appends.
+
+**Model-written compaction was rejected on the same numbers.** At 8.9 tok/s a 1,500-token summary costs 169s and a 2,500-token one 281s, and the turn after it is a cold prefill of whatever was produced — 3.5 to 5.5 minutes per compaction, recurring every 6–15 turns at typical tool-result sizes. Deterministic selection costs no model call at all. Claude Code's own auto-compaction still runs client-side against the window the launcher declares; nothing here replaces it, and bounding makes it fire later by sending less.
+
+**One local inference at a time per tier.** Two ~45,600-token sessions alternating on one model measured 105.8s and 116.3s per turn, against 0.7s for a single session repeating: each request evicted the other's KV cache, so every turn became a cold prefill. `OLLAMA_NUM_PARALLEL=2` provides two slots but not two retained prefixes at these sizes. Interleaving costs both sides roughly 100x while queueing costs the second session one turn of waiting, so local inference is serialized per `(base_url, model)`. Different tiers still run together. Waiting past `LOCAL_TIER_LOCK_TIMEOUT_SECONDS` proceeds unlocked rather than failing the request.
+
+Measured end to end on 2026-09-05, driving a dev router on port 8099 against the real 27B with a 205,400-token, 260-message session:
+
+```
+⇢ WORKING SET [qwen3.8:27b-obliterated] kept 21/260 messages in≈17734 (rebuilt)
+⇢ WORKING SET [qwen3.8:27b-obliterated] kept 23/262 messages in≈17771 (stable)
+⇢ WORKING SET [qwen3.8:27b-obliterated] kept 25/264 messages in≈17808 (stable)
+```
+
+First answer in 116s, the turn after it 143s — the second cold prefill, since the first request after a model load leaves no reusable cache — then 10.6s, 13.3s and 13.8s as the boundary held and each turn appended. The same session before this change escalated to the 256K 4B and prefilled all 205K tokens, which on the measured curve is about thirteen minutes to first answer, on a weaker model, every time the session was resumed.
+
+#### Codex replays a stable prefix too
+
+Codex sent the ACTIVE TURN ALONE — the latest instruction, its paired tool calls, and recalled memories — and discarded the rest. That keeps the prompt small and guarantees a cold prefill on every turn, because the head changes with every new instruction. Real turns from this machine's log, all of them small:
+
+```
+  2648 tok    232.5s     11 tok/s
+  2578 tok    220.4s     12 tok/s
+  6643 tok    223.6s     30 tok/s
+  3354 tok     20.5s    163 tok/s
+  6702 tok     43.9s    153 tok/s
+  2556 tok      1.3s   1925 tok/s
+```
+
+One turn in that sample reused a prefix and cost 1.3 seconds. The rest ran at cold-prefill rate or worse — a 180x spread across nearly identical inputs. The tier lock removes the contention half of it. The structural half is fixed by replaying history: `CODEX_HISTORY_BUDGET_TOKENS` (default 12,000) of earlier items go ahead of the memory block, behind the same sticky boundary the Claude path uses, so turn N's payload opens with turn N-1's.
+
+Three things make that safe to send where the active turn alone was safe by construction:
+
+- **An allowlist, not a denylist.** Only user and assistant messages and paired `function_call`/`function_call_output` items are replayable. `additional_tools` advertises hosted web search, developer messages restate a cloud harness the local preamble already replaced, and reasoning items carry `encrypted_content` only the cloud can verify.
+- **The budget is leftovers.** History spends what the active turn did not use, capped — never its own allocation. A large instruction reduces history to nothing and the path behaves exactly as it did before, which is why `validate_codex_context_allocation` did not have to move.
+- **Pairs stay whole.** A window never opens on a `function_call_output` whose call was left behind.
+
+Validated against real Ollama on 2026-09-05, posting the built payload to the same `/v1/responses` endpoint the Codex path uses, with a 10-turn conversation:
+
+```
+turn 1: items=23  in≈4316   34.6s  status=completed
+turn 2: items=25  in≈4367    4.0s  status=completed  prefix_stable=True
+```
+
+Turn two is the same size and 8.6x faster, and the provider accepts the replayed `function_call` items rather than rejecting the shape — the two things that could not be proven from unit tests alone. Before this change every turn cost what turn one costs.
+
+Memories sit between the history and the active turn on purpose: the block is rebuilt from a fresh recall query every turn, so anything placed after it is new work anyway, and putting it ahead of the history would make the history unreusable.
+
+#### The provider counts differently, so measure it
+
+The router sizes a request with tiktoken; Ollama prices the rendered chat template. Every local response now logs both — `prompt: 17677 provider tokens for an estimate of 19905 (ratio 0.89)` — and warns when a prompt reaches the window, because Ollama truncates from the front silently and the symptom is a model that answers nothing.
+
+Measured across a real routed Claude Code session on 2026-09-05, the ratio sat at **0.89–0.90** on ordinary traffic and fell to 0.18–0.41 when a single enormous message dominated. The router over-counts, mildly. `LOCAL_TOKEN_ESTIMATE_RATIO` therefore defaults to **1.0**, and `PROVIDER_CONTEXT_TOKENS` records each tag's real `num_ctx` so `_window_guard` can cap the working set at `(window − reply reserve − template slack) ÷ ratio`.
+
+This setting shipped at 1.8 for one revision, on the belief the provider counted more. That number came from comparing two different requests, and the session that caught it is worth keeping: at 1.8 the guard is 15,095, which is **below** the ~19K that the system block and tool schemas cost on their own, so the working set could never fit inside it and five turns in a row logged `cannot reach 15095 tokens (tail alone is 19877)` and fell through to the ladder. A guard smaller than a request's irreducible overhead is not a guard, it is an off switch. Raise the ratio only from logged pairs.
+
+**A harness note worth more than it looks.** Driving a dev router with `set -a; . profiles/<tier>.env` exports `PROVIDER_MODEL` into the process, and process env beats `env_file` in pydantic-settings — so every ESCALATED profile silently resolves back to that model, and a run that logs `ROUTE ESCALATE [... → local-failover-256k]` is still served by the 27B. Export only the router-level knobs when testing escalation. The live router carries no `PROVIDER_*` in its environment, so this is a test artifact rather than a deployed one; `ps -wwE` on the running process is how to confirm that.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `LOCAL_WORKING_SET` | `true` | Bound the transcript for local tiers |
+| `LOCAL_WORKING_SET_TARGET_TOKENS` | `18000` | What a rebuild aims for |
+| `LOCAL_WORKING_SET_MAX_TOKENS` | `22000` | What triggers one |
+| `LOCAL_TIER_LOCK_TIMEOUT_SECONDS` | `900` | How long a second session waits before proceeding unlocked |
+| `PROVIDER_CONTEXT_TOKENS` | per tag | The tier's real `num_ctx`, which the window guard sizes against |
+| `LOCAL_TOKEN_ESTIMATE_RATIO` | `1.0` | Provider tokens per estimated token; raise only from logged pairs |
+
+Bounding applies only where the provider is a local Ollama tier. The ceiling is a property of this machine's GPU, so applying it to a hosted provider would discard context for nothing. The client keeps its full transcript either way — this decides what is forwarded, exactly as bare mode decides how much of each message is forwarded.
+
+### Recall shares its budget instead of spending it first-come (2026-09-04)
+
+Two duplicate cases survived that change and were fixed the same day. The loop compared each
+original against `seen` but added the clipped text to it, so any memory long enough to clip never
+matched a later copy of itself; claude-mem writes near-identical summaries across sessions, so the
+same lesson landed twice and took two shares. Separately, two distinct memories can share a head
+longer than their share of the budget, which reached the reader as the same line twice. `seen` now
+holds originals and a second set holds what was emitted, so both cases return once. Two tests pin
+each case; both failed against the previous loop before the fix went in.
+
+`memory.recall()` fills a character budget from the best-ranked memories. Two things were wrong,
+and together they meant the router recalled nothing.
+
+**It stopped at the first memory that did not fit.** The loop `break`ed rather than skipping, so
+one long memory discarded every shorter one ranked behind it. That is not a corner case: a
+claude-mem session summary runs 700-1400 characters while bare mode allows 1200 in total.
+Measured against the real store on this machine, `corpus ingest cognee rename`,
+`qwen router failover` and `claude-mem sync hub` each returned **zero** memories. The search was
+fine — 4, 13 and 7 rows matched and joined — and every row was then thrown away.
+
+**First-come selection cannot fill six slots from a 1200-character budget anyway.** The budget is
+deliberately small: bare mode exists to hold the prompt near 945 tokens against a 32K window. But
+one summary is larger than a sixth of it, so even with the `break` fixed a single memory spent the
+lot and five slots went unused.
+
+Each memory now takes a share of what is left, divided between the memories that can still land,
+and is clipped to that share on a word boundary. Clipping is safe because the columns are selected
+lesson-first — `learned` before `investigated` and `request`, `title` before `narrative` — so the
+head of the text is the part worth keeping. Room that the remaining slots cannot use flows to the
+memories that exist, so two candidates against an 8000-character budget are taken whole rather
+than clipped to an eighth.
+
+| | before | after |
+|---|---|---|
+| qwen bare mode (k=6, 1200 chars) | 0 memories | 6 memories, 1197 chars |
+| Codex failover (k=8, 8000 chars) | 0 memories | 8 memories, 7982 chars |
+
+**Matched-but-dropped is no longer silent.** Recall is fail-open, so a broken filter and a store
+with nothing to say both returned an empty list — which is why this survived. When candidates
+match but none fit, recall now logs a warning naming the count, the budget and `k`, and says
+recall is off.
+
+**Left alone deliberately:** `_SOURCES` still includes `user_prompts_fts`. Prompts are 32% of rows
+on this store and rank first for several ordinary queries, so they take slots a distilled summary
+could have used. Whether the router should recall verbatim prompts at all is a product decision,
+not a defect.
 
 ### Sizing the failover tier
 
@@ -1095,7 +1377,11 @@ Every other local tier is an Ollama tag that loads on first request and gets evi
 ```
 
 The 4B fast tier loads through Ollama on demand and leaves enough memory
-headroom for recovery after an MLX startup failure.
+headroom for recovery after an MLX startup failure. It took over from
+`local-failover-heavy`, the 9B profile removed on 2026-08-31 (#70); the comment
+in `profiles/local-qwen38-action.env` still named that dead profile until
+2026-09-05, which is the kind of drift that makes an operator expect a fallback
+tier this host cannot load.
 
 Ollama cannot evict this server either, so `qwen38 stop` before an `llmjury solve` run rather than letting a 19GB server and a 21GB council fight over a 36GB host.
 
@@ -1175,21 +1461,17 @@ The profile sets `PROVIDER_REASONING_EFFORT=none` to suppress thinking traces fo
 
 ### Durable memory on local models
 
-Local sessions read Mem0 recall from the offline mirror at `~/.mem0-local/cache.db` and get it prepended to the system prompt as plain text. No MCP server, no tool call, no network.
+Local sessions read the synced claude-mem replica at `~/.claude-mem/claude-mem.db` and prepend bounded recall to the system prompt as plain text. The read needs no MCP server, tool call, or network.
 
-This exists because of a gap that was invisible from either side. Memory normally arrives through the `UserPromptSubmit` hook, which is why `bare.py` puts Mem0's MCP tools on the dropped side of the keep-list — the hook already injected the text before the request was built. But the `qwen` wrapper's lean and fast modes pass `--bare`, and `--bare` disables CLAUDE.md discovery and **every hook**. So the default local tier, the 27B, was the only brain in the stack with no durable memory, while `/model qwen`, failover, and `qwen full` all had it.
+Claude's lifecycle hooks normally supply memory, but the `qwen` wrapper's lean and fast modes pass `--bare`, which disables every hook. Backdoor therefore injects recall at the proxy layer, the one path every local request crosses.
 
 | Path | Before | Now |
 |---|---|---|
-| `/model qwen` (router) | hook injects | unchanged |
-| Cloud→local failover | hook injects | unchanged |
-| `qwen full` | hook injects | unchanged |
+| `/model qwen` (router) | path-dependent | proxy injects |
+| Cloud→local failover | path-dependent | proxy injects |
+| `qwen full` | hook injects | proxy deduplicates |
 | `qwen`, `qwen lean` | **nothing** | proxy injects |
 | `qwen fast` | **nothing** | proxy injects |
-
-The proxy is the one place every local request passes through whichever door it came in by, so one code path covers all of them.
-
-Reading the local mirror rather than the Mem0 API is deliberate: the cloud endpoint is unreachable during exactly the outage failover exists to cover, since the breaker opens on one condition — this host being offline.
 
 ```
 PROVIDER_BASE_URL=http://localhost:11434/v1   # injection only fires for local providers
@@ -1198,7 +1480,7 @@ MEMORY_TOP_K=6
 MEMORY_CHAR_BUDGET=1200
 ```
 
-Cloud providers are excluded so a session whose hook already ran does not pay for the same text twice. Recall is read-only (`mode=ro`), fails open on a missing or locked cache, and times out in 1.5s so the Mem0 sync job's write lock cannot stall a turn. The budget is small on purpose: bare mode exists to hold the prompt near 945 tokens, and unbounded recall would rebuild the problem it solved.
+Cloud providers are excluded so a session whose hook already ran does not pay for the same text twice. Recall is read-only (`mode=ro`), fails open on a missing or locked database, and times out in 1.5 seconds so the sync worker's write lock cannot stall a turn. The budget stays small because bare mode exists to hold the prompt near 945 tokens.
 
 Memories are labelled as background that may be stale rather than as instructions, because they are. The mirror still describes the heavy tier as `qwen3.5:27b-bare` at 15 GB, two facts that are both now wrong, and a local model asked about the tier will say so rather than assert the stale version.
 
@@ -1333,6 +1615,7 @@ executed by someone — or something — with no prior context on this repo.
 | Plan | Tasks | For |
 | --- | --- | --- |
 | [Hermes MCP Bridge](docs/superpowers/plans/2026-08-15-hermes-mcp-bridge.md) | 9 | [the spec above](docs/specs/hermes-mcp-bridge.md) |
+| [Hermes delegate-only tier](docs/superpowers/plans/2026-09-05-hermes-delegate-only-tier.md) | 3 | A narrow machine-delegation surface for the bridge |
 
 The Hermes bridge is worth a note here because it changes what this repo is. Backdoor has been one
 thing so far: a proxy that makes Claude Code talk to any model. The bridge adds a second, separate
@@ -1362,6 +1645,24 @@ the repository. Successful password submissions use an HTTP 303 redirect to a sa
 `/login/complete` GET. That GET loads a no-store approval page with a **Continue to Claude**
 link. Loading a real page before the external callback keeps Chrome and Comet from treating the
 callback as part of the password POST redirect chain and replaying the consumed login state.
+
+**Delegate-only bridge.** A `delegate_only` profile exposes four run-scoped tools:
+`hermes_chat`, `hermes_run_status`, `hermes_run_approve`, and `hermes_run_stop`.
+The approval tool requires the request ID returned by `hermes_run_status` and maps its boolean MCP
+input to the gateway's `once` or `deny` choice. A delayed caller cannot approve a newer action.
+The bridge refuses that profile's session history, configuration, model, toolset,
+job, log, status, and lifecycle tools before they reach the gateway or subprocess
+runner. It also refuses caller-supplied `session_id` values, so a delegate cannot
+attach a new run to an existing personal conversation. `hermes_list` remains
+available for health discovery and returns only the profile's structured health
+state and tier.
+
+Run machine delegation through a second static-bearer bridge instance. Give it a
+dedicated environment file, service name, bind port, bearer, and one-profile
+registry. Keep the existing OAuth bridge and its broader registry unchanged. This
+repository ships the tier, tests, and deployment examples. An operator must install
+the second service, provide secrets, configure proxy routing, and restart it in a
+separate deployment step.
 
 **Environment.** Set at deploy time, never committed:
 
@@ -1401,6 +1702,18 @@ uv run pytest                 # full suite
 uv run pytest tests/<file>    # one file
 ```
 
+`.claude-harness/init.sh` is not tracked. The claude-harness plugin rewrites it from its
+own template in whichever checkout it runs in, so tracking it left every checkout carrying a
+permanent modification — and `scripts/deploy-router.sh` aborts at preflight on a dirty service
+checkout, which made a plugin artifact able to block a deploy. It also kept reverting the
+committed version to an older format. The plugin recreates the file on demand; nothing needs it
+in a fresh clone.
+
+Worktrees usually point `.venv` at the main checkout's rather than building their own.
+`.gitignore` carries `.venv` without a trailing slash so those symlinks are ignored too;
+`.venv/` matches directories only, and a symlink shows up as untracked in every
+`git status` the worktree ever runs.
+
 Running a test you **expect** to fail? Suppress the test names. A red run exits 0 and
 gets recorded as a success, and test names are declarative sentences that the memory
 distiller inverts into architectural "rules":
@@ -1414,3 +1727,37 @@ This repo is the **source**. The live control plane is operated by hand from an
 independent Terminal session, and machine hooks reject agent attempts to touch it —
 see `~/.claude/CLAUDE.md`, section "Backdoor live-control boundary". Agent
 instructions live in `CLAUDE.md`.
+
+## Memory: claude-mem replica (since 2026-09-04)
+
+Every memory path in the router now reads the local claude-mem store,
+`~/.claude-mem/claude-mem.db`, and nothing else. `src/proxy/memory.py` runs FTS5 queries
+over its summaries, observations and prompts (read-only, 1.5 s timeout, fail-open),
+`src/proxy/memory_recall.py` wraps that for Codex failover turns, and
+`external_context.remember_document` posts fetched documents to the local worker on
+`127.0.0.1:37701` as verbatim prompts, which the worker queues durably and syncs to the
+cmem.ai hub. Cognee and Mem0 are gone: no tunnel, no API key, no HTTP recall.
+The superseded Cognee failover design and implementation plan were removed from `docs/` so no
+operator can mistake them for a supported recovery path; Git history retains the old design.
+
+Settings renamed with it: `codex_memory_timeout_seconds`, `codex_memory_top_k`,
+`codex_memory_char_budget`, `qwen_memory` (env `QWEN_MEMORY`), plus
+`memory_db_path` and `memory_worker_url`. The Qwen launcher no longer builds or
+attaches a memory MCP shim.
+
+The store is a synced replica of every device, so a failed-over local session recalls
+what Hermes on src or r2h learned, even when the network is down.
+
+## CI (2026-09-05)
+
+`.github/workflows/ci.yml` runs the suite on every pull request and on pushes to `main`.
+
+This repo had no CI at all. Shawn's QA Assist reviewed its pull requests and then declined to
+merge them, reporting "this repo has no gate I can trust" and asking whether it should merge on
+review alone. That was the right refusal: a review with nothing runnable behind it is an opinion,
+and this repo is the router every local model session goes through.
+
+The suite is the gate: failover, memory recall, the working set, tier serialization and the
+provider edges. The count is deliberately not quoted here — it moves every time a regression gets
+cover, and a number in prose only ever goes stale. Nothing here needs a secret, so the workflow runs with `contents: read` and no
+environment.

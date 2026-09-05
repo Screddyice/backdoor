@@ -5,10 +5,13 @@
 #   full          chat + control + history + config
 #   control_only  everything except chat. Use for hardened single-purpose
 #                 profiles that expose an API server for their own product.
+#   delegate_only chat + run status + approval + stop only. Use a separate
+#                 one-profile registry and bridge bearer for machine delegation.
 #   unconfigured  listed with a reason; every action refused.
 #
-# port and key_env are required for full and control_only. key_env names the
-# environment variable holding that gateway's API_SERVER_KEY — never the key.
+# port and key_env are required for full, control_only, and delegate_only.
+# key_env names the environment variable holding that gateway's API_SERVER_KEY,
+# never the key.
 # unit and home are optional; without unit the lifecycle tools refuse, without
 # home the log tool refuses.
 
@@ -25,6 +28,11 @@ port = 9002
 key_env = "HERMES_KEY_PRODUCT"
 unit = "gateway-product.service"
 home = "/home/example/.hermes/profiles/product"
+
+[profiles.delegate-example]
+tier = "delegate_only"
+port = 9003
+key_env = "HERMES_KEY_DELEGATE"
 
 [profiles.not-yet-configured]
 tier = "unconfigured"

@@ -11,7 +11,7 @@ Two behaviours carry the whole design and are tested here:
    `/model qwen` routing and offline failover keep working.
 
 2. **Everything else is tunnelled blind.** A single `claude` session also talks
-   to Composio, mem0, Neon, PostHog, npm and — critically — the Remote Control
+   to Composio, Neon, PostHog, npm and, most importantly, the Remote Control
    bridge on claude.ai. Intercepting any of those would break certificate
    pinning at best and silently reroute traffic at worst. They must pass through
    as opaque bytes.
@@ -22,8 +22,10 @@ Client work runs in threads via `asyncio.to_thread`: blocking sockets express
 """
 
 import asyncio
+import logging
 import socket
 import ssl
+import struct
 import time
 from unittest.mock import MagicMock
 
@@ -591,3 +593,91 @@ async def test_eof_does_not_extend_the_byte_idle_deadline(tmp_path, router):
     finally:
         await proxy.stop()
         await peer.stop()
+
+
+# ── Telling CA distrust apart from pool churn ────────────────────────────────
+# `_intercept` caught ssl.SSLError, ConnectionResetError and TimeoutError in one
+# clause and logged all three as `TLS interception for <host> ended early`, with
+# a comment attributing it to a client that does not trust the CA. The log said
+# otherwise: over one 8-day rotation, 33,092 ConnectionResetError, 465
+# TimeoutError and 25 TLSV1_ALERT_UNKNOWN_CA. The rare one is the real fault and
+# the frequent one is Claude Code's and Codex's connection pools opening a
+# CONNECT tunnel and dropping it before TLS. Logging both per occurrence spent
+# about a third of a 10 MB rotation on the benign one and buried the other 25.
+
+
+async def test_a_client_that_rejects_the_ca_is_warned_about_by_name(proxy, caplog):
+    def client() -> None:
+        sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        sock.sendall(f"CONNECT {MITM_HOST}:443 HTTP/1.1\r\n\r\n".encode())
+        _read_headers(sock)
+        ctx = ssl.create_default_context()  # system trust only
+        with pytest.raises(ssl.SSLCertVerificationError):
+            ctx.wrap_socket(sock, server_hostname=MITM_HOST)
+
+    with caplog.at_level(logging.DEBUG, logger="src.proxy.forward"):
+        await asyncio.to_thread(client)
+        for _ in range(100):
+            if any(r.levelno >= logging.WARNING for r in caplog.records):
+                break
+            await asyncio.sleep(0.02)
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "src.proxy.forward" and r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "CA" in warnings[0]
+    assert MITM_HOST in warnings[0]
+
+
+async def test_a_tunnel_dropped_before_tls_is_counted_not_logged(proxy, caplog):
+    def client() -> None:
+        sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        sock.sendall(f"CONNECT {MITM_HOST}:443 HTTP/1.1\r\n\r\n".encode())
+        _read_headers(sock)
+        # RST rather than FIN, which is how a pooled socket goes away.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+
+    with caplog.at_level(logging.DEBUG, logger="src.proxy.forward"):
+        await asyncio.to_thread(client)
+        for _ in range(100):
+            if proxy.abandoned_tunnels:
+                break
+            await asyncio.sleep(0.02)
+
+    assert proxy.abandoned_tunnels == 1
+    # Scoped to the proxy's own logger: dropping the client also drops the
+    # router leg `_intercept` had already dialled, and the StubRouter here
+    # complains about that on the asyncio logger.
+    assert [r.getMessage() for r in caplog.records if r.name == "src.proxy.forward"] == []
+
+
+async def test_abandoned_tunnels_are_summarised_once_per_interval(caplog):
+    clock = [1000.0]
+    proxy = ForwardProxy(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=1,
+        ca=MagicMock(),
+        now=lambda: clock[0],
+        abandon_summary_interval=300.0,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="src.proxy.forward"):
+        for _ in range(3):
+            proxy._note_abandoned_tunnel(MITM_HOST, ConnectionResetError(54, "reset"))
+        assert [r for r in caplog.records if r.name == "src.proxy.forward"] == []
+        clock[0] += 301.0
+        proxy._note_abandoned_tunnel(MITM_HOST, TimeoutError())
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "src.proxy.forward"]
+    assert len(messages) == 1
+    assert "4" in messages[0]
+    assert "3 reset" in messages[0]
+    assert "1 handshake timeout" in messages[0]
+    assert proxy.abandoned_tunnels == 0
