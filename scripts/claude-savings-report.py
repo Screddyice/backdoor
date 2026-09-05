@@ -30,7 +30,6 @@ CODEX_SESSIONS_DIR = os.path.join(HOME, ".codex", "sessions")
 REPORT_DIR    = os.environ.get("SAVINGS_REPORT_DIR",
                                os.path.join(HOME, "projects", "docs", "reports", "claude-savings"))
 ENV_FILE      = os.path.join(HOME, "projects", ".env")
-LLMJURY_ENV   = os.path.join(HOME, ".llmjury", ".env")
 EMAIL_FROM    = os.environ.get("SAVINGS_EMAIL_FROM_ACCOUNT", "gmail_gegger-tyken")  # admin@teamnebula.ai
 EMAIL_TO      = os.environ.get("SAVINGS_EMAIL_TO", "shawn@teamnebula.ai")
 
@@ -91,32 +90,6 @@ def openrouter_usage(per_model):
     """Return transcript usage whose model ID includes an OpenRouter provider."""
     return {model: usage for model, usage in per_model.items()
             if "/" in model and not is_local(model)}
-
-
-def openrouter_period_spend(days):
-    """Read account-wide OpenRouter spend without claiming client attribution."""
-    field = {1: "usage_daily", 7: "usage_weekly"}.get(days)
-    if 28 <= days <= 31:
-        field = "usage_monthly"
-    if field is None:
-        return None
-    try:
-        with open(LLMJURY_ENV) as fh:
-            key = next((line.split("=", 1)[1].strip().strip('"').strip("'")
-                        for line in fh
-                        if line.removeprefix("export ").startswith("OPENROUTER_API_KEY=")), None)
-        if not key:
-            return None
-        result = subprocess.run(
-            ["curl", "-fsS", "--max-time", "20", "-H",
-             f"Authorization: Bearer {key}", "https://openrouter.ai/api/v1/key"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return None
-        return float(json.loads(result.stdout)["data"][field])
-    except Exception:
-        return None
 
 
 def count_real_limit_hits(line):
@@ -384,14 +357,8 @@ def build_savings_email_md(s, week_of, today):
         label = client.title()
         if turns:
             return f"| OpenRouter via {label} | {turns} | {fmt_tok(tokens)} |"
-        if s["openrouter_available"] and s["openrouter_spend"] > 0:
-            return f"| OpenRouter via {label} | Attribution unavailable | Attribution unavailable |"
-        if not s["openrouter_available"]:
-            return f"| OpenRouter via {label} | Account usage unavailable | Account usage unavailable |"
         return f"| OpenRouter via {label} | 0 | 0 |"
 
-    spend = (f"${s['openrouter_spend']:,.2f}"
-             if s["openrouter_available"] else "Unavailable")
     lines = [
         f"# ${s['usd_saved']:,.2f} saved this week ({week_of} to {today})",
         "",
@@ -418,18 +385,16 @@ def build_savings_email_md(s, week_of, today):
         "",
         "## OpenRouter usage",
         "",
-        f"| Measured account spend | {spend} | |",
-        "",
         "| Client | Turns | Tokens |",
         "|---|---|---|",
         openrouter_row("claude"),
         openrouter_row("codex"),
         "",
-        "OpenRouter usage stays outside the savings total because its account endpoint does not "
-        "attribute spend to Claude or Codex.",
+        "OpenRouter usage stays outside the savings total because only transcript-attributed "
+        "usage is available here.",
         "",
         "---",
-        "*Full weekly breakdown (spend, plan usage, working time) is in the saved report.*",
+        "*Full weekly breakdown (usage, plan value, working time) is in the saved report.*",
         "",
     ]
     return "\n".join(lines)
@@ -508,19 +473,13 @@ def main():
                              + t["cache_w5m"] + t["cache_w1h"]
                              for t in codex_local.values())
 
-    # 2. OpenRouter usage from Claude and Codex transcripts. Account-wide
-    # spend is excluded because the key endpoint cannot attribute it by client.
+    # 2. OpenRouter usage from Claude and Codex transcripts.
     openrouter_claude_turns = sum(t["turns"] for t in claude_openrouter.values())
     openrouter_claude_tokens = sum(t["input"] + t["output"] + t["cache_read"]
                                    for t in claude_openrouter.values())
     openrouter_codex_turns = sum(t["turns"] for t in codex_openrouter.values())
     openrouter_codex_tokens = sum(t["input"] + t["output"] + t["cache_read"]
                                   for t in codex_openrouter.values())
-    openrouter_spend = openrouter_period_spend(days)
-    openrouter_available = openrouter_spend is not None
-    if openrouter_spend is None:
-        openrouter_spend = 0.0
-
     # 3. Codex plan savings from transcript token counts
     codex_value, codex_saved = codex_plan_savings(codex_cloud)
     codex_turns = sum(t["turns"] for t in codex_cloud.values())
@@ -626,24 +585,19 @@ def main():
         "",
         "## OpenRouter usage by client",
         "",
-        f"Measured account spend: **${openrouter_spend:,.2f}**"
-        if openrouter_available else "Measured account spend: **unavailable**",
-        "",
         "| Client | Turns | Tokens | Models |",
         "|---|---|---|---|",
         (f"| Claude | {openrouter_claude_turns} | {fmt_tok(openrouter_claude_tokens)} | "
          f"{', '.join(sorted(claude_openrouter))} |")
         if openrouter_claude_turns else
-        ("| Claude | Attribution unavailable | Attribution unavailable | Attribution unavailable |"
-         if openrouter_available and openrouter_spend > 0 else "| Claude | 0 | 0 | none |"),
+        "| Claude | 0 | 0 | none |",
         (f"| Codex | {openrouter_codex_turns} | {fmt_tok(openrouter_codex_tokens)} | "
          f"{', '.join(sorted(codex_openrouter))} |")
         if openrouter_codex_turns else
-        ("| Codex | Attribution unavailable | Attribution unavailable | Attribution unavailable |"
-         if openrouter_available and openrouter_spend > 0 else "| Codex | 0 | 0 | none |"),
+        "| Codex | 0 | 0 | none |",
         "",
-        "OpenRouter usage is not included in savings because the account-wide spend endpoint "
-        "cannot attribute charges to Claude or Codex.",
+        "OpenRouter usage is not included in savings because this report only has "
+        "transcript-attributed usage, not governed spend data.",
         "",
         "## Cloud usage by model",
         "",
@@ -701,8 +655,6 @@ def main():
                   "openrouter_claude_tokens": openrouter_claude_tokens,
                   "openrouter_codex_turns": openrouter_codex_turns,
                   "openrouter_codex_tokens": openrouter_codex_tokens,
-                  "openrouter_spend": openrouter_spend,
-                  "openrouter_available": openrouter_available,
                   "codex_saved": codex_saved, "codex_turns": codex_turns}
         sent = send_weekly_email(savings, week_of, today, dry)
         # Say "would send" on a dry run. This used to print "email sent to

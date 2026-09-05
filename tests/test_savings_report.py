@@ -159,8 +159,6 @@ def test_email_keeps_local_savings_separate_from_claude_and_codex_openrouter_usa
             "openrouter_claude_tokens": 1_200_000,
             "openrouter_codex_turns": 5,
             "openrouter_codex_tokens": 2_500_000,
-            "openrouter_spend": 1.0,
-            "openrouter_available": True,
             "codex_saved": 30.0,
             "codex_turns": 4,
         },
@@ -174,11 +172,10 @@ def test_email_keeps_local_savings_separate_from_claude_and_codex_openrouter_usa
     assert "Local models via Codex | 1 | 300K" in body
     assert "OpenRouter via Claude | 3 | 1.2M" in body
     assert "OpenRouter via Codex | 5 | 2.5M" in body
-    assert "Measured account spend | $1.00" in body
     assert "**Total: $40.00 saved.**" in body
 
 
-def test_email_marks_openrouter_client_attribution_unavailable_instead_of_zero():
+def test_email_reports_zero_when_no_transcript_attributed_openrouter_usage():
     body = REPORT.build_savings_email_md(
         {
             "usd_saved": 0.0,
@@ -193,8 +190,6 @@ def test_email_marks_openrouter_client_attribution_unavailable_instead_of_zero()
             "openrouter_claude_tokens": 0,
             "openrouter_codex_turns": 0,
             "openrouter_codex_tokens": 0,
-            "openrouter_spend": 3.0,
-            "openrouter_available": True,
             "codex_saved": 0.0,
             "codex_turns": 0,
         },
@@ -204,7 +199,7 @@ def test_email_marks_openrouter_client_attribution_unavailable_instead_of_zero()
 
     assert "Local models via Claude | 12 | 4.0M" in body
     assert "Local models via Codex | 8 | 2.0M" in body
-    assert "Measured account spend | $3.00" in body
-    assert "OpenRouter via Claude | Attribution unavailable" in body
-    assert "OpenRouter via Codex | Attribution unavailable" in body
-    assert "OpenRouter via Claude | 0 | 0" not in body
+    assert "Measured account spend" not in body
+    assert "Attribution unavailable" not in body
+    assert "OpenRouter via Claude | 0 | 0" in body
+    assert "OpenRouter via Codex | 0 | 0" in body

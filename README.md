@@ -92,9 +92,8 @@ figures for each path:
 
 - Local open-source models: measured Claude and Codex turns served by Qwen, Gemma, Llama, or
   Phi on this Mac, compared with the configured Claude counterfactual.
-- OpenRouter: measured account spend plus transcript-attributed usage for Claude and Codex.
-  When account activity exists without client attribution, the report says attribution is
-  unavailable instead of showing zero usage.
+- OpenRouter: transcript-attributed usage for Claude and Codex, kept separate from local-model
+  routing and savings.
 - Codex: measured token usage from `~/.codex/sessions/**/*.jsonl`, valued at configurable metered
   API rates and netted against the weekly Codex plan cost.
 
@@ -102,7 +101,7 @@ The script also reads Claude Code's transcript logs (`~/.claude/projects/**/*.js
 first-party Claude usage and local-model turns. Each source stays in its own row, so the total
 does not hide which savings are measured and which depend on a counterfactual. Local-model usage
 stays separate from OpenRouter routing. The local section splits agent usage between Claude and
-Codex, while the OpenRouter section keeps its account-wide total and client-attribution boundary.
+Codex, while the OpenRouter section only reports usage found in the client transcripts.
 
 Prompt caching is tracked as a separate efficiency stat, never counted as dollars saved — on a
 flat-rate subscription plan there's no per-token bill for it to discount off of.
