@@ -154,12 +154,14 @@ def recall(query: str, k: int = 6, char_budget: int = 1200, cache: Path | None =
     # before `investigated`, `title` before `narrative` — so the head of the text
     # is the part worth keeping.
     out: list[str] = []
-    seen: set[str] = set()
+    seen: set[str] = set()  # originals, so a clipped memory still matches its twin
+    emitted: set[str] = set()  # what the reader will see, so two heads never repeat
     used = 0
     truncated = 0
     for index, (_, text) in enumerate(ranked):
         if text in seen:
             continue
+        seen.add(text)
         # Share what is left between the memories that can still land, so a short
         # one hands its unused room to the next and a query with three candidates
         # gives each a third rather than a k-th of the budget.
@@ -171,8 +173,14 @@ def recall(query: str, k: int = 6, char_budget: int = 1200, cache: Path | None =
         if len(text) > room:
             text = _clip(text, room)
             truncated += 1
+        # Two distinct memories can share a head longer than their share, and
+        # claude-mem writes near-identical summaries across sessions. The first
+        # version of this loop added the CLIPPED text to `seen` and compared
+        # ORIGINALS against it, so nothing long enough to clip ever deduplicated.
+        if text in emitted:
+            continue
+        emitted.add(text)
         out.append(text)
-        seen.add(text)
         used += len(text)
         if len(out) >= k:
             break

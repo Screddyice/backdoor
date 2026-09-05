@@ -1262,6 +1262,14 @@ Bounding applies only where the provider is a local Ollama tier. The ceiling is 
 
 ### Recall shares its budget instead of spending it first-come (2026-09-04)
 
+Two duplicate cases survived that change and were fixed the same day. The loop compared each
+original against `seen` but added the clipped text to it, so any memory long enough to clip never
+matched a later copy of itself; claude-mem writes near-identical summaries across sessions, so the
+same lesson landed twice and took two shares. Separately, two distinct memories can share a head
+longer than their share of the budget, which reached the reader as the same line twice. `seen` now
+holds originals and a second set holds what was emitted, so both cases return once. Two tests pin
+each case; both failed against the previous loop before the fix went in.
+
 `memory.recall()` fills a character budget from the best-ranked memories. Two things were wrong,
 and together they meant the router recalled nothing.
 
