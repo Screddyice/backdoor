@@ -89,6 +89,31 @@ def test_the_budget_is_shared_so_one_memory_cannot_take_it_all(tmp_path):
     assert all(m.endswith("\u2026") for m in out), "each was clipped to its share"
 
 
+def test_identical_memories_are_returned_once_even_when_clipped(tmp_path):
+    """Dedupe must compare originals with originals.
+
+    The fair-share loop checked the original text against `seen`, then added the
+    CLIPPED text to it. A memory long enough to be clipped therefore never matched
+    a later copy of itself, so the same summary landed twice and took two shares.
+    claude-mem stores near-identical summaries across sessions, so this was common.
+    """
+    db = _store_of(tmp_path / "claude-mem.db", [_long("a"), _long("a"), _long("b")])
+    out = memory.recall("tunnel", k=6, char_budget=1200, cache=db)
+    assert len(out) == 2, "the duplicate 'a' should land once"
+    assert len(set(out)) == 2
+
+
+def test_two_memories_that_clip_to_the_same_head_are_returned_once(tmp_path):
+    """Distinct memories can share a head longer than their share of the budget.
+
+    The reader then sees the same line twice. The second is skipped after clipping,
+    without spending budget, so the slot goes to the next memory instead.
+    """
+    db = _store_of(tmp_path / "claude-mem.db", [_long("a"), _long("a") + " but this tail differs", _long("b")])
+    out = memory.recall("tunnel", k=6, char_budget=1200, cache=db)
+    assert len(out) == 2 and len(set(out)) == 2
+
+
 def test_a_few_candidates_are_not_clipped_to_a_k_th_of_the_budget(tmp_path):
     """Room left by the slots nothing can fill goes to the memories that exist."""
     db = _store_of(tmp_path / "claude-mem.db", [_long("a"), _long("b")])
