@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Weekly savings report: what the local router + prompt caching saved.
+"""Weekly usage and savings report for Claude, Codex, and local models.
 
-Measures, from ~/.claude/projects transcript JSONLs (the authoritative per-turn
-usage record), over the trailing window:
+Measures usage over the trailing window from Claude and Codex transcript JSONLs
+with OpenRouter-routed turns identified from their provider/model IDs:
 
   local routing   turns served by qwen* through the :8083 router — zero cloud
                   tokens; counterfactual is the same turn at Opus 5 pricing.
   prompt caching  cache_read tokens billed at 0.1x input, net of the 1.25x/2x
                   write premium actually paid.
-llm-jury and its OpenRouter ladder are deliberately NOT counted (removed
-2026-08-26). That is a separate system, on a separate provider, running
-different models, with its own billing. This script used to read
-~/.llmjury/.env for OPENROUTER_API_KEY and call the OpenRouter API to fold
-that spend into backdoor's numbers. Backdoor has no business holding another
-system's key, and a report that mixes the two cannot answer either question
-cleanly. If you want llm-jury economics, measure them in llm-jury.
+  OpenRouter      measured Claude and Codex transcript usage, kept separate
+                  from local open-source routing and subscription savings.
+  Codex           measured token usage from ~/.codex/sessions, valued at
+                  configurable metered API rates and net of the weekly plan.
   time            per-session active hours (gaps <= ACTIVE_GAP_MIN count as
                   work), summed across sessions, vs the wall-clock union.
 
@@ -29,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 HOME          = os.path.expanduser("~")
 PROJECTS_DIR  = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS_DIR = os.path.join(HOME, ".codex", "sessions")
 REPORT_DIR    = os.environ.get("SAVINGS_REPORT_DIR",
                                os.path.join(HOME, "projects", "docs", "reports", "claude-savings"))
 ENV_FILE      = os.path.join(HOME, "projects", ".env")
@@ -42,6 +40,10 @@ ACTIVE_GAP_MIN     = float(os.environ.get("SAVINGS_ACTIVE_GAP_MIN", 10))
 COUNTERFACTUAL     = os.environ.get("SAVINGS_COUNTERFACTUAL", "claude-opus-5")
 # Human needs at least as long as the agent's active time to do the same work.
 HOURS_MULTIPLIER   = float(os.environ.get("SAVINGS_HOURS_MULTIPLIER", 1.0))
+CODEX_INPUT_PER_MTOK = float(os.environ.get("SAVINGS_CODEX_INPUT_PER_MTOK", 2.5))
+CODEX_CACHED_INPUT_PER_MTOK = float(os.environ.get("SAVINGS_CODEX_CACHED_INPUT_PER_MTOK", 0.25))
+CODEX_OUTPUT_PER_MTOK = float(os.environ.get("SAVINGS_CODEX_OUTPUT_PER_MTOK", 15.0))
+CODEX_PLAN_COST_MO = float(os.environ.get("SAVINGS_CODEX_PLAN_COST_MO", 200))
 # --- the $200 plan benchmark ------------------------------------------------
 PLAN_COST_MO       = float(os.environ.get("SAVINGS_PLAN_COST_MO", 200))
 # Anthropic's published guidance for Max 20x: ~24-40 Opus-hours/week.
@@ -81,7 +83,13 @@ def price_for(model, now):
 
 
 def is_local(model):
-    return model.startswith(LOCAL_PREFIXES)
+    return model.lower().startswith(LOCAL_PREFIXES)
+
+
+def openrouter_usage(per_model):
+    """Return transcript usage whose model ID includes an OpenRouter provider."""
+    return {model: usage for model, usage in per_model.items()
+            if "/" in model and not is_local(model)}
 
 
 def count_real_limit_hits(line):
@@ -195,6 +203,84 @@ def scan(days):
     return now, per_model, session_ts, scanned, limit_events
 
 
+def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR):
+    """Read incremental Codex usage without double-counting repeated snapshots."""
+    per_model = defaultdict(lambda: {"model": "", "input": 0, "output": 0,
+                                     "cache_read": 0, "cache_w5m": 0,
+                                     "cache_w1h": 0, "turns": 0})
+    scanned = 0
+    pattern = os.path.join(sessions_dir, "**", "*.jsonl")
+    for path in glob.glob(pattern, recursive=True):
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) < cutoff:
+                continue
+        except OSError:
+            continue
+        scanned += 1
+        model = "unknown-codex"
+        seen_totals = set()
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                ts = parse_ts(record.get("timestamp", ""))
+                if ts is None or ts < cutoff:
+                    continue
+                payload = record.get("payload") or {}
+                if record.get("type") == "turn_context":
+                    model = payload.get("model") or model
+                    continue
+                if record.get("type") != "event_msg" or payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info") or {}
+                usage = info.get("last_token_usage") or {}
+                total = info.get("total_token_usage") or {}
+                if not usage:
+                    continue
+                total_key = json.dumps(total, sort_keys=True)
+                if total_key in seen_totals:
+                    continue
+                seen_totals.add(total_key)
+                bucket = per_model[model]
+                bucket["model"] = model
+                bucket["input"] += usage.get("input_tokens", 0) or 0
+                bucket["output"] += usage.get("output_tokens", 0) or 0
+                bucket["cache_read"] += usage.get("cached_input_tokens", 0) or 0
+                bucket["turns"] += 1
+    return per_model, scanned
+
+
+def codex_plan_savings(per_model, input_per_mtok=CODEX_INPUT_PER_MTOK,
+                       cached_input_per_mtok=CODEX_CACHED_INPUT_PER_MTOK,
+                       output_per_mtok=CODEX_OUTPUT_PER_MTOK,
+                       weekly_plan_cost=None):
+    """Return Codex metered API value and savings after the subscription."""
+    if weekly_plan_cost is None:
+        weekly_plan_cost = CODEX_PLAN_COST_MO * 12 / 52
+    value = 0.0
+    for usage in per_model.values():
+        cached = min(usage["cache_read"], usage["input"])
+        uncached = usage["input"] - cached
+        value += (uncached * input_per_mtok + cached * cached_input_per_mtok
+                  + usage["output"] * output_per_mtok) / 1e6
+    return value, max(0.0, value - weekly_plan_cost)
+
+
+def merge_usage(*groups):
+    merged = defaultdict(lambda: {"model": "", "input": 0, "output": 0,
+                                  "cache_read": 0, "cache_w5m": 0,
+                                  "cache_w1h": 0, "turns": 0})
+    for group in groups:
+        for model, usage in group.items():
+            bucket = merged[model]
+            bucket["model"] = model
+            for field in ("input", "output", "cache_read", "cache_w5m", "cache_w1h", "turns"):
+                bucket[field] += usage[field]
+    return merged
+
+
 def active_hours(session_ts, gap_min):
     """(sum of per-session active hours, wall-clock union hours)."""
     gap = timedelta(minutes=gap_min)
@@ -264,28 +350,51 @@ def md_to_html(md):
 
 
 def build_savings_email_md(s, week_of, today):
-    """Savings-only email body: what was saved, in $, and where it came from.
-    Deliberately omits cloud spend, plan-leverage, and working-time framing —
-    the full breakdown with those numbers still lands in the saved report.
-    Caching is excluded from $ saved: on a flat-rate plan there's no per-token
-    bill for it to discount off of, so an API-list-price counterfactual isn't
-    real money — it's noted separately, never added to the total."""
+    """Savings-only email body with each model path shown separately."""
+    def openrouter_row(client):
+        turns = s[f"openrouter_{client}_turns"]
+        tokens = s[f"openrouter_{client}_tokens"]
+        label = client.title()
+        if turns:
+            return f"| OpenRouter via {label} | {turns} | {fmt_tok(tokens)} |"
+        return f"| OpenRouter via {label} | 0 | 0 |"
+
     lines = [
         f"# ${s['usd_saved']:,.2f} saved this week ({week_of} to {today})",
         "",
         "| Source | $ saved | How |",
         "|---|---|---|",
-        f"| Local qwen routing | ${s['local_saved']:,.2f} | "
-        f"{s['local_turns']} turns ran free on local hardware instead of the cloud |",
-        f"kept work off {COUNTERFACTUAL} pricing |",
+        f"| Open-source models (local) | ${s['local_saved']:,.2f} | "
+        f"{s['local_turns']} turns ran on local hardware instead of metered cloud models |",
+        f"| Codex plan | ${s['codex_saved']:,.2f} | "
+        f"{s['codex_turns']} measured responses valued at metered API rates, net of the plan |",
         "",
         f"**Total: ${s['usd_saved']:,.2f} saved.**",
         "",
         f"(Not counted above: {s['cache_rate']:.1f}% of input tokens ran from cache this week — "
         f"real efficiency, but not $ saved, since the plan is flat-rate with no per-token bill.)",
         "",
+        "## Local-agent usage",
+        "",
+        "| Client | Turns | Tokens |",
+        "|---|---|---|",
+        f"| Local models via Claude | {s['local_claude_turns']} | "
+        f"{fmt_tok(s['local_claude_tokens'])} |",
+        f"| Local models via Codex | {s['local_codex_turns']} | "
+        f"{fmt_tok(s['local_codex_tokens'])} |",
+        "",
+        "## OpenRouter usage",
+        "",
+        "| Client | Turns | Tokens |",
+        "|---|---|---|",
+        openrouter_row("claude"),
+        openrouter_row("codex"),
+        "",
+        "OpenRouter usage stays outside the savings total because only transcript-attributed "
+        "usage is available here.",
+        "",
         "---",
-        "*Full weekly breakdown (spend, plan usage, working time) is in the saved report.*",
+        "*Full weekly breakdown (usage, plan value, working time) is in the saved report.*",
         "",
     ]
     return "\n".join(lines)
@@ -302,7 +411,7 @@ def send_weekly_email(savings, week_of, today, dry):
     if not key:
         print("email skipped: TMN_COMPOSIO_API_KEY not found", file=sys.stderr)
         return False
-    subject = f"${savings['usd_saved']:,.0f} saved this week — Claude automation ({week_of} to {today})"
+    subject = f"${savings['usd_saved']:,.0f} saved this week — AI model report ({week_of} to {today})"
     body_html = md_to_html(build_savings_email_md(savings, week_of, today))
     if dry:
         print(f"\n[dry-run] would email '{subject}' to {EMAIL_TO} from {EMAIL_FROM}", file=sys.stderr)
@@ -338,16 +447,46 @@ def main():
     send_email = "--no-email" not in sys.argv
 
     now, per_model, session_ts, scanned, limit_events = scan(days)
-    cloud = {m: t for m, t in per_model.items() if not is_local(m)}
-    local = {m: t for m, t in per_model.items() if is_local(m)}
+    cutoff = now - timedelta(days=days)
+    codex_models, codex_scanned = scan_codex(cutoff)
+    claude_openrouter = openrouter_usage(per_model)
+    codex_openrouter = openrouter_usage(codex_models)
+    cloud = {m: t for m, t in per_model.items()
+             if not is_local(m) and m not in claude_openrouter}
+    claude_local = {m: t for m, t in per_model.items() if is_local(m)}
+    codex_cloud = {m: t for m, t in codex_models.items()
+                   if not is_local(m) and m not in codex_openrouter}
+    codex_local = {m: t for m, t in codex_models.items() if is_local(m)}
+    local = merge_usage(claude_local, codex_local)
 
     # 1. local routing savings
     local_tokens = sum(t["input"] + t["output"] + t["cache_read"] + t["cache_w5m"] + t["cache_w1h"]
                        for t in local.values())
     local_saved = sum(counterfactual_usd(t, now) for t in local.values())
     local_turns = sum(t["turns"] for t in local.values())
+    local_claude_turns = sum(t["turns"] for t in claude_local.values())
+    local_claude_tokens = sum(t["input"] + t["output"] + t["cache_read"]
+                              + t["cache_w5m"] + t["cache_w1h"]
+                              for t in claude_local.values())
+    local_codex_turns = sum(t["turns"] for t in codex_local.values())
+    local_codex_tokens = sum(t["input"] + t["output"] + t["cache_read"]
+                             + t["cache_w5m"] + t["cache_w1h"]
+                             for t in codex_local.values())
 
-    # 2. cache savings (net of write premium actually paid)
+    # 2. OpenRouter usage from Claude and Codex transcripts.
+    openrouter_claude_turns = sum(t["turns"] for t in claude_openrouter.values())
+    openrouter_claude_tokens = sum(t["input"] + t["output"] + t["cache_read"]
+                                   for t in claude_openrouter.values())
+    openrouter_codex_turns = sum(t["turns"] for t in codex_openrouter.values())
+    openrouter_codex_tokens = sum(t["input"] + t["output"] + t["cache_read"]
+                                  for t in codex_openrouter.values())
+    # 3. Codex plan savings from transcript token counts
+    codex_value, codex_saved = codex_plan_savings(codex_cloud)
+    codex_turns = sum(t["turns"] for t in codex_cloud.values())
+    codex_tokens = sum(t["input"] + t["output"] for t in codex_cloud.values())
+    codex_plan_wk = CODEX_PLAN_COST_MO * 12 / 52
+
+    # 4. cache savings (net of write premium actually paid)
     cache_read_tok = sum(t["cache_read"] for t in cloud.values())
     cache_saved = cache_premium = 0.0
     for t in cloud.values():
@@ -358,11 +497,11 @@ def main():
     # full-price input tokens effectively avoided
     cache_tok_equiv = int(cache_read_tok * 0.9)
 
-    # 3. actual cloud spend for context
+    # 5. actual Claude cloud spend for context
     cloud_cost = sum(cost_usd(t, now) for t in cloud.values())
     cloud_turns = sum(t["turns"] for t in cloud.values())
 
-    # 5. time
+    # 6. Claude working time
     agent_hours, wall_hours = active_hours(session_ts, ACTIVE_GAP_MIN) if session_ts else (0.0, 0.0)
     human_hours = agent_hours * HOURS_MULTIPLIER
     parallelism = (agent_hours / wall_hours) if wall_hours else 0.0
@@ -372,8 +511,8 @@ def main():
     # counterfactual against API list price isn't money that ever left (or
     # would have left) your account. It's tracked separately as an efficiency
     # stat (more work fit in the same session/quota), never as dollars.
-    tokens_saved = local_tokens
-    usd_saved = local_saved
+    tokens_saved = local_tokens + codex_tokens
+    usd_saved = local_saved + codex_saved
 
     # plan benchmark
     plan_wk = PLAN_COST_MO * 12 / 52
@@ -386,17 +525,18 @@ def main():
     cache_rate = cache_read_tok / total_input * 100 if total_input else 0.0
     hrs_lo = agent_hours / PLAN_OPUS_HRS_HI if PLAN_OPUS_HRS_HI else 0.0
     hrs_hi = agent_hours / PLAN_OPUS_HRS_LO if PLAN_OPUS_HRS_LO else 0.0
-    off_plan_usd = local_saved
+    off_plan_usd = local_saved + codex_saved
 
     week_of = (now - timedelta(days=days)).strftime("%Y-%m-%d")
     today = now.strftime("%Y-%m-%d")
 
     lines = [
-        f"# Claude savings report — week of {week_of} to {today}",
+        f"# AI model savings report — week of {week_of} to {today}",
         "",
-        f"**${usd_saved:,.2f} saved this week** (local qwen routing; excludes "
+        f"**${usd_saved:,.2f} saved this week** (local open-source models and Codex; excludes "
         f"caching — see note below) · **${cloud_cost:,.2f} of API-equivalent work on a "
-        f"${plan_wk:,.0f}/wk subscription ({leverage:,.0f}x)** · **{agent_hours:,.1f} agent-hours**",
+        f"${plan_wk:,.0f}/wk Claude subscription ({leverage:,.0f}x)** · "
+        f"**${codex_value:,.2f} of metered Codex API value**",
         "",
         f"## The ${PLAN_COST_MO:,.0f} plan vs what you actually got",
         "",
@@ -406,10 +546,9 @@ def main():
         f"Opus-class models) — **{hrs_lo:,.1f}-{hrs_hi:,.1f}x the plan's Opus-hour band**.",
         f"- API-equivalent value pushed through the plan: **${cloud_cost:,.2f}** across "
         f"{cloud_turns} turns → **{leverage:,.0f}x** the subscription price.",
-        f"- What makes that fit inside one plan: **{cache_rate:.1f}% of input tokens came from "
+        f"- What makes Claude fit inside one plan: **{cache_rate:.1f}% of input tokens came from "
         f"cache** ({fmt_tok(cache_read_tok)} reads), and **${off_plan_usd:,.2f}** of "
-        f"Opus-equivalent work ran off-plan entirely (local qwen routing), "
-        f"touching zero plan quota.",
+        f"estimated savings came from the two paths below.",
         f"- Recorded plan-limit hits in transcripts this week: **{limit_events}** "
         f"(undercount — the CLI does not log every throttle).",
         "",
@@ -417,8 +556,11 @@ def main():
         "",
         "| Source | Tokens avoided | $ saved | Basis |",
         "|---|---|---|---|",
-        f"| Local qwen routing (:8083) | {fmt_tok(local_tokens)} | ${local_saved:,.2f} | "
-        f"{local_turns} turns served locally; counterfactual = {COUNTERFACTUAL} pricing (measured) |",
+        f"| Open-source models (local) | {fmt_tok(local_tokens)} | ${local_saved:,.2f} | "
+        f"{local_turns} Claude/Codex turns served locally; counterfactual = {COUNTERFACTUAL} pricing (measured) |",
+        f"| Codex plan | {fmt_tok(codex_tokens)} | ${codex_saved:,.2f} | "
+        f"${codex_value:,.2f} metered API value across {codex_turns} responses, less "
+        f"${codex_plan_wk:,.2f}/wk plan cost (measured tokens; configurable rates) |",
         "",
         f"**Note on caching:** {cache_rate:.1f}% of input tokens this week came from cache "
         f"({fmt_tok(cache_read_tok)} reads, worth ${cache_net:,.2f} against API list price). "
@@ -426,13 +568,36 @@ def main():
         f"no per-token bill, so there was no charge for caching to discount off of. What caching "
         f"actually buys you is efficiency: more work fits in the same session and weekly limits.",
         "",
-        "## Working time",
+        "## Claude working time",
         "",
         f"- Agent active time, summed per session: **{agent_hours:,.1f} h** "
         f"(events ≤ {ACTIVE_GAP_MIN:.0f} min apart count as continuous work)",
         f"- Wall-clock coverage: **{wall_hours:,.1f} h** → {parallelism:.1f} parallel agents on average",
         f"- Estimated human time to do the same work: **{human_hours:,.1f} h** "
         f"(assumes a human needs ≥ {HOURS_MULTIPLIER:g}x the agent's active time)",
+        "",
+        "## Local-agent usage by client",
+        "",
+        "| Client | Turns | Tokens |",
+        "|---|---|---|",
+        f"| Claude | {local_claude_turns} | {fmt_tok(local_claude_tokens)} |",
+        f"| Codex | {local_codex_turns} | {fmt_tok(local_codex_tokens)} |",
+        "",
+        "## OpenRouter usage by client",
+        "",
+        "| Client | Turns | Tokens | Models |",
+        "|---|---|---|---|",
+        (f"| Claude | {openrouter_claude_turns} | {fmt_tok(openrouter_claude_tokens)} | "
+         f"{', '.join(sorted(claude_openrouter))} |")
+        if openrouter_claude_turns else
+        "| Claude | 0 | 0 | none |",
+        (f"| Codex | {openrouter_codex_turns} | {fmt_tok(openrouter_codex_tokens)} | "
+         f"{', '.join(sorted(codex_openrouter))} |")
+        if openrouter_codex_turns else
+        "| Codex | 0 | 0 | none |",
+        "",
+        "OpenRouter usage is not included in savings because this report only has "
+        "transcript-attributed usage, not governed spend data.",
         "",
         "## Cloud usage by model",
         "",
@@ -444,17 +609,25 @@ def main():
                      f"{fmt_tok(t['cache_read'])} | {fmt_tok(t['cache_w5m'] + t['cache_w1h'])} | "
                      f"${cost_usd(t, now):,.2f} |")
     if local:
-        lines += ["", "## Local model usage (zero cloud cost)", "",
+        lines += ["", "## Open-source model usage (zero cloud cost)", "",
                   "| Model | Turns | Input | Output |", "|---|---|---|---|"]
         for m, t in sorted(local.items()):
             lines.append(f"| {m} | {t['turns']} | "
                          f"{fmt_tok(t['input'] + t['cache_read'] + t['cache_w5m'] + t['cache_w1h'])} | "
                          f"{fmt_tok(t['output'])} |")
+    if codex_cloud:
+        lines += ["", "## Codex usage by model", "",
+                  "| Model | Responses | Input | Cached input | Output |", "|---|---|---|---|---|"]
+        for m, t in sorted(codex_cloud.items()):
+            lines.append(f"| {m} | {t['turns']} | {fmt_tok(t['input'])} | "
+                         f"{fmt_tok(t['cache_read'])} | {fmt_tok(t['output'])} |")
     lines += ["", "---",
-              f"*Scanned {scanned} transcript files; window {days}d; generated {now.strftime('%Y-%m-%d %H:%M UTC')}. "
+              f"*Scanned {scanned} Claude and {codex_scanned} Codex transcript files; window {days}d; "
+              f"generated {now.strftime('%Y-%m-%d %H:%M UTC')}. "
               f"Assumption knobs: SAVINGS_COUNTERFACTUAL, SAVINGS_HOURS_MULTIPLIER, "
               f"SAVINGS_ACTIVE_GAP_MIN, SAVINGS_PLAN_COST_MO, "
-              f"SAVINGS_PLAN_OPUS_HRS_LO/HI.*", ""]
+              f"SAVINGS_PLAN_OPUS_HRS_LO/HI, "
+              f"SAVINGS_CODEX_*_PER_MTOK, SAVINGS_CODEX_PLAN_COST_MO.*", ""]
     report = "\n".join(lines)
 
     print(report)
@@ -473,7 +646,16 @@ def main():
         print(f"\nwritten: {out}", file=sys.stderr)
     if send_email:
         savings = {"usd_saved": usd_saved, "cache_rate": cache_rate,
-                  "local_saved": local_saved, "local_turns": local_turns}
+                  "local_saved": local_saved, "local_turns": local_turns,
+                  "local_claude_turns": local_claude_turns,
+                  "local_claude_tokens": local_claude_tokens,
+                  "local_codex_turns": local_codex_turns,
+                  "local_codex_tokens": local_codex_tokens,
+                  "openrouter_claude_turns": openrouter_claude_turns,
+                  "openrouter_claude_tokens": openrouter_claude_tokens,
+                  "openrouter_codex_turns": openrouter_codex_turns,
+                  "openrouter_codex_tokens": openrouter_codex_tokens,
+                  "codex_saved": codex_saved, "codex_turns": codex_turns}
         sent = send_weekly_email(savings, week_of, today, dry)
         # Say "would send" on a dry run. This used to print "email sent to
         # <address>" unconditionally, because the dry-run branch returns True
@@ -488,7 +670,7 @@ def main():
                f"({leverage:,.0f}x), {agent_hours:,.0f} agent-hours, "
                f"{fmt_tok(tokens_saved)} tokens saved")
         subprocess.run(["osascript", "-e",
-                        f'display notification "{msg}" with title "Claude savings report"'],
+                        f'display notification "{msg}" with title "AI model savings report"'],
                        capture_output=True)
 
 
