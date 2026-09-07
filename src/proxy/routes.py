@@ -1,6 +1,7 @@
 """FastAPI route handlers."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -649,6 +650,97 @@ async def _release_deferred(
         await ollama_admin.unload(base_url, model)
 
 
+# What the real API sends to keep a slow stream alive, byte for byte. Claude
+# Code already tolerates these mid-stream from Anthropic itself, which is what
+# makes it the safe frame to inject: an unknown one would have to be guessed at.
+_PING_EVENT = 'event: ping\ndata: {"type": "ping"}\n\n'
+# Gap after which a local stream sends one. Five seconds is far under any
+# plausible client idle timeout and costs ~30 bytes, so the cheap side of the
+# trade is also the safe one.
+_LOCAL_STREAM_PING_SECONDS = 5.0
+
+
+async def _locked_events(
+    inner: AsyncIterator[str],
+    tier: tuple[str, str] | None,
+    lock_timeout: float,
+) -> AsyncIterator[str]:
+    """`inner`, with the tier's serialization lock held across the whole run.
+
+    Split out of `_tracked_local_stream` so the lock WAIT sits inside the
+    iterator rather than around it. That is what lets one heartbeat cover both
+    slow phases: waiting for the tier and waiting for the first token are both
+    just a slow first `__anext__` from here.
+    """
+    if tier is None:
+        async for event in inner:
+            yield event
+        return
+    async with tier_lock.hold(tier[0], tier[1], timeout=lock_timeout):
+        async for event in inner:
+            yield event
+
+
+async def _with_heartbeat(inner: AsyncIterator[str], interval: float) -> AsyncIterator[str]:
+    """Emit a ping whenever `inner` has produced nothing for `interval`.
+
+    A local turn commits to its response early: FastAPI puts 200 and the SSE
+    headers on the wire as soon as the StreamingResponse starts, and only then
+    does the work begin. Two phases of that work produce no bytes at all, and
+    both can run to a minute or more:
+
+      * waiting for the tier lock, when another session is already generating
+      * the cold prefill, before the first token exists
+
+    Until 2026-09-08 the client got headers and then silence for as long as
+    that took, which it renders as `API Error: The response stopped arriving.
+    The response above may be incomplete.` — indistinguishable from a dead
+    connection, and it lands on the turn that failover was supposed to rescue.
+    Measured that night at 01:20:38: a failed-over turn queued behind a live
+    one and did not acquire the tier for 75.2 seconds, 47 of them after
+    Anthropic was already reachable again.
+
+    So the fix is not to make the wait shorter — a single GPU cannot serve two
+    17K-token prefills at once, and serializing them is the right call (see
+    tier_lock) — but to stop the wait looking like a failure. A ping every few
+    seconds says "still here" in the one dialect the client already speaks.
+    """
+    if interval <= 0:
+        async for event in inner:
+            yield event
+        return
+    it = inner.__aiter__()
+    pending: asyncio.Task[str] | None = None
+    try:
+        while True:
+            pending = asyncio.ensure_future(it.__anext__())
+            while True:
+                done, _ = await asyncio.wait({pending}, timeout=interval)
+                if done:
+                    break
+                yield _PING_EVENT
+            try:
+                event = pending.result()
+            except StopAsyncIteration:
+                pending = None
+                return
+            pending = None
+            yield event
+    finally:
+        # The consumer can vanish mid-wait (client hung up). Cancelling the
+        # in-flight pull raises into `inner` at its await point, which is what
+        # runs the `async with` in `_locked_events` and hands the tier back;
+        # aclose() covers the case where it was parked between yields instead.
+        if pending is not None:
+            pending.cancel()
+            with contextlib.suppress(BaseException):
+                await pending
+        aclose = getattr(it, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(BaseException):
+                await aclose()
+
+
 async def _tracked_local_stream(
     inner: AsyncIterator[str],
     settings: Settings,
@@ -669,16 +761,18 @@ async def _tracked_local_stream(
     generator, and a lock taken in the handler would then be released by
     nobody. Acquiring inside means the lock's lifetime is exactly the
     generator's.
+
+    Everything it produces goes out through :func:`_with_heartbeat`, because
+    the two slowest parts of a local turn both happen AFTER the response is
+    committed — headers are already on the wire, and the client is waiting on a
+    body that has not started. See that function for the incident.
     """
     _local_stream_started()
     try:
-        if tier is not None:
-            async with tier_lock.hold(tier[0], tier[1], timeout=lock_timeout):
-                async for event in inner:
-                    yield event
-        else:
-            async for event in inner:
-                yield event
+        async for event in _with_heartbeat(
+            _locked_events(inner, tier, lock_timeout), _LOCAL_STREAM_PING_SECONDS
+        ):
+            yield event
     finally:
         due = _local_stream_ended()
         try:

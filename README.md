@@ -693,6 +693,25 @@ A dead stream still counts against the 20-second duration gate before anything o
 
 Hanging up yourself does not count. `CancelledError` and `GeneratorExit` are not `httpx.TransportError`, so pressing Ctrl-C never pushes the breaker toward claiming the GPU.
 
+### The same error, from the local side: a stream that never starts
+
+`The response stopped arriving` has a second cause, and it is not a dead upstream at all — it is the failover turn that was supposed to rescue you, sitting mute.
+
+A local turn commits to its response early. FastAPI puts `200` and the SSE headers on the wire when the `StreamingResponse` starts, and only *then* does the work begin. Two phases of that work produce no bytes, and either can run past a minute:
+
+| Phase | Why it is silent |
+|---|---|
+| Waiting for the tier lock | another session is already generating, and one GPU serves one prefill |
+| The cold prefill | the first token does not exist yet — a 17K-token context on the 27B is not fast |
+
+Measured 2026-09-08 at `01:20:38`: a failed-over turn queued behind a live one and did not acquire the tier for **75.2 seconds**, 47 of them after Anthropic was already reachable again. The client had headers and nothing else for that whole time, which is indistinguishable from a dead connection — so the turn Backdoor had just rescued from an outage died anyway, with the same message a truncated upstream produces.
+
+The wait itself is correct and stays. Interleaving two large prefills costs both sessions roughly 100x against one turn of queueing (see the measurements in `tier_lock`), so serializing is the right call. What was wrong is that the wait looked like a failure.
+
+Every locally served stream — failover and deliberate `/model qwen` alike — now goes out through a heartbeat that emits `event: ping` after five seconds of silence, the same frame the real API sends to hold a slow stream open. Claude Code already tolerates those mid-stream from Anthropic itself, which is what makes it the safe thing to inject rather than a guess.
+
+The lock wait sits *inside* the iterator being watched, not around it, so one heartbeat covers both phases: from the watcher's side, waiting for the tier and waiting for the first token are both just a slow first pull. A client that hangs up mid-wait cancels that pull, which raises into the generator at its await point and hands the tier back — the queue must not outlive the turn that was in it.
+
 
 ### A local tier that stops answering
 
