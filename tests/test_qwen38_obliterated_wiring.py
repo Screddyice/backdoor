@@ -9,8 +9,11 @@ keep the action-tuned MLX model reachable by its explicit alias, and retain the
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from src.proxy import mlx_admin
 from src.proxy.config import FAILOVER_LADDER, MODEL_ROUTES, Settings
@@ -103,6 +106,7 @@ def test_qwen_wrapper_stops_mlx_before_warming_the_ollama_27b() -> None:
     assert '[ -n "$WARM_OLLAMA" ] && curl' in wrapper
 
 
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="Zsh is unavailable")
 def test_stopping_an_absent_mlx_tier_is_silent(tmp_path) -> None:
     """The routine preflight must not claim that the selected Ollama tier is down."""
     launchctl = tmp_path / "launchctl"
@@ -110,7 +114,7 @@ def test_stopping_an_absent_mlx_tier_is_silent(tmp_path) -> None:
     env = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
 
     result = subprocess.run(
-        [str(ROOT / "local" / "qwen38"), "stop"],
+        [shutil.which("zsh"), str(ROOT / "local" / "qwen38"), "stop"],
         check=True,
         capture_output=True,
         text=True,

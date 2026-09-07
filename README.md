@@ -1699,6 +1699,8 @@ uv run pytest tests/<file>    # one file
 Linux test runners need `zsh` for the Qwen launcher regression tests. CI installs
 it before running the suite. Those tests stub `launchctl`, so they exercise the
 launcher without operating a macOS service.
+Other test environments report a skip for the launcher execution test when
+`zsh` is unavailable; the required CI gate runs it.
 
 `.claude-harness/init.sh` is not tracked. The claude-harness plugin rewrites it from its
 own template in whichever checkout it runs in, so tracking it left every checkout carrying a
