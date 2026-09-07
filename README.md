@@ -1696,6 +1696,10 @@ uv run pytest                 # full suite
 uv run pytest tests/<file>    # one file
 ```
 
+Linux test runners need `zsh` for the Qwen launcher regression tests. CI installs
+it before running the suite. Those tests stub `launchctl`, so they exercise the
+launcher without operating a macOS service.
+
 `.claude-harness/init.sh` is not tracked. The claude-harness plugin rewrites it from its
 own template in whichever checkout it runs in, so tracking it left every checkout carrying a
 permanent modification — and `scripts/deploy-router.sh` aborts at preflight on a dirty service
