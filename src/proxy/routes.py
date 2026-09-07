@@ -17,7 +17,7 @@ from .config import (
 )
 from .bare import OFFLINE_SYSTEM, make_bare, parse_keep, route_system
 from .external_context import prepare_external_context
-from .failover import FAILOVER_STATUSES, FailoverBreaker
+from .failover import FAILOVER_STATUSES, FailoverBreaker, service_reachable
 from .provider_errors import is_provider_edge_404
 from . import compute_lease, mlx_admin, ollama_admin, tier_lock, working_set
 from .models import MessagesRequest, TokenCountRequest, MessagesResponse, TokenCountResponse, Usage
@@ -328,6 +328,8 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
             probe_interval=settings.failover_probe_seconds,
             min_outage=settings.failover_min_outage_seconds,
             notify_cooldown=settings.failover_notify_cooldown_seconds,
+            require_offline=False,
+            service_fn=lambda: service_reachable(settings.anthropic_upstream),
         )
     return _breaker
 
@@ -335,7 +337,7 @@ def get_breaker(settings: Settings) -> FailoverBreaker:
 async def failover_recovery_loop(
     settings: Settings, targets=None, sleep=asyncio.sleep
 ) -> None:
-    """Close an open breaker once this host is back online, without a rider.
+    """Close an open breaker once its upstream is reachable, without a rider.
 
     The breaker's own half-open path needs an upstream-bound request to carry
     it, and an outage is exactly what stops those arriving: sessions served by a
@@ -348,10 +350,7 @@ async def failover_recovery_loop(
     `targets` is a list of `(breaker, release)` pairs, `release` being an async
     callable taking the breaker. It defaults to both breakers this router owns:
     the Claude one here and the Codex one in codex_routes, each with its own
-    tier-release path. Only a breaker that required an offline host to open can
-    actually be closed this way — `maybe_recover` refuses for a service-level
-    breaker — but passing it costs nothing and keeps the wiring honest if that
-    configuration changes.
+    tier-release path. Each breaker runs the probe that matches its policy.
 
     Cheap by construction: it does nothing at all while the breakers are closed,
     which is essentially always. The probe itself is blocking socket work, so it

@@ -17,10 +17,20 @@ logger = logging.getLogger(__name__)
 
 _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_TOOL_SCHEMA_RECOVERY = (
+    "[Tool schema correction: Use the tool's declared field names. "
+    "Do not repeat the rejected arguments.]"
+)
 
 
 def _new_tool_use_id() -> str:
     return f"toolu_{uuid.uuid4().hex[:24]}"
+
+
+def _decorate_tool_result(text: str) -> str:
+    if "<tool_use_error>" in text and "InputValidationError" in text:
+        return f"{text}\n\n{_TOOL_SCHEMA_RECOVERY}"
+    return text
 
 
 def looks_like_tool_call_start(buf: str) -> bool:
@@ -215,6 +225,7 @@ def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
                         text = "\n".join(b.get("text", "") for b in raw if b.get("type") == "text")
                     else:
                         text = str(raw) if raw is not None else ""
+                    text = _decorate_tool_result(text)
                     result.append({
                         "role": "tool",
                         "tool_call_id": block["tool_use_id"],

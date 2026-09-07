@@ -1,8 +1,7 @@
 """Unit tests for the cloud→local failover breaker.
 
-The breaker opens on exactly one condition: this host is offline. Tests inject
-connectivity through `online_fn` rather than touching the network, and redirect
-the published state file so a test run never writes to ~/.backdoor.
+Tests cover both offline-gated and service-gated policies. They inject probes
+instead of touching the network and redirect published state out of ~/.backdoor.
 """
 
 import contextlib

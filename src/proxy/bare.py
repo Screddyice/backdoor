@@ -64,8 +64,9 @@ from .models import MessagesRequest, Message
 # harness's own tools still work perfectly — Read, Edit, Bash, Glob and Grep
 # touch nothing but this disk — so keeping them lets the failover model carry on
 # doing work instead of only talking about it. Every `mcp__*` tool is a remote
-# integration and is dead for exactly as long as the breaker is open, since the
-# breaker opens on one condition only: this host is offline.
+# integration. Those tools are unavailable during a host-wide outage and too
+# expensive to retain during a provider-specific outage: their schemas supplied
+# most of the measured ~286K-token harness.
 #
 # That also happens to be where the weight is. The ~286K tokens of definitions
 # measured on this machine came from MCP servers, not from the dozen local tools, so dropping `mcp__*`

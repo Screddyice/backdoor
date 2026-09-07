@@ -535,7 +535,7 @@ The installer retains one full rollback bundle per Codex version and build. Remo
 
 The patch keeps the Desktop task stream alive. Backdoor still decides whether an inference request uses ChatGPT or local Qwen. Online Qwen requests can opt into the specific MCP tools they need; internet-dependent MCP servers remain unavailable during a genuine network outage.
 
-In hybrid mode Backdoor passes Anthropic-bound traffic straight through to the real API and only steps in when it has to. A circuit breaker watches passthrough requests, and when it opens, `/v1/messages` is served by a local Ollama profile instead — so an in-flight session survives losing the network. The profile is chosen by session size, so a large context escalates to a wider-window tier rather than being truncated.
+In hybrid mode Backdoor passes Anthropic-bound traffic through to the real API. A circuit breaker watches passthrough requests. After Anthropic stays unreachable for 20 seconds, `/v1/messages` uses a local Ollama profile. This covers a full network outage and a network that can reach other services while Anthropic's edge remains unreachable. Backdoor chooses the profile by session size, so a large context moves to a wider-window tier.
 
 > **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
 
@@ -556,7 +556,7 @@ What each route does now when upstream will not answer:
 | `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage |
 | `/{path:path}` | `502` |
 
-Recording a failure never opens the breaker on its own. `internet_usable()` still decides that, and these routes never call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
+Recording one failure never opens the breaker before the 20-second duration gate. These routes do not call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.
 
 ### Deploying: scripts/deploy-router.sh
 
@@ -641,17 +641,17 @@ An open breaker used to have exactly one way back: `allow_upstream` hands a real
 
 Measured on 2026-09-02, the breaker was open from 22:28:14 to 23:45:51 — 77 minutes 37 seconds, most of them on a network that had already recovered — and it closed at the exact second unrelated test traffic reached it. For that whole window every routed session was quietly answered by qwen instead of the cloud model, which reads as "the API errors never stopped" rather than as a stuck breaker.
 
-A background ticker now re-runs the connectivity probe every `failover_probe_seconds` while the breaker is open, and closes it the moment this host is online again — releasing the local tiers exactly as an upstream success would. It is the negation of the condition that opened the breaker: opening means "this host is offline", so recovery is "that stopped being true". If Anthropic itself is still down, the next real request fails, the probe finds the host online, and the error is relayed — the documented behaviour for an upstream outage on a working link. The ticker does nothing at all while the breaker is closed, and starts only when `failover_to_local` is on.
+A background ticker checks each unavailable service every `failover_probe_seconds` while its breaker is open. It closes the breaker when that service accepts a verified TLS connection and releases the local tiers. The ticker does no network work while both breakers are closed and starts only when `failover_to_local` is on.
 
 The ticker watches **both** breakers this router owns — the Claude one and the Codex one — each released through its own tier path.
 
-**Each breaker is answered by the probe that matches its premise.** The Claude breaker opens because this host had no route out, so connectivity is the exact negation of what it concluded. The Codex breaker never consults connectivity at all — `codex_failover_require_offline` is `false`, so it opens on consecutive service failures and can be open while the network is perfect. Answering it with a connectivity probe would be answering a question it never asked. It gets `service_reachable()` instead: the same verified handshake, aimed at its own upstream host.
+**Each breaker checks its own upstream.** Claude probes Anthropic and Codex probes ChatGPT with `service_reachable()`. A working ChatGPT connection cannot close the Claude breaker, and a working Anthropic connection cannot close the Codex breaker.
 
 Unlike `internet_reachable`, that one resolves DNS on purpose. Literal IPs exist so a broken resolver cannot fold itself into "has this machine got a route"; "is *that service* reachable from here" is a different question, and a name that will not resolve is a real way for a service to be unreachable.
 
 **Reachability disproves "I could not reach it" and never "it answered 429".** The front door of a rate-limited service is perfectly reachable, and this router cannot check the difference on its own: it relays the caller's credentials and holds none, so it cannot make an authenticated Codex request outside a real one. So `record_failure` takes `transport_error`, passed `False` at the two `f"HTTP {status}"` call sites, and the breaker remembers which kind opened it. A transport-error open can be reconsidered by the probe; a status open keeps the half-open path, which is the only route that actually settles a quota and the only one carrying a credential.
 
-The practical difference: an idle Codex outage that was a transport failure now ends on its own, instead of holding a qwen tier resident and llm-jury disabled until traffic happens to return. A usage limit still waits for a real request, which is correct.
+The practical difference: an idle transport outage ends on its own instead of holding a qwen tier resident and llm-jury disabled until traffic returns. A usage limit still waits for a real authenticated request.
 
 ### A stream that dies after the headers
 
@@ -668,7 +668,7 @@ Backdoor cannot rescue the truncated request. It now does the two things still a
 | Logs it | `upstream stream died mid-response after N byte(s)`, with the exception name and how far the body got |
 | Counts it | `record_failure()`, so the retry can be served locally instead of truncating again |
 
-A dead stream still runs the connectivity probe before anything opens. If Anthropic dropped your stream while this host is online, Backdoor relays the failure and leaves the GPU alone.
+A dead stream still counts against the 20-second duration gate before anything opens. Backdoor relays brief failures and keeps the GPU free.
 
 Hanging up yourself does not count. `CancelledError` and `GeneratorExit` are not `httpx.TransportError`, so pressing Ctrl-C never pushes the breaker toward claiming the GPU.
 
@@ -692,11 +692,9 @@ The cloud side had the quieter half of the same problem. A relayed upstream erro
 
 ### The breaker's verdict does not run on the event loop
 
-`record_failure` calls `internet_reachable`, a blocking socket probe against a public address. It
-is the thing that decides whether a run of failures means *this host is offline* or just *Anthropic
-is having a moment*, and it was called straight from the request coroutine. So every failed turn
-froze the router for the length of that probe, for every other session on it, at exactly the moment
-the router is busiest.
+`record_failure` can call a blocking socket probe. Earlier versions called it from the request
+coroutine, so every failed turn froze the router for the probe's duration while other sessions
+waited.
 
 Moving it to a worker thread fixes the stall and exposes a second fault underneath. A probe started
 by one request can finish after a NEWER request has already succeeded and closed the breaker, and it
@@ -1349,7 +1347,11 @@ ollama create qwen3.8:27b-obliterated \
 
 The bundled GGUF template does not advertise tools, so Ollama rejects Claude Code requests with `does not support tools`. The Modelfile installs the tool-capable template from the stock local `qwen3:8b` tag, clamps `num_ctx` to 32,768, and sets the publisher's required `repeat_penalty` to 1.15. Live checks must cover both tool-call serialization and a non-empty compact response before this tag is used as the default.
 
+Qwen can still choose a valid tool name with invalid fields. One September 6 session called `Bash` with a `query` field, received `InputValidationError`, and repeated the rejected call. Backdoor now appends a short schema correction to that tool result so the next turn re-reads the supplied schema and changes its arguments. Ordinary tool output stays unchanged.
+
 The 27B GGUF and the 27B MLX server cannot share memory safely. Before the router serves `local-qwen38-obliterated`, `mlx_admin` stops either managed MLX profile and waits for port 8080 to go quiet. If the server cannot stop, the router selects `local-fast` and logs the collision instead of loading both 27B runtimes.
+
+The `qwen` wrapper performs the same MLX stop check before warming Ollama. An absent MLX server is the normal state, so that check stays silent. The launch banner names the selected Ollama model and remains the source of truth for the session. A failed MLX stop still prints an error and blocks the unsafe warmup.
 
 ### The action-tuned rollback is `qwen38-action`
 
@@ -1515,34 +1517,35 @@ Measured against the registry on 2026-08-16: one connection 435 KB/s, four range
 
 **A partial of exactly the right size can still be corrupt.** Ollama's abandoned `-partial` file for the projector blob was byte-for-byte the manifest's size, 931,146,016, and its SHA-256 did not match. Size is not verification; promoting that blob on size alone would have installed a broken model. Always check the digest before salvaging a partial.
 
-**The breaker opens on exactly one condition: this machine is offline.** That is deliberately narrow, because failing over is not free — it loads a local model into Ollama, and on a machine that also runs a local council (see [llm-jury](https://github.com/Screddyice/llm-jury)) two GPU consumers at once will fight for memory.
+**The breaker opens after Anthropic has a sustained transport outage.** On September 7, 2026, this Mac could reach ChatGPT while every connection to Anthropic's edge failed. The old host-wide gate returned repeated 502 responses because it treated any working internet service as proof that local fallback was unnecessary.
+
+Backdoor now uses the same service-level policy for Claude and Codex. The 20-second duration gate protects the shared GPU from brief network errors. A local model still consumes enough memory to displace the [llm-jury](https://github.com/Screddyice/llm-jury) council, so the router keeps HTTP responses visible and only treats transport loss as outage evidence.
 
 So the trigger set is tight:
 
 | Upstream behavior | Failover? | Why |
 |---|---|---|
 | Any HTTP response (`429`, `529`, `500`…) | **No** | A status code proves the request reached Anthropic and was answered. A usage limit is not a reachability problem, and hiding it behind a local model both masks a real signal and takes the GPU. The error is relayed so your client's own retry/backoff runs. |
-| Transport error, host still online | **No** | Anthropic specifically is unreachable. Relayed verbatim so a provider outage stays visible. |
-| Transport error, host offline | **Yes** | Nothing else is reachable either — local is the only way the session survives. |
+| Transport error lasting under 20 seconds | **No** | The client receives the real error while the duration gate waits out a short interruption. |
+| Transport error lasting at least 20 seconds | **Yes** | Anthropic is unreachable from this network, even if another provider still works. |
 | `401` / `403` | **No** | The network is fine and a credential is broken. Masking that would hide a revoked key indefinitely. |
 
-Reaching the failure threshold is necessary but not sufficient: a TCP connectivity probe to a public address gets the final say, and it is re-taken each time (never cached), costing one probe per run of failures rather than one per request.
+The recovery ticker uses a verified TLS handshake to Anthropic's own host. It closes only when that endpoint becomes reachable.
 
 ### How long failover takes
 
-The breaker probes connectivity on the first transport failure. If the host is offline, the first
-request moves to local failover after one bounded upstream retry. The local model's cold start is
-then the main delay.
+The breaker starts its outage clock on the first transport failure. A request after the 20-second
+gate moves to local failover following one bounded upstream retry. The local model's cold start
+then becomes the main delay.
 
 | Stage | Cost |
 |---|---|
 | One router-level retry, bounded by the upstream timeout | depends on the failed operation |
-| TCP probe confirming the host is offline | ~0s offline (fails instantly), up to 4s otherwise |
+| Duration gate protecting against a brief provider interruption | 20s from the first failure |
 | `qwen3.5:27b-bare` cold start | ~10s |
 
-The connectivity probe, rather than a retry count, prevents a provider-only blip from claiming the
-GPU. The default threshold is one so Claude does not have to display an error before the router
-checks whether local failover is permitted.
+The duration gate prevents a provider blip from claiming the GPU. The default threshold is one;
+concurrent retries cannot bypass the elapsed-time check.
 
 **Local retries are serialized per profile.** When Claude retries while Ollama is still loading or
 prefilling, Backdoor queues the duplicate request instead of opening another connection and
@@ -1573,7 +1576,7 @@ Writing is best-effort. A router that cannot publish state still routes, and LLM
 | `failover_bare` | `true` | Strip the harness off a failed-over request. Turn off only together with reverting the tier to a 4B |
 | `failover_keep_tools` | `local` | What survives the tool list. `local` keeps everything not prefixed `mcp__`; add comma-separated substrings to keep specific MCP tools; empty keeps none |
 | `failover_tool_result_chars` | `2000` | Per-tool-result character budget in the stripped transcript |
-| `failover_threshold` | `1` | Transport failures before the connectivity probe runs. The probe, not this count, stops a transient blip from opening the breaker |
+| `failover_threshold` | `1` | Transport failures required alongside the elapsed-time gate |
 | `failover_window_seconds` | `120` | Failures outside this window start a fresh run |
 | `failover_probe_seconds` | `60` | How often an open breaker retries upstream (half-open) |
 | `BACKDOOR_FAILOVER_STATUSES` | *(empty)* | Comma-separated HTTP statuses to restore as triggers, e.g. `429,529` |
@@ -1692,6 +1695,12 @@ uv sync                       # install
 uv run pytest                 # full suite
 uv run pytest tests/<file>    # one file
 ```
+
+Linux test runners need `zsh` for the Qwen launcher regression tests. CI installs
+it before running the suite. Those tests stub `launchctl`, so they exercise the
+launcher without operating a macOS service.
+Other test environments report a skip for the launcher execution test when
+`zsh` is unavailable; the required CI gate runs it.
 
 `.claude-harness/init.sh` is not tracked. The claude-harness plugin rewrites it from its
 own template in whichever checkout it runs in, so tracking it left every checkout carrying a

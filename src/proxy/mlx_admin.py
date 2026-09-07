@@ -5,11 +5,10 @@ and evicts it on a timer. The Qwen3.8-27B Action-Abliterated tier does not: it i
 a launchd-managed `mlx_vlm.server` on 127.0.0.1:8080 that is either running and
 holding ~19GB, or not running at all. Nothing loads it lazily.
 
-That matters because this tier now backs `/model qwen` AND offline failover.
-Failover fires when the host is offline and nobody is watching, so "the server
-happened to be stopped" would turn a working fallback into a dead session. So the
-router starts the server itself and, when that fails, drops to the Ollama tier
-rather than returning a connection error.
+That matters because this tier now backs `/model qwen` and failover. An outage
+can arrive when nobody is watching, so a stopped server would turn a working
+fallback into a dead session. The router starts the server and drops to the
+Ollama tier if startup fails.
 
 Cost of being wrong in each direction:
   * Starting when we should not: ~19GB resident that Ollama cannot evict, which

@@ -7,9 +7,9 @@ measured action checkpoint stays available by name.
 
 The load-bearing test in this file is test_fallback_profile_is_a_lazy_ollama_tier.
 Unlike every other local tier, this one does not load on demand: it is a launchd
-job that is either up or absent. Failover fires when the host is offline and
-nobody is watching, so a tier that cannot self-start would turn the fallback into
-a dead session. mlx_admin starts it and drops to the 4B fast tier when it cannot.
+job that is either up or absent. Failover can fire when nobody is watching, so a
+tier that cannot self-start would turn the fallback into a dead session.
+mlx_admin starts it and drops to the 4B fast tier when it cannot.
 """
 
 from pathlib import Path

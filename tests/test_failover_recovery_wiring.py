@@ -166,6 +166,42 @@ def test_lifespan_skips_the_ticker_when_failover_is_off(monkeypatch):
 # list covers both.
 
 
+def test_anthropic_transport_outage_opens_while_the_rest_of_the_internet_works(
+    monkeypatch,
+):
+    """The provider can be unreachable from a network that still reaches ChatGPT."""
+    monkeypatch.setattr(routes, "_breaker", None)
+    settings = Settings(failover_min_outage_seconds=0)
+    breaker = routes.get_breaker(settings)
+    breaker._online = lambda: True
+
+    try:
+        assert breaker.record_failure("ConnectError") is True
+        assert breaker.open
+    finally:
+        routes._breaker = None
+
+
+def test_the_anthropic_breaker_probes_its_own_upstream(monkeypatch):
+    asked = []
+    monkeypatch.setattr(
+        routes,
+        "service_reachable",
+        lambda url: asked.append(url) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(routes, "_breaker", None)
+    settings = Settings()
+    breaker = routes.get_breaker(settings)
+
+    try:
+        assert breaker._service is not None
+        assert breaker._service() is True
+        assert asked == [settings.anthropic_upstream]
+    finally:
+        routes._breaker = None
+
+
 def test_the_default_targets_cover_both_breakers(monkeypatch):
     import src.proxy.codex_routes as codex_routes
 

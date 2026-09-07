@@ -61,11 +61,11 @@ class Settings(BaseSettings):
     router_mode: str = "profile"
     anthropic_upstream: str = "https://api.anthropic.com"
 
-    # Cloud→local failover (hybrid mode only): when THIS HOST IS OFFLINE —
-    # `failover_threshold` consecutive transport errors within
-    # `failover_window_seconds`, confirmed by a connectivity probe — serve
-    # passthrough /v1/messages traffic from a local profile instead of failing,
-    # probing upstream every `failover_probe_seconds` until it recovers.
+    # Cloud→local failover (hybrid mode only): after a sustained run of
+    # transport errors to Anthropic, serve passthrough /v1/messages traffic from
+    # a local profile instead of failing. Probe Anthropic's own edge every
+    # `failover_probe_seconds` until it recovers. This covers both a host-wide
+    # outage and a network that can reach other services but not Anthropic.
     #
     # Usage limits (429) and overloads (529) are deliberately NOT triggers: they
     # arrive as HTTP responses, which prove the network works. Failing over on
@@ -80,15 +80,8 @@ class Settings(BaseSettings):
     # action checkpoint has its own runtime supervisor and falls back to the
     # 4B fast profile when its launchd service cannot start.
     failover_profile: str = "local-qwen38-obliterated"  # default tier
-    # Probe on the first transport failure. The connectivity probe remains the
-    # safety gate: local failover opens only when the host is offline. Waiting
-    # for a second Claude retry exposed one avoidable API error before asking
-    # the question that decides whether local failover is allowed.
-    #
-    # Dropping to 1 is safe because the threshold was never the real guard: the
-    # connectivity probe is. A run of failures only opens the breaker if a TCP
-    # probe to a public address also fails, so a single transient blip still
-    # cannot claim the GPU. The third failure bought latency, not safety.
+    # Count from the first transport failure. Elapsed outage time below is the
+    # safety gate, so concurrent retries in one instant cannot claim the GPU.
     failover_threshold: int = DEFAULT_FAILOVER_THRESHOLD
     failover_window_seconds: float = 120.0
     failover_probe_seconds: float = 60.0
@@ -124,11 +117,11 @@ class Settings(BaseSettings):
     # load-bearing change — it is what lets the failover tier be a 14B instead
     # of a 4B without repeating the 2026-07-09 prefill regression.
     # "local" keeps every tool NOT prefixed `mcp__`: Read, Edit, Bash, Glob and
-    # Grep all work with no network, so the failover model can keep doing work,
-    # while remote MCP integrations (which are dead for as long as the breaker
-    # is open, and which are where the ~286K tokens of definitions came from)
-    # are dropped. Set to "" for a tier that cannot accept tool definitions at
-    # all — deepseek-r1 makes Ollama 400 the request. See src/proxy/bare.py.
+    # Grep work without a network, so the failover model can keep doing local
+    # work. Remote MCP integrations are dropped because their schemas supplied
+    # most of the measured ~286K-token harness, even when the wider internet is
+    # still available. Set to "" for a tier that cannot accept tool definitions
+    # at all. deepseek-r1 makes Ollama return 400. See src/proxy/bare.py.
     failover_bare: bool = True
     failover_keep_tools: str = "local"
     failover_tool_result_chars: int = 2000
