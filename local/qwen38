@@ -186,8 +186,6 @@ stop_server() {
   stop_profile long
   if (( had_server )); then
     print "Qwen3.8 server stopped."
-  else
-    print "Qwen3.8 server is not running."
   fi
 }
 

@@ -9,8 +9,8 @@ request goes through the proxy, so injecting here covers every local path.
 
 WHY THE LOCAL REPLICA AND NOT THE HOSTED MCP
 --------------------------------------------
-cmem.ai cannot be reached during a failover, and a failover is when a local model
-matters most: the breaker opens on one condition, this host being offline.
+cmem.ai cannot be reached during a host-wide outage, which is when local recall
+matters most. Provider-specific outages also use the same local model path.
 `~/.claude-mem/claude-mem.db` is the worker's SQLite store, kept in sync with every
 other device through the cloud hub, with FTS5 indexes over summaries, observations
 and prompts. Recall keeps working with the network gone.

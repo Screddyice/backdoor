@@ -7,9 +7,10 @@ on `:8083` sends `qwen*` model names to local Ollama and passes everything else 
 the real Anthropic API; the forward proxy on `:8084` fronts it. Cloud-to-local
 failover sits in the request path with no opt-in.
 
-**The breaker opens on one condition: this host being offline.** 429, 529, 401 and
-403 are HTTP responses that prove the network works, so they get relayed rather
-than failed over.
+**The breaker opens after a sustained transport outage to Anthropic.** The rest
+of the internet may still work; some networks can reach ChatGPT while blocking
+Anthropic's edge. HTTP 429, 529, 401 and 403 responses still get relayed because
+the provider answered and the caller needs to see that response.
 
 ## Live-control boundary — read before running anything
 

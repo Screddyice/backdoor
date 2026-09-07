@@ -8,6 +8,8 @@ keep the action-tuned MLX model reachable by its explicit alias, and retain the
 28K escalation guard used by long-running local sessions.
 """
 
+import os
+import subprocess
 from pathlib import Path
 
 from src.proxy import mlx_admin
@@ -99,3 +101,21 @@ def test_qwen_wrapper_stops_mlx_before_warming_the_ollama_27b() -> None:
     assert stop < warm
     assert 'WARM_OLLAMA=""' in wrapper
     assert '[ -n "$WARM_OLLAMA" ] && curl' in wrapper
+
+
+def test_stopping_an_absent_mlx_tier_is_silent(tmp_path) -> None:
+    """The routine preflight must not claim that the selected Ollama tier is down."""
+    launchctl = tmp_path / "launchctl"
+    launchctl.symlink_to("/usr/bin/false")
+    env = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+
+    result = subprocess.run(
+        [str(ROOT / "local" / "qwen38"), "stop"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.stdout == ""
+    assert result.stderr == ""

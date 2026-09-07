@@ -1,8 +1,8 @@
 """Cloud→local failover breaker for hybrid mode.
 
-When this machine cannot reach the internet, hybrid-mode passthrough requests
-are served by a local Ollama profile instead of failing, so an in-flight Claude
-Code session keeps going.
+When an upstream cannot be reached for a sustained interval, hybrid-mode
+passthrough requests can use a local Ollama profile so an in-flight client keeps
+going. Each caller chooses an offline-gated or service-gated policy.
 
 Shape: a classic circuit breaker.
 
@@ -10,21 +10,16 @@ Shape: a classic circuit breaker.
           a consecutive-failure counter; any response resets it. Errors below
           the threshold are relayed verbatim so the client's own retry logic
           still runs.
-  OPEN    reached after `threshold` consecutive failures inside `window`
-          seconds AND a connectivity probe confirming this host is offline.
-          Passthrough-bound /v1/messages requests are served by the failover
-          profile. One request per `probe_interval` is allowed to try upstream
-          (half-open); a success closes the breaker. Independently of any
-          traffic, :meth:`FailoverBreaker.maybe_recover` re-runs the connectivity
-          probe on the same interval and closes the breaker once this host is
-          online again — an outage removes the very requests half-open needs.
+  OPEN    reached after the threshold and duration gates accept the failure.
+          Passthrough requests use the failover profile. One request per
+          `probe_interval` may try upstream; a success closes the breaker.
+          :meth:`FailoverBreaker.maybe_recover` also checks the relevant network
+          or service probe so recovery does not depend on client traffic.
 
-**Opening the breaker means exactly one thing: this machine is offline.** That
-narrowness is deliberate and load-bearing, because failing over is not free —
-it loads a qwen tier (up to ~13 GB) into the same Ollama server the llm-jury
-council needs, on a host where the council already wants ~23 GB of a 36 GB
-budget. Two local-GPU consumers at once is how this Mac gets taken down, so the
-router may only claim the GPU when it is the *only* way a session survives.
+Failing over loads a qwen tier into the same Ollama server the llm-jury council
+needs. The duration gate protects that shared GPU from brief transport errors.
+The Claude and Codex routes use service-level breakers because a network can
+reach one provider while blocking the other.
 
 Two consequences follow, and both are why triggers are as tight as they are:
 
@@ -33,11 +28,8 @@ Two consequences follow, and both are why triggers are as tight as they are:
     limit or a capacity blip is not a reachability problem, and serving it from
     a local 4B hid a real provider signal while taking the GPU. Hence
     :data:`FAILOVER_STATUSES` is empty by default.
-  * A transport error proves only that *Anthropic* is unreachable, which is not
-    the same as this host being offline (their edge or DNS can be down while
-    everything else works). So reaching the threshold is necessary but not
-    sufficient — :func:`internet_usable` gets the final say, and it asks both
-    halves of the question: a verified route out, and a resolver that answers.
+  * A transport error must persist for the configured minimum outage before a
+    service-level breaker opens. Its recovery probe checks the same upstream.
 
 Auth failures (401/403) were never triggers, for the same underlying reason:
 the network path is fine and a credential is broken, and masking that behind a
@@ -722,14 +714,14 @@ class FailoverBreaker:
 
         **Each breaker is answered by the probe that matches its premise.**
 
-        An offline-gated breaker (`require_offline=True`, the Claude upstream)
-        opened because this host had no route out, so `online_fn` is the exact
-        negation of what it concluded.
+        An offline-gated breaker (`require_offline=True`) opened because this
+        host had no route out, so `online_fn` is the matching recovery probe.
 
-        A service-level breaker (`require_offline=False`, the Codex upstream)
-        never consulted connectivity at all, so that probe answers nothing about
-        it. It is answered by `service_fn` — a verified handshake to its own
-        upstream host — and then only when it opened on a **transport error**.
+        A service-level breaker (`require_offline=False`, used by both client
+        upstreams) never consulted connectivity at all, so that probe answers
+        nothing about it. It is answered by `service_fn` — a verified handshake
+        to its own upstream host — and then only when it opened on a **transport
+        error**.
         That condition is the whole care of this branch: reachability can
         disprove "I could not reach it", and can never disprove "it answered me
         with 429". A breaker that opened on a status keeps the half-open path as
@@ -738,12 +730,9 @@ class FailoverBreaker:
         credentials — which this router relays and never holds, so it could not
         ask on its own behalf even if a status were worth re-testing.
 
-        The probe is the same one that opened the breaker, so the close is the
-        exact negation of the open: the breaker means "this host is offline", and
-        the moment that stops being true the premise is gone. If Anthropic itself
-        is still down, the next real request fails, `record_failure` re-runs the
-        probe, finds the host online, and relays the error — which is the
-        documented behaviour for an upstream outage on a working link.
+        The recovery probe matches the policy that opened the breaker. It checks
+        broad connectivity for an offline-gated breaker and the named upstream
+        for a service-level breaker.
         """
         if not self.open:
             return False

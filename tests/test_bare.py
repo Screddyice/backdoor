@@ -33,9 +33,8 @@ def test_default_keeps_local_tools_only():
     """The default keeps harness-local tools and drops every MCP tool.
 
     Local tools (Read, Edit, Bash, Glob, Grep) touch nothing but this disk, so
-    they work while the host is offline — which is the only condition that opens
-    the breaker. MCP tools are remote integrations and are dead for exactly as
-    long as failover is active, and they are also where the token weight lives.
+    they work during any transport outage. MCP tools are remote integrations
+    and also supply most of the token weight that bare mode removes.
 
     Pairing constraint: this default REQUIRES a tool-capable tier. deepseek-r1
     makes Ollama reject any request carrying tool definitions with HTTP 400,
