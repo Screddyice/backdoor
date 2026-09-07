@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 from src.proxy import mlx_admin
-from src.proxy.config import FAILOVER_LADDER, MODEL_ROUTES, Settings
+from src.proxy.config import FAILOVER_LADDER, MODEL_ROUTES, Settings, load_profile_settings
+from src.proxy.bare import make_bare, parse_keep
+from src.proxy.models import Message, MessagesRequest, Tool
 
 
 PROFILE = "local-qwen38-obliterated"
@@ -53,6 +55,24 @@ def test_profile_uses_local_ollama_without_thinking_stripping() -> None:
     assert "ROUTE_MAX_INPUT_TOKENS=27000" in settings
     assert "PROVIDER_MAX_TOKENS=4096" in settings
     assert not [line for line in settings if line.startswith("PROVIDER_STRIP_INLINE_THINKING=")]
+
+
+def test_explicit_qwen_keeps_hypercrawl_but_failover_keeps_its_local_policy() -> None:
+    request = MessagesRequest(
+        model="qwen",
+        messages=[Message(role="user", content="Check HyperCrawl status")],
+        tools=[
+            Tool(name="Read"),
+            Tool(name="mcp__hypercrawl__hypercrawl_status"),
+            Tool(name="mcp__unrelated__send_message"),
+        ],
+    )
+    explicit = make_bare(request, keep=parse_keep(load_profile_settings(PROFILE).failover_keep_tools))
+    assert [tool.name for tool in explicit.tools] == [
+        "Read", "mcp__hypercrawl__hypercrawl_status",
+    ]
+    outage = make_bare(request, keep=parse_keep(Settings().failover_keep_tools))
+    assert [tool.name for tool in outage.tools] == ["Read"]
 
 
 def test_modelfile_clamps_context_and_installs_the_tool_template() -> None:

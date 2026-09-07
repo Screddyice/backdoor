@@ -1580,6 +1580,15 @@ The bundled GGUF template does not advertise tools, so Ollama rejects Claude Cod
 
 Qwen can still choose a valid tool name with invalid fields. One September 6 session called `Bash` with a `query` field, received `InputValidationError`, and repeated the rejected call. Backdoor now appends a short schema correction to that tool result so the next turn re-reads the supplied schema and changes its arguments. Ordinary tool output stays unchanged.
 
+Explicit Qwen sessions retain attached `mcp__hypercrawl__*` tools alongside local
+coding tools. The default profile previously discarded their schemas, so a
+client could connect to HyperCrawl while Qwen received zero MCP tools and
+printed invented calls as text. Other MCP servers stay excluded. Automatic
+cloud-outage fallback uses the router's own keep-list, which defaults to local
+coding tools only. Attach HyperCrawl in the client as well: this profile setting
+retains supplied tools but does not start or configure an MCP server. Public
+website operations still require network access even when inference is local.
+
 The 27B GGUF and the 27B MLX server cannot share memory safely. Before the router serves `local-qwen38-obliterated`, `mlx_admin` stops either managed MLX profile and waits for port 8080 to go quiet. If the server cannot stop, the router selects `local-fast` and logs the collision instead of loading both 27B runtimes.
 
 The `qwen` wrapper performs the same MLX stop check before warming Ollama. An absent MLX server is the normal state, so that check stays silent. The launch banner names the selected Ollama model and remains the source of truth for the session. A failed MLX stop still prints an error and blocks the unsafe warmup.
