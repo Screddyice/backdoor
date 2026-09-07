@@ -610,9 +610,30 @@ The shared 20-second gate is the operator policy for Codex and Claude. During
 that window, each client retains its normal retry or error behavior.
 Authentication and request errors still bypass failover on both paths.
 
-During the gate the real errors are relayed, and Claude Code retries through
-them. That avoids moving a live Claude session onto a local
-model for a short link stall.
+During the gate the router **holds the turn** rather than answering it. That
+sentence used to read "the real errors are relayed, and Claude Code retries
+through them", and the retry was assumed to be cheap. It is not. A 502 is the
+one status Claude Code treats as *retry later*, and its backoff escalates: on
+2026-09-08 seven consecutive requests took a 502 in the 20 seconds before the
+breaker opened at `00:51:04`, and the session was still counting down
+`will retry in 2m 29s` at `01:01:24` — thirteen seconds after a *second*,
+separate outage had already closed. Both outages lasted under 30 seconds. The
+router recovered in half a minute and the session stayed frozen for minutes,
+because nothing about the router coming back reaches a client that is asleep in
+its own backoff.
+
+So a failure inside the gate now waits there. Both exits serve a real answer —
+upstream returns and the response relays, or the breaker opens and the turn is
+served locally — and a blip shorter than `failover_min_outage_seconds` never
+reaches the client as a retryable error at all. The gate's purpose is unchanged:
+it still keeps a live session off the local model for a short link stall. What
+changed is who pays for it. It costs the held turn some latency instead of
+costing the session minutes of backoff.
+
+The hold is bounded by the gate plus a five-second grace, because that is the
+longest a pending verdict can legitimately take. Past it the 502 stands. A
+verdict the breaker actually *delivered* is never held: when it rules that this
+host is online and the error belongs to the client, that error goes out at once.
 
 Worth knowing when reading the log: **a short outage shows as a long open.** Half-open only retries once per `failover_probe_seconds`, so a five-second blip can appear as a 60–90 second open with nothing wrong.
 
