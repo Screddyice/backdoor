@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import src.proxy.codex_context as codex_context
 from src.proxy.codex_context import (
     CodexRequestError,
     _trim_active_items,
@@ -114,6 +115,38 @@ def test_history_is_dropped_when_the_active_turn_needs_the_budget():
     )
 
     assert "older task" not in json.dumps(local), "history ignored its budget"
+
+
+def test_memory_overflow_drops_memory_without_moving_the_stable_history(monkeypatch):
+    cloud = load_request()
+
+    def count_without_fitting_memory(payload):
+        rendered = json.dumps(payload)
+        return 10_000 if "discardable memory" in rendered else 100
+
+    monkeypatch.setattr(
+        codex_context, "estimate_codex_tokens", count_without_fitting_memory
+    )
+
+    local, budget = build_local_payload(
+        cloud,
+        ["discardable memory"],
+        Settings(
+            codex_context_window=2_200,
+            codex_reply_reserve_tokens=100,
+            codex_system_budget_tokens=10,
+            codex_memory_budget_tokens=10,
+            codex_tools_budget_tokens=10,
+            codex_active_turn_budget_tokens=1_000,
+            codex_history_budget_tokens=1_000,
+        ),
+    )
+    rendered = json.dumps(local)
+
+    assert "discardable memory" not in rendered
+    assert "older task" in rendered
+    assert budget.input_tokens == 100
+    assert budget.memory_tokens == 0
 
 
 def test_build_local_payload_starts_at_active_user_and_injects_memory_context():
