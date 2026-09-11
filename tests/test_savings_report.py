@@ -470,3 +470,46 @@ def test_send_does_not_retry_a_client_timeout(monkeypatch, tmp_path):
 
     assert not REPORT.send_weekly_email(_savings(), "2026-09-04", "2026-09-11", dry=False)
     assert run.calls == 1
+
+
+# --- the headline must not blend measured savings with plan value ------------
+
+
+def test_llmjury_spend_keeps_avoided_apart_from_metered(tmp_path, monkeypatch):
+    """Money that left and money that never left are different claims.
+
+    llm-jury tags a subscription-served escalation `billing: "subscription"`
+    with `cost_usd: 0.0` and an estimated `avoided_usd`. Summing the two kinds
+    into one figure is how a report ends up asserting spend it cannot show.
+    """
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in [
+        {"ts": "2026-09-10T12:00:00+00:00", "backend": "openrouter",
+         "model": "deepseek/deepseek-v4-pro", "cost_usd": 0.40},
+        {"ts": "2026-09-10T12:05:00+00:00", "backend": "codex", "model": "gpt-5.6-sol",
+         "billing": "subscription", "cost_usd": 0.0, "avoided_usd": 0.25, "estimated": True},
+        {"ts": "2026-09-10T12:06:00+00:00", "backend": "claude", "model": "claude-opus-5",
+         "billing": "subscription", "cost_usd": 0.0, "avoided_usd": 1.50, "estimated": True},
+    ]))
+    monkeypatch.setattr(REPORT, "LLMJURY_SPEND_LEDGER", str(ledger))
+
+    spend = REPORT.llmjury_spend(days=7, now=datetime(2026, 9, 11, tzinfo=timezone.utc))
+    assert spend["usd"] == pytest.approx(0.40), "metered spend must exclude subscription rows"
+    assert spend["calls"] == 1, "a subscription row is not a metered call"
+    assert spend["avoided_usd"] == pytest.approx(1.75)
+    assert spend["subscription_calls"] == 2
+
+
+def test_a_subscription_row_never_inflates_metered_spend(tmp_path, monkeypatch):
+    """With only free escalations, metered spend is zero — not 1.75."""
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text(json.dumps({
+        "ts": "2026-09-10T12:00:00+00:00", "backend": "claude", "model": "claude-opus-5",
+        "billing": "subscription", "cost_usd": 0.0, "avoided_usd": 1.75, "estimated": True,
+    }) + "\n")
+    monkeypatch.setattr(REPORT, "LLMJURY_SPEND_LEDGER", str(ledger))
+
+    spend = REPORT.llmjury_spend(days=7, now=datetime(2026, 9, 11, tzinfo=timezone.utc))
+    assert spend["usd"] == 0.0
+    assert spend["calls"] == 0
+    assert spend["avoided_usd"] == pytest.approx(1.75)

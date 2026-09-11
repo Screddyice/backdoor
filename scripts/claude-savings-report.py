@@ -147,8 +147,14 @@ def llmjury_spend(days, now=None):
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
     if not os.path.exists(LLMJURY_SPEND_LEDGER):
-        return {"available": False, "usd": 0.0, "calls": 0, "by_model": {}}
+        return {"available": False, "usd": 0.0, "calls": 0, "by_model": {},
+                "avoided_usd": 0.0, "subscription_calls": 0}
     usd, calls, by_model = 0.0, 0, defaultdict(float)
+    # Metered spend and avoided spend are summed apart and never added: one is
+    # money that left, the other is money that did not. llm-jury tags the second
+    # kind `billing: "subscription"` with cost_usd 0.0 and an estimated
+    # avoided_usd (its CLIs return text, not token counts).
+    avoided, sub_calls = 0.0, 0
     try:
         with open(LLMJURY_SPEND_LEDGER) as fh:
             for line in fh:
@@ -168,12 +174,18 @@ def llmjury_spend(days, now=None):
                     # A partial append or a hand-edit must not lose the rest of
                     # the file: one bad line is not a broken ledger.
                     continue
-                usd += cost
-                calls += 1
-                by_model[model] += cost
+                if str(rec.get("billing", "")).lower() == "subscription":
+                    avoided += float(rec.get("avoided_usd") or 0.0)
+                    sub_calls += 1
+                else:
+                    usd += cost
+                    calls += 1
+                    by_model[model] += cost
     except OSError:
-        return {"available": False, "usd": 0.0, "calls": 0, "by_model": {}}
-    return {"available": True, "usd": usd, "calls": calls, "by_model": dict(by_model)}
+        return {"available": False, "usd": 0.0, "calls": 0, "by_model": {},
+                "avoided_usd": 0.0, "subscription_calls": 0}
+    return {"available": True, "usd": usd, "calls": calls, "by_model": dict(by_model),
+            "avoided_usd": avoided, "subscription_calls": sub_calls}
 
 
 def openrouter_usage(per_model):
@@ -459,7 +471,7 @@ def build_savings_email_md(s, week_of, today):
         return f"| OpenRouter via {label} | 0 | 0 |"
 
     lines = [
-        f"# ${s['usd_saved']:,.2f} saved this week ({week_of} to {today})",
+        f"# ${s['usd_saved']:,.2f} not spent this week ({week_of} to {today})",
         "",
         "| Source | $ saved | How |",
         "|---|---|---|",
@@ -538,7 +550,8 @@ def send_weekly_email(savings, week_of, today, dry):
     if not key:
         print("email skipped: TMN_COMPOSIO_API_KEY not found", file=sys.stderr)
         return False
-    subject = f"${savings['usd_saved']:,.0f} saved this week — AI model report ({week_of} to {today})"
+    subject = (f"${savings['usd_saved']:,.0f} not spent this week — AI model report "
+               f"({week_of} to {today})")
     body_html = md_to_html(build_savings_email_md(savings, week_of, today))
     if dry:
         print(f"\n[dry-run] would email '{subject}' to {EMAIL_TO} from {EMAIL_FROM}", file=sys.stderr)
@@ -648,6 +661,8 @@ def main():
     # 5. actual Claude cloud spend for context
     cloud_cost = sum(cost_usd(t, now) for t in cloud.values())
     cloud_turns = sum(t["turns"] for t in cloud.values())
+    cloud_tokens = sum(t["input"] + t["output"] + t["cache_read"]
+                       + t["cache_w5m"] + t["cache_w1h"] for t in cloud.values())
 
     # 6. Claude working time
     agent_hours, wall_hours = active_hours(session_ts, ACTIVE_GAP_MIN) if session_ts else (0.0, 0.0)
@@ -660,7 +675,26 @@ def main():
     # would have left) your account. It's tracked separately as an efficiency
     # stat (more work fit in the same session/quota), never as dollars.
     tokens_saved = local_tokens + codex_tokens
-    usd_saved = local_saved + codex_saved
+    # Three different claims, deliberately NOT one number.
+    #
+    #   measured    money that would have been spent and was not, because local
+    #               weights served the turn. Counterfactual pricing, but the
+    #               tokens are measured.
+    #   avoided     frontier escalations a subscription absorbed instead of
+    #               OpenRouter billing them. Real, but ESTIMATED -- the CLIs
+    #               return text, not token counts (see llm-jury's ledger).
+    #   plan value  metered API value of Codex work, less the subscription. That
+    #               is what the plan is WORTH, not money saved: the plan is paid
+    #               either way and no per-token bill existed to avoid.
+    #
+    # They were previously summed under "saved this week", where plan value
+    # dominated: $976.38 of it against $24.63 genuinely saved, overstating the
+    # measured figure roughly 40x. A headline nobody can substantiate is worse
+    # than three smaller ones that each survive being questioned.
+    jury = llmjury_spend(days)
+    avoided_usd = float(jury.get("avoided_usd") or 0.0)
+    usd_saved = local_saved + avoided_usd
+    plan_value_usd = codex_saved
 
     # plan benchmark
     plan_wk = PLAN_COST_MO * 12 / 52
@@ -681,10 +715,11 @@ def main():
     lines = [
         f"# AI model savings report — week of {week_of} to {today}",
         "",
-        f"**${usd_saved:,.2f} saved this week** (local open-source models and Codex; excludes "
-        f"caching — see note below) · **${cloud_cost:,.2f} of API-equivalent work on a "
-        f"${plan_wk:,.0f}/wk Claude subscription ({leverage:,.0f}x)** · "
-        f"**${codex_value:,.2f} of metered Codex API value**",
+        f"**${usd_saved:,.2f} not spent this week** — ${local_saved:,.2f} measured "
+        f"(local models) + ${avoided_usd:,.2f} estimated (frontier escalations a "
+        f"subscription absorbed). Separately: **${plan_value_usd:,.2f} of Codex plan "
+        f"value** and **${cloud_cost:,.2f} of API-equivalent Claude work on a "
+        f"${plan_wk:,.0f}/wk plan ({leverage:,.0f}x)** — value delivered, not money saved.",
         "",
         f"## The ${PLAN_COST_MO:,.0f} plan vs what you actually got",
         "",
@@ -700,15 +735,34 @@ def main():
         f"- Recorded plan-limit hits in transcripts this week: **{limit_events}** "
         f"(undercount — the CLI does not log every throttle).",
         "",
-        "## Where the $ saved came from",
+        "## Money not spent",
         "",
-        "| Source | Tokens avoided | $ saved | Basis |",
+        "| Source | Tokens | $ | Basis |",
         "|---|---|---|---|",
         f"| Open-source models (local) | {fmt_tok(local_tokens)} | ${local_saved:,.2f} | "
-        f"{local_turns} Claude/Codex turns served locally; counterfactual = {COUNTERFACTUAL} pricing (measured) |",
-        f"| Codex plan | {fmt_tok(codex_tokens)} | ${codex_saved:,.2f} | "
+        f"{local_turns} Claude/Codex turns served locally; counterfactual = {COUNTERFACTUAL} "
+        f"pricing (tokens measured) |",
+        (f"| Frontier escalations on a subscription | — | ${avoided_usd:,.2f} | "
+         f"{jury['subscription_calls']} llm-jury escalation(s) the Codex/Claude CLI absorbed "
+         f"instead of OpenRouter billing them (estimated: the CLIs return text, not token counts) |"
+         if jury.get("available") else
+         "| Frontier escalations on a subscription | — | Ledger unavailable | "
+         "llm-jury has written no spend ledger yet |"),
+        f"| **Total not spent** | | **${usd_saved:,.2f}** | |",
+        "",
+        "## Value delivered — not money saved",
+        "",
+        "These are what the subscriptions were *worth* this week. The plan is paid either way "
+        "and there was no per-token bill to avoid, so counting them as savings would overstate "
+        "the figure above by roughly 40x — which this report used to do.",
+        "",
+        "| Source | Tokens | $ value | Basis |",
+        "|---|---|---|---|",
+        f"| Codex plan | {fmt_tok(codex_tokens)} | ${plan_value_usd:,.2f} | "
         f"${codex_value:,.2f} metered API value across {codex_turns} responses, less "
         f"${codex_plan_wk:,.2f}/wk plan cost (measured tokens; configurable rates) |",
+        f"| Claude plan | {fmt_tok(cloud_tokens)} | ${cloud_cost:,.2f} | "
+        f"API-equivalent value across {cloud_turns} turns on a ${plan_wk:,.2f}/wk plan |",
         "",
         f"**Note on caching:** {cache_rate:.1f}% of input tokens this week came from cache "
         f"({fmt_tok(cache_read_tok)} reads, worth ${cache_net:,.2f} against API list price). "
