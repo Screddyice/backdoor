@@ -134,6 +134,31 @@ cd backdoor
 
 That's it. The wizard handles everything: animated intro, provider selection, API key entry, and launching your first session. If you'd rather skip the wizard and configure manually, copy `.env.example` to `.env`, fill it in, and run `./run.sh` directly.
 
+**The wizard builds profile mode, which has no failover.** That is the right shape for what it
+asks you — one provider, every request translated to it. But cloud-to-local failover, the thing
+that keeps a session alive when Anthropic goes unreachable, lives in **hybrid** mode and is off
+unless you set it:
+
+```bash
+ROUTER_MODE=hybrid   # in .env — see .env.example for what hybrid additionally needs
+```
+
+Hybrid needs two more things that are easy to miss, and both fail in ways that look like "failover
+is broken" rather than "failover is not set up":
+
+1. **The local tags are custom builds, not registry pulls.** `ollama pull` alone will not produce
+   them; see [Model tags](#model-tags-are-custom-builds-not-pulls). Without the tag, the breaker
+   opens correctly, routes to Ollama exactly as designed, and Ollama 404s.
+2. **Claude Code has to actually talk to the router.** A session pointed at `api.anthropic.com`
+   never reaches the breaker, no matter how well configured the router is. Either
+   `ANTHROPIC_BASE_URL=http://127.0.0.1:8083` (simple, costs you Remote Control) or the forward
+   proxy on `:8084` with `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` (keeps Remote Control, more
+   moving parts).
+
+Before this, `ROUTER_MODE` appeared only in the launchd plist example — so following this
+quickstart produced a working proxy with no failover in it and nothing to indicate anything was
+missing.
+
 ---
 
 ## Pick your provider
@@ -187,6 +212,7 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in `.env` and you can tr
 ---
 
 ## Running the tests
+
 
 Run them through the project venv, not the `pytest` on your PATH:
 
@@ -323,6 +349,39 @@ whether DNS answers cannot be answered from a cache of the times it did.
 | `BACKDOOR_DNS_CACHE` | unset | Set to `0` to disable and leave `socket.getaddrinfo` alone |
 | `CACHE_TTL` | 6 h | How long a remembered address stays usable |
 | `CACHE_MAX` | 256 | Entries kept before the oldest is dropped |
+
+## Model tags are custom builds, not pulls
+
+The failover tiers exist on no registry. Build them:
+
+```bash
+# 1. The 27B failover tier
+ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M   # ~17 GB
+ollama create qwen3.8:27b-obliterated \
+  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
+
+# 2. The 256K escalation tier, for sessions too large for the 27B's window
+ollama pull qwen3.5:4b                                          # registry base
+modelfiles/build.sh qwen3.5-4b-256k.Modelfile                   # -> qwen3.5:4b-256k
+```
+
+Use `modelfiles/build.sh` for the 256K tag rather than a raw `ollama create`: it bakes in the
+shared system prompt from `prompts/`, which a plain create would omit.
+
+The custom Modelfile for the 27B is required, not cosmetic: the source GGUF's template carries no
+tool contract, so Ollama returns 400 to any request carrying tools without it.
+
+Both tags are needed. `pick_failover_profile` escalates to `qwen3.5:4b-256k` when a session is too
+large for the 27B's 32K window, so building only the first tag leaves the escalation path 404ing
+on exactly the long sessions that need it most.
+
+Build from the **GGUF** tag, never int4/MLX — the MLX engine ignores `num_ctx` and loads a 262144
+window that grows toward 32 GB. Verify with `ollama ps`, not `ollama show --parameters`.
+
+If failover seems not to work, run `ollama list` before reading any code. A missing tag produces a
+clean handoff into a model that is not there, which reads exactly like a broken breaker.
+
+---
 
 ## Troubleshooting
 
