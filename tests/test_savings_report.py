@@ -372,3 +372,101 @@ def test_llmjury_spend_skips_corrupt_lines_without_losing_the_rest(tmp_path, mon
     spend = REPORT.llmjury_spend(days=7, now=datetime(2026, 9, 11, tzinfo=timezone.utc))
     assert spend["usd"] == pytest.approx(0.75)
     assert spend["calls"] == 2
+
+
+# --- QA #134: findings from shawns-qa-assist --------------------------------
+
+
+def test_is_local_does_not_claim_hosted_openrouter_models_as_free(monkeypatch):
+    """A paid hosted model must never be booked as free local inference.
+
+    Matching a local family in ANY delimited component swept up hosted ids like
+    `openrouter-meta-llama-3.1-70b`, which cost real money. That both hides
+    OpenRouter spend and inflates the local saving — the exact error this PR
+    set out to remove, in the opposite direction.
+    """
+    for model in (
+        "openrouter-meta-llama-3.1-70b",
+        "openrouter-qwen-2.5-72b",
+        "together-llama-3-70b",
+        "groq-llama-3.3-70b-versatile",
+    ):
+        assert not REPORT.is_local(model), model
+
+
+def test_is_local_still_accepts_the_launcher_alias_shape():
+    for model in ("claude-qwen-27b", "claude-qwen38-obliterated", "Claude-Qwen-27B"):
+        assert REPORT.is_local(model), model
+
+
+def test_llmjury_spend_survives_a_nonnumeric_cost(tmp_path, monkeypatch):
+    """A bad value inside a well-formed line must skip that line, not the report.
+
+    `float("unknown")` raised outside the per-line guard, so one malformed
+    record aborted the entire weekly run — the opposite of the tolerance the
+    function documents.
+    """
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text(
+        '{"ts": "2026-09-10T12:00:00+00:00", "cost_usd": 0.50}\n'
+        '{"ts": "2026-09-10T12:30:00+00:00", "cost_usd": "unknown"}\n'
+        '{"ts": "2026-09-10T13:00:00+00:00", "cost_usd": 0.25}\n'
+    )
+    monkeypatch.setattr(REPORT, "LLMJURY_SPEND_LEDGER", str(ledger))
+    spend = REPORT.llmjury_spend(days=7, now=datetime(2026, 9, 11, tzinfo=timezone.utc))
+    assert spend["usd"] == pytest.approx(0.75)
+    assert spend["calls"] == 2
+
+
+def test_send_does_not_retry_failures_that_may_have_been_delivered(monkeypatch, tmp_path):
+    """GMAIL_SEND_EMAIL is not idempotent, so only pre-submission failures retry.
+
+    A reset connection, a hung-up socket or a client timeout can all happen
+    AFTER Gmail accepted the message. Retrying those can mail the same weekly
+    report twice. Only failures that prove no request was ever submitted — DNS
+    resolution and a refused connection — are safe to repeat.
+    """
+    env = tmp_path / ".env"
+    env.write_text("TMN_COMPOSIO_API_KEY=abc123\n")
+    monkeypatch.setattr(REPORT, "ENV_FILE", str(env))
+    monkeypatch.setattr(REPORT, "md_to_html", lambda md: "<p>x</p>")
+    monkeypatch.setattr(REPORT, "build_savings_email_md", lambda *a: "x")
+    monkeypatch.setattr(REPORT.time, "sleep", lambda _s: None)
+
+    for stderr in ("read ECONNRESET", "socket hang up", "request timeout", "network error"):
+        run = _Run([_Completed(stdout="", stderr=stderr, returncode=1)])
+        monkeypatch.setattr(REPORT.subprocess, "run", run)
+        assert not REPORT.send_weekly_email(_savings(), "2026-09-04", "2026-09-11", dry=False)
+        assert run.calls == 1, f"{stderr!r} must not be retried"
+
+
+def test_send_still_retries_a_failure_that_proves_nothing_was_submitted(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("TMN_COMPOSIO_API_KEY=abc123\n")
+    monkeypatch.setattr(REPORT, "ENV_FILE", str(env))
+    monkeypatch.setattr(REPORT, "md_to_html", lambda md: "<p>x</p>")
+    monkeypatch.setattr(REPORT, "build_savings_email_md", lambda *a: "x")
+    monkeypatch.setattr(REPORT.time, "sleep", lambda _s: None)
+
+    for stderr in ("getaddrinfo ENOTFOUND backend.composio.dev",
+                   "connect ECONNREFUSED 127.0.0.1:443",
+                   "getaddrinfo EAI_AGAIN backend.composio.dev"):
+        run = _Run([_Completed(stdout="", stderr=stderr, returncode=1), _OK])
+        monkeypatch.setattr(REPORT.subprocess, "run", run)
+        assert REPORT.send_weekly_email(_savings(), "2026-09-04", "2026-09-11", dry=False)
+        assert run.calls == 2, f"{stderr!r} should retry"
+
+
+def test_send_does_not_retry_a_client_timeout(monkeypatch, tmp_path):
+    """A timeout is the ambiguous case: the send may have landed."""
+    env = tmp_path / ".env"
+    env.write_text("TMN_COMPOSIO_API_KEY=abc123\n")
+    monkeypatch.setattr(REPORT, "ENV_FILE", str(env))
+    monkeypatch.setattr(REPORT, "md_to_html", lambda md: "<p>x</p>")
+    monkeypatch.setattr(REPORT, "build_savings_email_md", lambda *a: "x")
+    monkeypatch.setattr(REPORT.time, "sleep", lambda _s: None)
+    run = _Run([REPORT.subprocess.TimeoutExpired(cmd="composio", timeout=60)])
+    monkeypatch.setattr(REPORT.subprocess, "run", run)
+
+    assert not REPORT.send_weekly_email(_savings(), "2026-09-04", "2026-09-11", dry=False)
+    assert run.calls == 1
