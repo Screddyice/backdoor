@@ -596,6 +596,26 @@ async def _serve_local(
     if not settings.codex_failover_to_local:
         raise HTTPException(status_code=502, detail="ChatGPT Codex unavailable")
 
+    # Checked here rather than at the three call sites, so no future path into
+    # local serving can skip it. A deliberate `qwen` session holds the 27B at
+    # ~17 GB on a 36 GB host and publishes an exclusive lease; loading a second
+    # model on top would wedge the machine the session is running on. The
+    # transport error is the honest answer, and it is recoverable -- the
+    # oversubscribed machine is not.
+    held = compute_lease.foreign_exclusive_lease()
+    if held is not None:
+        logger.warning(
+            "Codex failover declined id=%s holder=%s pid=%s model=%s",
+            correlation_id, held.get("source", "?"), held.get("pid", "?"),
+            held.get("model", "?"),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(f"ChatGPT Codex unavailable. Local failover declined: "
+                    f"{held.get('source','another process')} holds "
+                    f"{held.get('model','the local GPU')}."),
+        )
+
     await _reserve_local_slot()
     await _hold_tier(settings)
     response: httpx.Response | None = None

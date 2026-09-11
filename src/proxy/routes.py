@@ -901,6 +901,26 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
                     "upstream transport failure (%s): %s", type(e).__name__, e,
                 )
                 if await _record_failure(br, type(e).__name__):
+                    held = compute_lease.foreign_exclusive_lease()
+                    if held is not None:
+                        # Another process already owns the local GPU -- a
+                        # deliberate `qwen` session holds the 27B at ~17 GB on a
+                        # 36 GB host. Failing over would load a SECOND model on
+                        # top of it. Serving this turn is not worth wedging the
+                        # machine the session is running on, so the transport
+                        # error stands.
+                        logger.warning(
+                            "declining failover: %s (pid %s) holds an exclusive "
+                            "lease on %s; a second local model would not fit",
+                            held.get("source", "?"), held.get("pid", "?"),
+                            held.get("model", "?"),
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(f"Anthropic unreachable: {e}. Local failover "
+                                    f"declined: {held.get('source','another process')} "
+                                    f"holds {held.get('model','the local GPU')}."),
+                        ) from e
                     return None
                 if not br.deciding:
                     # A delivered verdict, not a pending one: the breaker ruled that
