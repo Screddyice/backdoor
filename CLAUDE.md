@@ -101,6 +101,11 @@ symptom is indistinguishable from "failover is broken", and the router log shows
 clean handoff into a model that is not there. If failover appears not to work,
 check `ollama list` before reading any other code.
 
+The general rule, for the next tag anyone adds: a name that resolves and builds
+a route but was never pulled fails at the provider, which reads as a broken
+agent rather than a missing model. Keep `MODEL_ROUTES` and `profiles/` pointing
+only at tags `ollama list` actually shows.
+
 Build a bare tag from the GGUF tag, never int4/MLX — the MLX engine ignores
 `num_ctx` and loads a 262144 window that grows toward 32 GB. Verify with
 `ollama ps`, not `ollama show --parameters`.

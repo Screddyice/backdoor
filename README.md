@@ -643,6 +643,23 @@ In hybrid mode Backdoor passes Anthropic-bound traffic through to the real API. 
 
 > **Put Backdoor in the request path, or none of this runs.** Failover lives in the request path, so a session that reaches api.anthropic.com directly gets a plain API error when the network drops. That is not a bug in the breaker; the breaker was never consulted. If an outage produced an error instead of a local answer, check the routing first — the two supported ways to be in the path are `ANTHROPIC_BASE_URL` and the forward proxy below.
 
+### Enabling it: the three things that have to be true
+
+Hybrid failover is opt-in, and the quick-start paths (`./backdoor`, `run.sh`) do not turn it on — they produce `router_mode="profile"`, which translates every request to one provider and never opens a breaker. To get cloud→local failover:
+
+1. **Run the router in hybrid mode.** `ROUTER_MODE=hybrid PORT=8083` in the service environment (the committed launchd example at `deploy/com.screddy.backdoor-router.plist.example` carries the full set).
+2. **Build the failover tiers.** They are custom Ollama tags, not registry pulls:
+   ```bash
+   ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M   # ~17 GB
+   ollama create qwen3.8:27b-obliterated -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
+   ollama pull qwen3.5:4b
+   ollama create qwen3.5:4b-256k -f modelfiles/qwen3.5-4b-256k.Modelfile
+   ```
+   The custom Modelfile is required: the source GGUF's template lacks the Ollama tool contract, so an unmodified pull 400s on every request that carries tools. Without the tags the breaker opens and every failover fails at Ollama — which reads as a broken agent rather than a missing model.
+3. **Put a session in the path.** `ANTHROPIC_BASE_URL=http://127.0.0.1:8083 claude` is the simple form and costs you Remote Control; the forward proxy below keeps it.
+
+To test without cutting the network: set `ANTHROPIC_UPSTREAM=http://127.0.0.1:9` on the router so every upstream connection is refused, then send two turns ~20 seconds apart. The second turn answers locally, and `proxy.log` shows `⇢ FAILOVER`.
+
 ### Every passthrough route feeds the breaker
 
 Four handlers forward to Anthropic: `/v1/messages`, `/v1/messages/count_tokens`, the `/{path:path}` catch-all, and `/v1/messages` again when you set `failover_to_local=false`. All four report a transport failure to the breaker, and none of them let one escape as an unhandled exception.
