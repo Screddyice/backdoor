@@ -85,3 +85,23 @@ def _no_leaked_dns_cache():
     from src.proxy import resolver
 
     resolver.uninstall()
+
+
+@pytest.fixture(autouse=True)
+def _no_desktop_notifications(monkeypatch):
+    """A test run must never post a macOS notification.
+
+    Same category as the state-file redirect above, and missed for the same
+    reason: `_notify` is a real side effect that escapes the process. Fifteen
+    test sites build a `FailoverBreaker` without passing `notify_fn`, so every
+    breaker they opened called osascript for real — a full suite run put a burst
+    of "Anthropic unavailable; routing to local model" notifications on the
+    developer's screen, claiming an outage that never happened on a router that
+    was not even running.
+
+    Patching the module attribute is enough only because `__init__` now resolves
+    it per construction; as a def-time default it was unreachable from here.
+    """
+    fired = []
+    monkeypatch.setattr(failover, "_notify", lambda title, message: fired.append((title, message)))
+    yield fired

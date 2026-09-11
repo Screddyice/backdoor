@@ -188,6 +188,18 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in `.env` and you can tr
 
 ## Running the tests
 
+**The suite posts no desktop notifications.** Fifteen test sites build a `FailoverBreaker` without
+passing `notify_fn`, and the default notifier shells out to `osascript` for real — so a full run
+used to put a burst of *"Anthropic unavailable; routing to local model"* on screen, announcing an
+outage that never happened, on a router that was not even running.
+
+`notify_fn` now resolves per construction instead of as a def-time default (a default is evaluated
+once, at import, which captured the real notifier and made it unpatchable), and `tests/conftest.py`
+suppresses it for every test while still exposing what *would* have been shown. This is the same
+category as the state-file redirect that conftest already did, and it was missed for the same
+reason: a side effect that leaves the process.
+
+
 Run them through the project venv, not the `pytest` on your PATH:
 
 ```bash
