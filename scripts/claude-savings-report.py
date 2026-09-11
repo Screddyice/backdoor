@@ -70,9 +70,9 @@ SKIP_MODELS = {"<synthetic>", "PAY_PER_EVENT", ""}
 LOCAL_PREFIXES = ("qwen", "gemma", "llama", "phi")
 
 # Send is one shot a week, so a transport blip costs the whole report. Retry a
-# few times with backoff; the send itself is not idempotent, but a transport
-# failure means the request never reached Composio, so there is nothing to
-# duplicate. A DELIVERED rejection is never retried — see _transient_send.
+# few times with backoff — but GMAIL_SEND_EMAIL is NOT idempotent, so only
+# failures that prove no request was ever submitted may be repeated. See
+# _transient_send for why the ambiguous ones are excluded.
 # llm-jury's frontier ladder spends on OpenRouter, and none of it appears in a
 # Claude or Codex transcript — llm-jury runs its own process. It reaches this
 # report as a ledger llm-jury appends, never as its API key: backdoor holding
@@ -84,10 +84,17 @@ LLMJURY_SPEND_LEDGER = os.environ.get(
 SEND_ATTEMPTS = int(os.environ.get("SAVINGS_SEND_ATTEMPTS", 4))
 SEND_BACKOFF_SECONDS = float(os.environ.get("SAVINGS_SEND_BACKOFF_SECONDS", 15))
 # Matched against the CLI's stderr. These are all "never reached the server".
-_TRANSIENT_MARKERS = (
-    "enotfound", "econnrefused", "econnreset", "etimedout", "eai_again",
-    "socket hang up", "network", "timeout", "getaddrinfo",
-)
+# Every one of these happens BEFORE a request is put on the wire: DNS could not
+# be resolved, or the TCP connection was refused outright. Repeating them cannot
+# duplicate a message because none was ever sent.
+#
+# Deliberately absent: ECONNRESET, "socket hang up", ETIMEDOUT and any generic
+# timeout. Those can all occur AFTER Gmail accepted the send and before the
+# client saw the response, so retrying them can mail the same weekly report
+# twice. A duplicate report is a worse failure than a late one, and the outage
+# that actually took this job down was `getaddrinfo ENOTFOUND` — squarely in
+# the safe set.
+_TRANSIENT_MARKERS = ("enotfound", "eai_again", "econnrefused", "getaddrinfo")
 
 
 def price_for(model, now):
@@ -113,14 +120,20 @@ def is_local(model):
     to its unknown-claude opus-tier fallback, and a turn that cost nothing is
     billed as cloud spend — which both invents cost and hides the saving.
 
-    So also accept a local family appearing as a delimited component of the id.
-    `claude-haiku-4-5-20251001` has no such component and stays cloud.
+    So also accept the alias shape the launcher owns — `claude-<local family>` —
+    and ONLY that shape. Matching a local family anywhere in the id swept up
+    hosted routing like `openrouter-meta-llama-3.1-70b`, which costs real money;
+    booking that as free local inference would hide OpenRouter spend and inflate
+    the saving, the same error this rule exists to remove, pointing the other
+    way. `claude-haiku-4-5-20251001` has no local family after `claude-` and
+    stays cloud.
     """
     lowered = model.lower()
     if lowered.startswith(LOCAL_PREFIXES):
         return True
-    return any(part.startswith(LOCAL_PREFIXES)
-               for part in re.split(r"[^a-z0-9.]+", lowered) if part)
+    if not lowered.startswith("claude-"):
+        return False
+    return lowered[len("claude-"):].startswith(LOCAL_PREFIXES)
 
 
 def llmjury_spend(days, now=None):
@@ -142,18 +155,22 @@ def llmjury_spend(days, now=None):
                 try:
                     rec = json.loads(line)
                     ts = datetime.fromisoformat(rec["ts"])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts < cutoff or ts > now:
+                        continue
+                    # Inside the guard: a well-formed line can still carry an
+                    # unusable value, and `float("unknown")` raising here used
+                    # to abort the whole weekly report over one bad record.
+                    cost = float(rec.get("cost_usd") or 0.0)
+                    model = str(rec.get("model", "unknown"))
                 except Exception:
                     # A partial append or a hand-edit must not lose the rest of
                     # the file: one bad line is not a broken ledger.
                     continue
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                if ts < cutoff or ts > now:
-                    continue
-                cost = float(rec.get("cost_usd") or 0.0)
                 usd += cost
                 calls += 1
-                by_model[rec.get("model", "unknown")] += cost
+                by_model[model] += cost
     except OSError:
         return {"available": False, "usd": 0.0, "calls": 0, "by_model": {}}
     return {"available": True, "usd": usd, "calls": calls, "by_model": dict(by_model)}
@@ -484,15 +501,26 @@ def build_savings_email_md(s, week_of, today):
 
 
 def _transient_send(result):
-    """True when the request never reached Composio, so a retry is meaningful.
+    """True only when the request provably never reached Composio.
 
-    The distinction matters: an answered rejection (bad recipient, revoked
-    account) will be rejected identically every time, and retrying it just
-    delays the honest failure. A transport error is the opposite — nothing was
-    delivered, and the next attempt is a fresh chance.
+    Three outcomes, and only one is safe to repeat:
+
+      answered rejection  the server replied "no" (bad recipient, revoked
+                          account). It will reply identically next time, so a
+                          retry only delays an honest failure.
+      ambiguous failure   the connection died mid-flight, or the client gave
+                          up waiting. Gmail may already have accepted the
+                          message. GMAIL_SEND_EMAIL is not idempotent, so
+                          retrying risks a duplicate report.
+      unsubmitted failure DNS did not resolve, or the connection was refused.
+                          Nothing was sent, so the next attempt is a clean
+                          first try.
+
+    `result is None` means the call raised — a client timeout — which is
+    ambiguous, not safe.
     """
     if result is None:
-        return True
+        return False
     if result.returncode == 0:
         return False
     blob = f"{result.stdout}\n{result.stderr}".lower()
@@ -537,7 +565,9 @@ def send_weekly_email(savings, week_of, today, dry):
                 pass
             last = f"{result.stdout}\n{result.stderr}".strip()
         if not _transient_send(result):
-            print(f"email send rejected (not retrying): {last}", file=sys.stderr)
+            why = ("the server answered" if result is not None and result.returncode == 0
+                   else "delivery is ambiguous, so a retry could duplicate the report")
+            print(f"email send not retried ({why}): {last}", file=sys.stderr)
             return False
         if attempt < SEND_ATTEMPTS:
             delay = SEND_BACKOFF_SECONDS * (2 ** (attempt - 1))

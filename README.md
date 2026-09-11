@@ -125,14 +125,20 @@ python3 scripts/claude-savings-report.py --dry-run   # preview, writes and email
 Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
 `SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it.
 
-**The send retries.** This job fires once a week, so a transport blip at that moment used to cost
-the entire report: a single `getaddrinfo ENOTFOUND backend.composio.dev` meant the report was
-written to disk, the mail never left, and the only evidence was a `.err` file nobody opens. That
-is how the weekly mail went dark. The send now makes `SAVINGS_SEND_ATTEMPTS` attempts (default 4)
-with exponential backoff from `SAVINGS_SEND_BACKOFF_SECONDS` (default 15s), and on final failure
-posts a desktop notification instead of failing silently. A transport error is retried because
-nothing reached the server and there is nothing to duplicate; a rejection the server actually
-answered is never retried, since it will be rejected identically every time. The local-model counterfactual,
+**The send retries, but only where a retry is safe.** This job fires once a week, so a transport
+blip at that moment used to cost the entire report: a single `getaddrinfo ENOTFOUND
+backend.composio.dev` meant the report was written to disk, the mail never left, and the only
+evidence was a `.err` file nobody opens. That is how the weekly mail went dark. The send now makes
+`SAVINGS_SEND_ATTEMPTS` attempts (default 4) with exponential backoff from
+`SAVINGS_SEND_BACKOFF_SECONDS` (default 15s), and on final failure posts a desktop notification
+instead of failing silently.
+
+`GMAIL_SEND_EMAIL` is **not idempotent**, so only failures that prove no request was ever
+submitted are repeated — DNS resolution failure (`ENOTFOUND`, `EAI_AGAIN`, `getaddrinfo`) and a
+refused connection (`ECONNREFUSED`). A reset connection, a hung-up socket, or a client timeout can
+all occur *after* Gmail accepted the message, so retrying those could mail the same report twice;
+they are reported, not retried. A duplicate weekly report is a worse failure than a late one, and
+the outage that actually took this job down sits in the safe set. The local-model counterfactual,
 Codex token rates, subscription costs, and Claude plan assumptions are tunable
 through the `SAVINGS_*` environment variables defined near the top of the script.
 
