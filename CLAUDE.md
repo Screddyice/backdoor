@@ -67,11 +67,12 @@ The count proves what the names prove and carries no sentence to invert.
 
 ## Known defect
 
-`config.py` maps `qwen-9b` to profile `local-qwen-9b`, which resolves to
-`qwen3.5:9b-64k`. **That tag is not pulled on this Mac.** The `local-failover-heavy`
-profile points at the same absent tag. Both names resolve, build a route, and then
-fail at the provider, which reads as a broken agent rather than a missing model.
-Either build the tag or drop both mappings.
+~~`config.py` maps `qwen-9b` to profile `local-qwen-9b`~~ — resolved: neither
+the route nor the `local-failover-heavy` profile exists in the shipped
+`MODEL_ROUTES`/`profiles/` any more. The lesson stands for the next tag added:
+a name that resolves and builds a route but is not pulled fails at the
+provider, which reads as a broken agent rather than a missing model. Keep
+`MODEL_ROUTES` and `profiles/` pointing only at tags `ollama list` shows.
 
 Build a bare tag from the GGUF tag, never int4/MLX — the MLX engine ignores
 `num_ctx` and loads a 262144 window that grows toward 32 GB. Verify with
