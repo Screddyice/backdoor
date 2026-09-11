@@ -525,6 +525,15 @@ def run_wizard():
         f"PROVIDER_MAX_TOKENS=32768\n"
         f"PROVIDER_TEMPERATURE=1.0\n"
         f"PROVIDER_TOP_P=1.0\n\n"
+        # Written explicitly, not left to the default. The wizard builds a
+        # single-provider proxy, which IS profile mode -- but an absent key made
+        # that invisible, and a reader who wanted cloud-to-local failover had no
+        # way to discover the switch existed. Name the mode and name the way out.
+        f"# profile = translate everything to the one provider above.\n"
+        f"# Set ROUTER_MODE=hybrid instead to pass Anthropic traffic through and\n"
+        f"# fail a live session over to a local model during an outage; see\n"
+        f"# .env.example for what hybrid additionally needs.\n"
+        f"ROUTER_MODE=profile\n\n"
         f"HOST=127.0.0.1\nPORT=8082\nLOG_FILE=proxy.log\n\n"
         f"SKIP_QUOTA_PROBES=true\nSKIP_TITLE_GENERATION=true\n"
         f"SKIP_SUGGESTION_MODE=true\nMOCK_PREFIX_DETECTION=true\n"

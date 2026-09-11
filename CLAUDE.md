@@ -23,8 +23,13 @@ enforce this, and they will reject a command or a file edit that merely *names* 
 protected artifacts — including this file, which is why the specifics are not
 restated here.
 
-**Read the exact boundary in `~/.claude/CLAUDE.md`, section
-"Backdoor live-control boundary", before attempting any live operation.**
+**That section of `~/.claude/CLAUDE.md` no longer exists.** It was removed on
+2026-09-10 along with the router itself, so this file spent that time pointing
+agents at safety guidance that was not there — and "go read the rules" failing
+silently is worse than having no pointer at all. Until a live router exists again
+and the machine rules describe it, treat the boundary as: **inspect freely, change
+nothing that is running.** Anything that starts, stops, restarts, deploys to, or
+repoints a live router or its launchd job is Shawn's to run, from his own session.
 
 If a tool call comes back refused with a message about the live control plane, that
 is this guard doing its job. Do not try to route around it; hand the operation to
@@ -65,13 +70,36 @@ The count proves what the names prove and carries no sentence to invert.
 | `tests/` | pytest suite |
 | `deploy/`, `local/` | Deployment glue |
 
-## Known defect
+## Model tags are custom builds, not pulls
 
-`config.py` maps `qwen-9b` to profile `local-qwen-9b`, which resolves to
-`qwen3.5:9b-64k`. **That tag is not pulled on this Mac.** The `local-failover-heavy`
-profile points at the same absent tag. Both names resolve, build a route, and then
-fail at the provider, which reads as a broken agent rather than a missing model.
-Either build the tag or drop both mappings.
+The failover tiers do not exist on any registry. `local-qwen38-obliterated` wants
+`qwen3.8:27b-obliterated`, and the 256K fallback wants `qwen3.5:4b-256k`; both are
+built locally:
+
+```bash
+# 27B failover tier
+ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M   # ~17 GB
+ollama create qwen3.8:27b-obliterated \
+  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
+
+# 256K escalation tier (pick_failover_profile sends oversized sessions here)
+ollama pull qwen3.5:4b
+modelfiles/build.sh qwen3.5-4b-256k.Modelfile                  # -> qwen3.5:4b-256k
+```
+
+The 27B's custom Modelfile is not optional: the source GGUF's template carries no
+tool contract, so Ollama answers 400 to any request carrying tools without it.
+Build the 256K tag through `modelfiles/build.sh`, not a raw `ollama create` —
+the script bakes in the shared system prompt a plain create would omit.
+
+Build **both**. With only the 27B, the escalation path 404s on exactly the long
+sessions that needed a wider window.
+
+**Why this matters more than it looks.** Without the tag the breaker opens
+correctly, the request routes to Ollama exactly as designed, and Ollama 404s. The
+symptom is indistinguishable from "failover is broken", and the router log shows a
+clean handoff into a model that is not there. If failover appears not to work,
+check `ollama list` before reading any other code.
 
 Build a bare tag from the GGUF tag, never int4/MLX — the MLX engine ignores
 `num_ctx` and loads a 262144 window that grows toward 32 GB. Verify with
