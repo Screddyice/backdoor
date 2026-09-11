@@ -91,9 +91,20 @@ The harness is free. The intelligence is cheap. That's the whole point.
 figures for each path:
 
 - Local open-source models: measured Claude and Codex turns served by Qwen, Gemma, Llama, or
-  Phi on this Mac, compared with the configured Claude counterfactual.
+  Phi on this Mac, compared with the configured Claude counterfactual. Local turns are recognised
+  by bare tag (`qwen3.8:27b-obliterated`) *and* by catalog alias: Claude Code validates the
+  session model against its compiled catalog, so the `qwen` launcher registers local weights under
+  a `claude-*` name and the transcript records e.g. `claude-qwen-27b`. Matching only the bare
+  prefix billed those turns at the unknown-`claude-*` opus-tier fallback — inventing cloud cost
+  for a turn that cost nothing, and hiding the saving it produced.
 - OpenRouter: transcript-attributed usage for Claude and Codex, kept separate from local-model
   routing and savings.
+- llm-jury: metered OpenRouter spend read from the ledger llm-jury appends at
+  `~/.llmjury/spend.jsonl` (override with `LLMJURY_SPEND_LEDGER`). Its frontier ladder never
+  appears in a Claude or Codex transcript, so without the ledger that spend is invisible. The
+  report reads the ledger and never `OPENROUTER_API_KEY` — backdoor holding another system's
+  credential is what got the previous integration removed on 2026-08-26. A missing ledger reports
+  "Ledger unavailable", not `$0`, so a stopped producer stays visible.
 - Codex: measured token usage from `~/.codex/sessions/**/*.jsonl`, valued at configurable metered
   API rates and netted against the weekly Codex plan cost.
 
@@ -112,7 +123,22 @@ python3 scripts/claude-savings-report.py --dry-run   # preview, writes and email
 ```
 
 Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
-`SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it. The local-model counterfactual,
+`SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it.
+
+**The send retries, but only where a retry is safe.** This job fires once a week, so a transport
+blip at that moment used to cost the entire report: a single `getaddrinfo ENOTFOUND
+backend.composio.dev` meant the report was written to disk, the mail never left, and the only
+evidence was a `.err` file nobody opens. That is how the weekly mail went dark. The send now makes
+`SAVINGS_SEND_ATTEMPTS` attempts (default 4) with exponential backoff from
+`SAVINGS_SEND_BACKOFF_SECONDS` (default 15s), and on final failure posts a desktop notification
+instead of failing silently.
+
+`GMAIL_SEND_EMAIL` is **not idempotent**, so only failures that prove no request was ever
+submitted are repeated — DNS resolution failure (`ENOTFOUND`, `EAI_AGAIN`, `getaddrinfo`) and a
+refused connection (`ECONNREFUSED`). A reset connection, a hung-up socket, or a client timeout can
+all occur *after* Gmail accepted the message, so retrying those could mail the same report twice;
+they are reported, not retried. A duplicate weekly report is a worse failure than a late one, and
+the outage that actually took this job down sits in the safe set. The local-model counterfactual,
 Codex token rates, subscription costs, and Claude plan assumptions are tunable
 through the `SAVINGS_*` environment variables defined near the top of the script.
 

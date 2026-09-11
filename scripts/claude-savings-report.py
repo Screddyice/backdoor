@@ -20,7 +20,7 @@ usage reports zeros — silence is indistinguishable from a broken job.
 
 Usage: claude-savings-report.py [--days N] [--dry-run] [--no-notify]
 """
-import glob, json, os, subprocess, sys
+import glob, json, os, re, subprocess, sys, time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -69,6 +69,33 @@ ALIASES = {"opus": "claude-opus-5", "sonnet": "claude-sonnet-5", "haiku": "claud
 SKIP_MODELS = {"<synthetic>", "PAY_PER_EVENT", ""}
 LOCAL_PREFIXES = ("qwen", "gemma", "llama", "phi")
 
+# Send is one shot a week, so a transport blip costs the whole report. Retry a
+# few times with backoff — but GMAIL_SEND_EMAIL is NOT idempotent, so only
+# failures that prove no request was ever submitted may be repeated. See
+# _transient_send for why the ambiguous ones are excluded.
+# llm-jury's frontier ladder spends on OpenRouter, and none of it appears in a
+# Claude or Codex transcript — llm-jury runs its own process. It reaches this
+# report as a ledger llm-jury appends, never as its API key: backdoor holding
+# another system's credential is what got the old integration removed
+# (2026-08-26), and an account-wide total could not be attributed anyway.
+LLMJURY_SPEND_LEDGER = os.environ.get(
+    "LLMJURY_SPEND_LEDGER", os.path.join(HOME, ".llmjury", "spend.jsonl"))
+
+SEND_ATTEMPTS = int(os.environ.get("SAVINGS_SEND_ATTEMPTS", 4))
+SEND_BACKOFF_SECONDS = float(os.environ.get("SAVINGS_SEND_BACKOFF_SECONDS", 15))
+# Matched against the CLI's stderr. These are all "never reached the server".
+# Every one of these happens BEFORE a request is put on the wire: DNS could not
+# be resolved, or the TCP connection was refused outright. Repeating them cannot
+# duplicate a message because none was ever sent.
+#
+# Deliberately absent: ECONNRESET, "socket hang up", ETIMEDOUT and any generic
+# timeout. Those can all occur AFTER Gmail accepted the send and before the
+# client saw the response, so retrying them can mail the same weekly report
+# twice. A duplicate report is a worse failure than a late one, and the outage
+# that actually took this job down was `getaddrinfo ENOTFOUND` — squarely in
+# the safe set.
+_TRANSIENT_MARKERS = ("enotfound", "eai_again", "econnrefused", "getaddrinfo")
+
 
 def price_for(model, now):
     if model == "claude-sonnet-5" and now <= SONNET5_INTRO_UNTIL:
@@ -83,7 +110,70 @@ def price_for(model, now):
 
 
 def is_local(model):
-    return model.lower().startswith(LOCAL_PREFIXES)
+    """True for a turn served by local weights, however the id is spelled.
+
+    Two spellings reach the transcript. A bare tag (`qwen`, `gemma3:12b`) is
+    matched by prefix. A CATALOG ALIAS is not: Claude Code validates the session
+    model against its compiled catalog, so the `qwen` launcher registers local
+    weights under a claude-* name (`ollama cp`) and the transcript records
+    `claude-qwen-27b`. A prefix test misses that, `price_for` then falls through
+    to its unknown-claude opus-tier fallback, and a turn that cost nothing is
+    billed as cloud spend — which both invents cost and hides the saving.
+
+    So also accept the alias shape the launcher owns — `claude-<local family>` —
+    and ONLY that shape. Matching a local family anywhere in the id swept up
+    hosted routing like `openrouter-meta-llama-3.1-70b`, which costs real money;
+    booking that as free local inference would hide OpenRouter spend and inflate
+    the saving, the same error this rule exists to remove, pointing the other
+    way. `claude-haiku-4-5-20251001` has no local family after `claude-` and
+    stays cloud.
+    """
+    lowered = model.lower()
+    if lowered.startswith(LOCAL_PREFIXES):
+        return True
+    if not lowered.startswith("claude-"):
+        return False
+    return lowered[len("claude-"):].startswith(LOCAL_PREFIXES)
+
+
+def llmjury_spend(days, now=None):
+    """Sum llm-jury's metered spend over the window from its ledger.
+
+    Returns `available: False` rather than zero when the ledger is absent. The
+    two are different claims — "llm-jury spent nothing" and "nobody told us" —
+    and reporting the second as the first is how a broken producer becomes an
+    invisible one.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    if not os.path.exists(LLMJURY_SPEND_LEDGER):
+        return {"available": False, "usd": 0.0, "calls": 0, "by_model": {}}
+    usd, calls, by_model = 0.0, 0, defaultdict(float)
+    try:
+        with open(LLMJURY_SPEND_LEDGER) as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    ts = datetime.fromisoformat(rec["ts"])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts < cutoff or ts > now:
+                        continue
+                    # Inside the guard: a well-formed line can still carry an
+                    # unusable value, and `float("unknown")` raising here used
+                    # to abort the whole weekly report over one bad record.
+                    cost = float(rec.get("cost_usd") or 0.0)
+                    model = str(rec.get("model", "unknown"))
+                except Exception:
+                    # A partial append or a hand-edit must not lose the rest of
+                    # the file: one bad line is not a broken ledger.
+                    continue
+                usd += cost
+                calls += 1
+                by_model[model] += cost
+    except OSError:
+        return {"available": False, "usd": 0.0, "calls": 0, "by_model": {}}
+    return {"available": True, "usd": usd, "calls": calls, "by_model": dict(by_model)}
 
 
 def openrouter_usage(per_model):
@@ -351,6 +441,15 @@ def md_to_html(md):
 
 def build_savings_email_md(s, week_of, today):
     """Savings-only email body with each model path shown separately."""
+    def llmjury_row():
+        j = s.get("llmjury") or {}
+        if not j.get("available"):
+            # Say which producer is silent, so a stopped ledger is a visible
+            # fact rather than a quiet zero.
+            return "| llm-jury (OpenRouter) | Ledger unavailable | Ledger unavailable |"
+        return (f"| llm-jury (OpenRouter) | {j['calls']} calls | "
+                f"${j['usd']:,.2f} metered |")
+
     def openrouter_row(client):
         turns = s[f"openrouter_{client}_turns"]
         tokens = s[f"openrouter_{client}_tokens"]
@@ -389,6 +488,7 @@ def build_savings_email_md(s, week_of, today):
         "|---|---|---|",
         openrouter_row("claude"),
         openrouter_row("codex"),
+        llmjury_row(),
         "",
         "OpenRouter usage stays outside the savings total because only transcript-attributed "
         "usage is available here.",
@@ -398,6 +498,33 @@ def build_savings_email_md(s, week_of, today):
         "",
     ]
     return "\n".join(lines)
+
+
+def _transient_send(result):
+    """True only when the request provably never reached Composio.
+
+    Three outcomes, and only one is safe to repeat:
+
+      answered rejection  the server replied "no" (bad recipient, revoked
+                          account). It will reply identically next time, so a
+                          retry only delays an honest failure.
+      ambiguous failure   the connection died mid-flight, or the client gave
+                          up waiting. Gmail may already have accepted the
+                          message. GMAIL_SEND_EMAIL is not idempotent, so
+                          retrying risks a duplicate report.
+      unsubmitted failure DNS did not resolve, or the connection was refused.
+                          Nothing was sent, so the next attempt is a clean
+                          first try.
+
+    `result is None` means the call raised — a client timeout — which is
+    ambiguous, not safe.
+    """
+    if result is None:
+        return False
+    if result.returncode == 0:
+        return False
+    blob = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in blob for marker in _TRANSIENT_MARKERS)
 
 
 def send_weekly_email(savings, week_of, today, dry):
@@ -419,16 +546,36 @@ def send_weekly_email(savings, week_of, today, dry):
     env = dict(os.environ, COMPOSIO_API_KEY=key)
     payload = json.dumps({"recipient_email": EMAIL_TO, "subject": subject,
                           "body": body_html, "is_html": True})
-    r = subprocess.run(["composio", "execute", "GMAIL_SEND_EMAIL",
-                        "--account", EMAIL_FROM, "-d", payload],
-                       capture_output=True, text=True, timeout=60, env=env)
-    try:
-        ok = json.loads(r.stdout).get("successful", False)
-    except Exception:
-        ok = False
-    if not ok:
-        print(f"email send failed: {r.stdout}\n{r.stderr}", file=sys.stderr)
-    return ok
+    last = ""
+    for attempt in range(1, SEND_ATTEMPTS + 1):
+        result = None
+        try:
+            result = subprocess.run(["composio", "execute", "GMAIL_SEND_EMAIL",
+                                     "--account", EMAIL_FROM, "-d", payload],
+                                    capture_output=True, text=True, timeout=60, env=env)
+        except subprocess.TimeoutExpired:
+            last = "composio execute timed out after 60s"
+        else:
+            try:
+                if json.loads(result.stdout).get("successful", False):
+                    if attempt > 1:
+                        print(f"email sent on attempt {attempt}", file=sys.stderr)
+                    return True
+            except Exception:
+                pass
+            last = f"{result.stdout}\n{result.stderr}".strip()
+        if not _transient_send(result):
+            why = ("the server answered" if result is not None and result.returncode == 0
+                   else "delivery is ambiguous, so a retry could duplicate the report")
+            print(f"email send not retried ({why}): {last}", file=sys.stderr)
+            return False
+        if attempt < SEND_ATTEMPTS:
+            delay = SEND_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(f"email send attempt {attempt}/{SEND_ATTEMPTS} hit a transport "
+                  f"error, retrying in {delay:.0f}s", file=sys.stderr)
+            time.sleep(delay)
+    print(f"email send failed after {SEND_ATTEMPTS} attempts: {last}", file=sys.stderr)
+    return False
 
 
 def fmt_tok(n):
@@ -445,6 +592,7 @@ def main():
     dry = "--dry-run" in sys.argv
     notify = "--no-notify" not in sys.argv and not dry
     send_email = "--no-email" not in sys.argv
+    sent = False
 
     now, per_model, session_ts, scanned, limit_events = scan(days)
     cutoff = now - timedelta(days=days)
@@ -655,7 +803,8 @@ def main():
                   "openrouter_claude_tokens": openrouter_claude_tokens,
                   "openrouter_codex_turns": openrouter_codex_turns,
                   "openrouter_codex_tokens": openrouter_codex_tokens,
-                  "codex_saved": codex_saved, "codex_turns": codex_turns}
+                  "codex_saved": codex_saved, "codex_turns": codex_turns,
+                  "llmjury": llmjury_spend(days)}
         sent = send_weekly_email(savings, week_of, today, dry)
         # Say "would send" on a dry run. This used to print "email sent to
         # <address>" unconditionally, because the dry-run branch returns True
@@ -665,7 +814,17 @@ def main():
             print(f"email NOT sent (dry-run) — would go to {EMAIL_TO}", file=sys.stderr)
         else:
             print(f"email {'sent' if sent else 'FAILED'} to {EMAIL_TO}", file=sys.stderr)
-    if notify:
+    if notify and send_email and not dry and not sent:
+        # A silent send failure is how this job went dark: the report was
+        # written, the mail never left, and the only evidence was a .err file
+        # nobody opens. Say so on screen, where a weekly job's failure is as
+        # visible as its success.
+        subprocess.run(["osascript", "-e",
+                        'display notification "Report written but email FAILED — see '
+                        '~/.claude/state/claude-savings-weekly.err" with title '
+                        '"AI model savings report"'],
+                       capture_output=True)
+    elif notify:
         msg = (f"${cloud_cost:,.0f} of API-equivalent work on a ${plan_wk:,.0f}/wk plan "
                f"({leverage:,.0f}x), {agent_hours:,.0f} agent-hours, "
                f"{fmt_tok(tokens_saved)} tokens saved")
