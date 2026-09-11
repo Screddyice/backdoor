@@ -280,6 +280,18 @@ _HOLD_GRACE_SECONDS = 5.0
 # held turn is not re-running the connectivity probe continuously.
 _HOLD_RETRY_SECONDS = 0.5
 
+def _request_never_left(exc: BaseException) -> bool:
+    """True only when `exc` proves no request reached Anthropic.
+
+    The hold re-sends, and a POST to /v1/messages is NOT idempotent: Anthropic
+    may have accepted it and begun generating before the transport died, so a
+    re-send bills a second turn nobody asked for. `_upstream_send` already
+    settled which failures are replayable for its own internal retry, and the
+    answer is the same one — reuse it rather than keep a second list that can
+    drift out of agreement with the first.
+    """
+    return isinstance(exc, _RETRYABLE_PRE_SEND_ERRORS)
+
 _breaker: FailoverBreaker | None = None
 # Serialises every breaker verdict. See `_record_failure`.
 _breaker_failure_lock = asyncio.Lock()
@@ -820,58 +832,92 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
     if not br.allow_upstream():
         return None
     hold_deadline: float | None = None
+    # Cleared by the first failure that might already have been delivered. From
+    # then on the turn holds for the verdict without asking upstream again.
+    resend_is_safe = True
+    last_exc: BaseException | None = None
     while True:
-        try:
-            uresp = await _upstream_send(request, body, settings)
-            break
-        except httpx.TransportError as e:
-            # Below the breaker threshold this becomes a bare 502 with no other
-            # trace, yet the client renders a retry banner for it — the 2026-08-20
-            # VPN diagnosis meant correlating banners against a log that never
-            # mentioned them. Every transport failure gets a line.
-            #
-            # Only the FIRST gets a WARNING. A held turn re-attempts every
-            # `_HOLD_RETRY_SECONDS`, so warning on each one would put ~50 lines
-            # per turn into the log at exactly the moment several turns are
-            # holding at once — burying the transitions the log exists to show.
-            # The guarantee the 2026-08-20 incident asked for is that a failure
-            # is never invisible, and the first line delivers it.
-            logger.log(
-                logging.DEBUG if hold_deadline is not None else logging.WARNING,
-                "upstream transport failure (%s): %s", type(e).__name__, e,
-            )
-            if await _record_failure(br, type(e).__name__):
-                return None
-            if not br.deciding:
-                # A delivered verdict, not a pending one: the breaker ruled that
-                # this host is online and the error should reach the client.
-                raise HTTPException(
-                    status_code=502, detail=f"Anthropic unreachable: {e}"
-                ) from e
+        if not resend_is_safe:
+            # Holding without re-sending. The breaker's own recovery probe, not
+            # this request, is what notices upstream coming back.
             now = time.monotonic()
-            if hold_deadline is None:
-                hold_deadline = now + br.min_outage + _HOLD_GRACE_SECONDS
-                logger.warning(
-                    "holding this turn while the breaker decides (%s) rather "
-                    "than answering 502 — a 502 costs the client minutes of "
-                    "backoff for a blip that may last seconds",
-                    type(e).__name__,
+        else:
+            try:
+                if hold_deadline is None:
+                    uresp = await _upstream_send(request, body, settings)
+                else:
+                    # Bound the attempt by what is LEFT of the hold, not by the
+                    # client's own timeout. Checking the deadline only between
+                    # sends let an attempt that started a tick before it run a
+                    # full timeout past it, so the turn could be held for the
+                    # first attempt plus the gate plus another whole attempt —
+                    # the long freeze this hold exists to prevent. The first
+                    # attempt is deliberately unbounded: that one is ordinary
+                    # upstream latency, not time the hold added.
+                    uresp = await asyncio.wait_for(
+                        _upstream_send(request, body, settings),
+                        timeout=max(0.0, hold_deadline - time.monotonic()),
+                    )
+                break
+            except (httpx.TransportError, asyncio.TimeoutError) as e:
+                # Below the breaker threshold this becomes a bare 502 with no other
+                # trace, yet the client renders a retry banner for it — the 2026-08-20
+                # VPN diagnosis meant correlating banners against a log that never
+                # mentioned them. Every transport failure gets a line.
+                #
+                # Only the FIRST gets a WARNING. A held turn re-attempts every
+                # `_HOLD_RETRY_SECONDS`, so warning on each one would put ~50 lines
+                # per turn into the log at exactly the moment several turns are
+                # holding at once — burying the transitions the log exists to show.
+                # The guarantee the 2026-08-20 incident asked for is that a failure
+                # is never invisible, and the first line delivers it.
+                last_exc = e
+                logger.log(
+                    logging.DEBUG if hold_deadline is not None else logging.WARNING,
+                    "upstream transport failure (%s): %s", type(e).__name__, e,
                 )
-            if now >= hold_deadline:
-                logger.warning(
-                    "breaker still undecided after %.0fs of holding; "
-                    "surfacing the transport failure to the client",
-                    br.min_outage + _HOLD_GRACE_SECONDS,
-                )
-                raise HTTPException(
-                    status_code=502, detail=f"Anthropic unreachable: {e}"
-                ) from e
-            await asyncio.sleep(_HOLD_RETRY_SECONDS)
-            if not br.allow_upstream():
-                # Another request opened the breaker while this one waited.
-                # Serve this turn locally rather than spending the hold on an
-                # upstream the router has already given up on.
-                return None
+                if await _record_failure(br, type(e).__name__):
+                    return None
+                if not br.deciding:
+                    # A delivered verdict, not a pending one: the breaker ruled that
+                    # this host is online and the error should reach the client.
+                    raise HTTPException(
+                        status_code=502, detail=f"Anthropic unreachable: {e}"
+                    ) from e
+                if not _request_never_left(e):
+                    # Might already be generating upstream. Keep holding for the
+                    # verdict, but never ask twice.
+                    if resend_is_safe:
+                        logger.warning(
+                            "not re-sending this turn: %s can occur after Anthropic "
+                            "accepted the request, and /v1/messages is not idempotent",
+                            type(e).__name__,
+                        )
+                    resend_is_safe = False
+                now = time.monotonic()
+                if hold_deadline is None:
+                    hold_deadline = now + br.min_outage + _HOLD_GRACE_SECONDS
+                    logger.warning(
+                        "holding this turn while the breaker decides (%s) rather "
+                        "than answering 502 — a 502 costs the client minutes of "
+                        "backoff for a blip that may last seconds",
+                        type(e).__name__,
+                    )
+        if now >= hold_deadline:
+            logger.warning(
+                "breaker still undecided after %.0fs of holding; "
+                "surfacing the transport failure to the client",
+                br.min_outage + _HOLD_GRACE_SECONDS,
+            )
+            raise HTTPException(
+                status_code=502, detail=f"Anthropic unreachable: {last_exc}"
+            ) from last_exc
+        await asyncio.sleep(_HOLD_RETRY_SECONDS)
+        if not br.allow_upstream():
+            # Another request opened the breaker while this one waited.
+            # Serve this turn locally rather than spending the hold on an
+            # upstream the router has already given up on.
+            return None
     if uresp.status_code in FAILOVER_STATUSES or uresp.status_code == 404:
         err_body = await uresp.aread()  # decoded: content-encoding is undone here
         err_headers = _decoded_relay_headers(uresp)

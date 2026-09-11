@@ -630,6 +630,24 @@ it still keeps a live session off the local model for a short link stall. What
 changed is who pays for it. It costs the held turn some latency instead of
 costing the session minutes of backoff.
 
+**The hold bounds itself, and never asks twice.** Two limits keep it from becoming the
+freeze it replaces.
+
+Each re-attempt is capped by what is *left* of the deadline, not by the client's own
+timeout. Checking the deadline only between sends let an attempt starting a tick before
+it run a full timeout past it, so a turn could be held for the first attempt, plus the
+gate, plus another whole attempt. The first attempt stays unbounded on purpose: that is
+ordinary upstream latency, not time the hold added.
+
+And `/v1/messages` is **not idempotent**. A read timeout, a reset mid-flight or a server
+hang-up can all happen after Anthropic accepted the request and began generating, so
+re-sending would bill a second turn nobody asked for — potentially several times a second
+and with no trace. Only failures that prove the request never left this host are repeated
+(`_RETRYABLE_PRE_SEND_ERRORS`: connect, connect-timeout, pool-timeout — the same set
+`_upstream_send` uses for its own internal retry). An ambiguous failure still holds for the
+verdict, it just stops asking upstream; the breaker's recovery probe, not the held request,
+is what notices Anthropic returning.
+
 The hold is bounded by the gate plus a five-second grace, because that is the
 longest a pending verdict can legitimately take. Past it the 502 stands. A
 verdict the breaker actually *delivered* is never held: when it rules that this
