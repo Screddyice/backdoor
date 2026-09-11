@@ -63,6 +63,23 @@ def test_only_loopback_is_administrable():
     assert not ollama_admin.is_ollama("https://api.anthropic.com/v1")
 
 
+def test_loopback_means_the_hostname_not_a_substring():
+    # "127.0.0.1" as a *prefix* of the hostname passed the old substring test,
+    # which would have let a remote host look administrable by this machine.
+    assert not ollama_admin.is_ollama("http://127.0.0.1.evil.com/v1")
+    assert not ollama_admin.is_ollama("http://localhost.evil.com/v1")
+    assert not ollama_admin.is_ollama("http://0.0.0.0.evil.com/v1")
+    # Userinfo and path text cannot smuggle a loopback match either.
+    assert not ollama_admin.is_ollama("http://127.0.0.1@evil.com/v1")
+    assert not ollama_admin.is_ollama("http://evil.com/127.0.0.1/v1")
+    # Scheme-less and IPv6 loopback still work.
+    assert ollama_admin.is_ollama("127.0.0.1:11434/v1")
+    assert ollama_admin.is_ollama("http://[::1]:11434/v1")
+    # Malformed input is not local, and must not raise.
+    assert not ollama_admin.is_ollama("")
+    assert not ollama_admin.is_ollama("http://[unclosed/v1")
+
+
 # --------------------------------------------------------------------------
 # Admin calls
 # --------------------------------------------------------------------------

@@ -48,6 +48,62 @@ def test_an_unknown_model_still_passes_through():
 
 
 @pytest.mark.anyio
+async def test_count_tokens_resolves_local_names_case_insensitively():
+    """The count route used a raw `in MODEL_ROUTES` dict lookup, so `/model
+    Qwen` served /v1/messages locally while count_tokens relayed the same
+    session's transcript to Anthropic for counting. Both must agree.
+    """
+    import httpx
+
+    import src.proxy.routes as routes
+    from src.proxy.app import create_app
+    from src.proxy.config import Settings, get_settings
+
+    class RecordingUpstream:
+        calls = 0
+
+        def build_request(self, method, url, *, content, headers):
+            return httpx.Request(
+                method,
+                f"https://api.anthropic.com{url}",
+                content=content,
+                headers=headers,
+            )
+
+        async def send(self, request, *, stream):
+            type(self).calls += 1
+            return httpx.Response(200, json={"input_tokens": 1})
+
+        async def aclose(self):
+            pass
+
+    routes._upstream_client = RecordingUpstream()
+    routes._breaker = None
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(router_mode="hybrid")
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages/count_tokens",
+                json={
+                    "model": "Qwen",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+    finally:
+        app.dependency_overrides.clear()
+        routes._upstream_client = None
+        routes._breaker = None
+
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] > 0
+    assert RecordingUpstream.calls == 0
+
+
+@pytest.mark.anyio
 async def test_engaging_the_mlx_tier_evicts_resident_ollama_models(monkeypatch):
     evicted: list[str] = []
 

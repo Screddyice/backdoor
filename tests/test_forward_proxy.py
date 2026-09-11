@@ -220,6 +220,20 @@ async def proxy(tmp_path, router):
 # ── tests ────────────────────────────────────────────────────────────────────
 
 
+async def test_refuses_a_non_loopback_bind(tmp_path, router):
+    """An open CONNECT relay with a live MITM CA must never face the LAN."""
+    p = ForwardProxy(
+        listen_host="0.0.0.0",
+        listen_port=0,
+        mitm_hosts={MITM_HOST},
+        router_host="127.0.0.1",
+        router_port=router.port,
+        ca=LocalCA(tmp_path / "ca"),
+    )
+    with pytest.raises(ValueError, match="non-loopback"):
+        await p.start()
+
+
 async def test_intercepts_allowlisted_host_and_reaches_the_router(proxy, router):
     def client() -> bytes:
         sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)

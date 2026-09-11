@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     router_mode: str = "profile"
     anthropic_upstream: str = "https://api.anthropic.com"
 
+    # Inbound request bound for the Claude path. Codex has had this guard since
+    # its relay was added (codex_max_request_bytes); /v1/messages read the whole
+    # body unbounded, so a loopback client could make the router buffer
+    # arbitrarily large payloads. Same 64 MiB as the Codex side.
+    max_request_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+
     # Cloud→local failover (hybrid mode only): after a sustained run of
     # transport errors to Anthropic, serve passthrough /v1/messages traffic from
     # a local profile instead of failing. Probe Anthropic's own edge every
