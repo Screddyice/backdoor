@@ -49,3 +49,56 @@ def claim_exclusive_model(
         return path
     except OSError:
         return None
+
+
+def _process_alive(pid) -> bool:
+    """Is `pid` still running? An unreadable pid counts as gone."""
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def foreign_exclusive_lease(*, own_pid: int | None = None, now: float | None = None):
+    """An exclusive local-GPU lease held by some OTHER live process, or None.
+
+    The router publishes leases for tiers it loads (see `claim_exclusive_model`)
+    and never read anyone else's, which left one real hole: a deliberate `qwen`
+    session loads the 27B -- roughly 17 GB resident on a 36 GB host -- and
+    publishes a lease so other local-compute consumers stand down. A network
+    drop during that session would have failed Claude and Codex over and loaded
+    a SECOND model on top of the first.
+
+    Fails OPEN. A missing directory is the ordinary case, and a lease that
+    cannot be read is not evidence that the GPU is busy -- refusing to fail over
+    because a file was unparseable would break the feature to protect memory
+    that may well be free.
+
+    Ignored: our own pid (the router's tiers are not a reason to refuse), leases
+    past `expires_at`, `active: false`, and leases whose process is gone -- a
+    crashed session must not strand failover forever.
+    """
+    own = os.getpid() if own_pid is None else own_pid
+    moment = time.time() if now is None else now
+    try:
+        entries = sorted(LEASE_DIR.glob("*.json"))
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            lease = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # one unreadable lease is not a verdict about the GPU
+        if not isinstance(lease, dict) or not lease.get("active"):
+            continue
+        try:
+            if float(lease.get("expires_at", 0)) <= moment:
+                continue
+        except (TypeError, ValueError):
+            continue
+        pid = lease.get("pid")
+        if pid == own or not _process_alive(pid):
+            continue
+        return lease
+    return None

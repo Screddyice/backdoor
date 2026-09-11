@@ -444,6 +444,31 @@ clean handoff into a model that is not there, which reads exactly like a broken 
 
 ---
 
+## Failover stands down when another process owns the GPU
+
+A deliberate `qwen` session loads the 27B — roughly **17 GB resident on a 36 GB host** — and
+publishes an exclusive lease under `~/.backdoor/compute-leases/` so other local-compute
+consumers stand down. The router published leases of its own and never read anyone else's,
+which left one real hole: **lose your connection during a Qwen session and failover would
+load a SECOND model on top of the first.** Both the Claude and Codex paths now decline
+instead, and the transport error stands.
+
+That is the right trade. A 502 is recoverable and the client retries; an oversubscribed
+machine takes the session down with it, including the Qwen session that was using the GPU
+legitimately.
+
+The check fails **open**, deliberately. A missing lease directory is the ordinary case, and a
+lease that cannot be parsed is not evidence the GPU is busy — refusing to fail over because a
+file was unreadable would break the feature to protect memory that may well be free. Four
+things are ignored: the router's own leases (its tiers are not a reason to refuse itself),
+leases past `expires_at`, `active: false`, and leases whose process is gone — a crashed
+session must not strand failover forever.
+
+The Codex gate sits inside `_serve_local` rather than at its three call sites, so no future
+path into local serving can skip it.
+
+---
+
 ## Troubleshooting
 
 **`500 ... "system message must be at the beginning"`**
