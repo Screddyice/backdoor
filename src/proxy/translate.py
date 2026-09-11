@@ -340,8 +340,9 @@ def _is_local_provider(settings) -> bool:
     Cloud sessions receive memory through claude-mem's lifecycle hooks. Local
     sessions launched with `--bare` get no hooks, so Backdoor fills that gap.
     """
-    url = (getattr(settings, "provider_base_url", "") or "").lower()
-    return "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url
+    from .ollama_admin import is_local_base_url
+
+    return is_local_base_url(getattr(settings, "provider_base_url", "") or "")
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:

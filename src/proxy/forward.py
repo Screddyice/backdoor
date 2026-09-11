@@ -228,7 +228,19 @@ class ForwardProxy:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
+    _LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
+
     async def start(self) -> None:
+        # This is an open CONNECT relay with a live MITM CA behind it. Bound to
+        # anything but loopback it becomes an open proxy for the LAN, and every
+        # device that can reach it can also hand it traffic to intercept. The
+        # app layer catches this error and continues without the proxy, so a
+        # misconfigured FORWARD_HOST degrades to no-proxy rather than an
+        # internet-facing one.
+        if self.listen_host not in self._LOOPBACK_NAMES:
+            raise ValueError(
+                f"forward proxy refuses a non-loopback bind: {self.listen_host!r}"
+            )
         self._server = await asyncio.start_server(
             self._accept, self.listen_host, self.listen_port
         )

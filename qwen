@@ -60,6 +60,11 @@ else
 fi
 QWEN_MCP_HELPER="$QWEN_SOURCE/local/qwen-mcp-config.py"
 
+# bd manages a checkout, not a path convention. Point it at THIS checkout so a
+# clone that is not ~/backdoor still switches and starts the right proxy, and
+# so the profile/prompt reads below agree with what bd serves.
+export BACKDOOR_DIR="$QWEN_SOURCE"
+
 PROFILE=""    # empty = derive from the FINAL mode below
 MODE="lean"   # default flipped full→lean 2026-07-09 (offline responsiveness)
 MCP_REQUESTED=""

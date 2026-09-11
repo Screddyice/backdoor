@@ -237,3 +237,58 @@ async def test_count_tokens_still_reaches_upstream_for_a_cloud_model():
     # `_upstream_send` retries once internally, so the count is >= 1; the
     # property under test is that a cloud model still reaches Anthropic.
     assert recorder.requests, "a cloud model must still be counted upstream"
+
+# ── Request bound ────────────────────────────────────────────────────────────
+# The Codex relay has had a 64 MiB body cap since it was added; the Claude path
+# read the whole body unbounded, so a loopback client could grow the router
+# without limit. max_request_bytes applies the same bound here.
+
+
+@pytest.fixture
+def small_cap_app():
+    app, settings = _app(max_request_bytes=128)
+    try:
+        yield app, settings
+    finally:
+        app.dependency_overrides.clear()
+        routes._upstream_client = None
+        routes._breaker = None
+
+
+async def test_messages_over_the_byte_limit_gets_413(small_cap_app):
+    app, _ = small_cap_app
+    response = await _post(
+        app,
+        "/v1/messages",
+        {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "x" * 512}]},
+    )
+    assert response.status_code == 413
+
+
+async def test_count_tokens_over_the_byte_limit_gets_413(small_cap_app):
+    app, _ = small_cap_app
+    response = await _post(
+        app,
+        "/v1/messages/count_tokens",
+        {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "x" * 512}]},
+    )
+    assert response.status_code == 413
+
+
+async def test_catch_all_over_the_byte_limit_gets_413(small_cap_app):
+    app, _ = small_cap_app
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/anything", content=b"x" * 512)
+    assert response.status_code == 413
+
+
+async def test_a_body_under_the_limit_still_routes(small_cap_app):
+    app, _ = small_cap_app
+    response = await _post(
+        app,
+        "/v1/messages/count_tokens",
+        {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] > 0
