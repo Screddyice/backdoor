@@ -10,7 +10,12 @@ from .config import get_settings
 from .resolver import install as install_dns_cache
 from .client import ProviderClient
 from .logging_config import configure_logging as _configure_logging
-from .routes import failover_recovery_loop, router, set_provider_client
+from .routes import (
+    close_route_clients,
+    failover_recovery_loop,
+    router,
+    set_provider_client,
+)
 from .codex_routes import codex_router, close_codex_clients
 
 logger = logging.getLogger(__name__)
@@ -102,6 +107,7 @@ async def lifespan(app: FastAPI):
         await tg_app.shutdown()
 
     await client.aclose()
+    await close_route_clients()
     await close_codex_clients()
     logger.info("Proxy shut down")
 

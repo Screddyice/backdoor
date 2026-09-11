@@ -12,7 +12,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from .config import (
-    MODEL_ROUTES, Settings, get_settings, load_profile_settings, load_route_system_extra,
+    Settings, get_settings, load_profile_settings, load_route_system_extra,
     pick_failover_profile, resolve_model_route,
 )
 from .bare import OFFLINE_SYSTEM, make_bare, parse_keep, route_system
@@ -53,6 +53,22 @@ def get_provider_client() -> ProviderClient:
 
 _profile_clients: dict[str, ProviderClient] = {}
 _upstream_client: httpx.AsyncClient | None = None
+
+
+async def close_route_clients() -> None:
+    """Close the lazily-built hybrid clients at shutdown.
+
+    The profile-mode client is closed by the lifespan; these two pools were
+    created on first use and never released, which only mattered while the
+    process lived forever — but a restart during a deploy leaked them.
+    """
+    global _upstream_client
+    for client in _profile_clients.values():
+        await client.aclose()
+    _profile_clients.clear()
+    if _upstream_client is not None:
+        await _upstream_client.aclose()
+        _upstream_client = None
 
 
 def _get_profile_client(profile: str, psettings: Settings) -> ProviderClient:
@@ -747,6 +763,31 @@ def _model_from_body(body: bytes) -> str:
         return ""
 
 
+async def _read_bounded_body(request: Request, settings: Settings) -> bytes:
+    """Read the request body with a hard size cap, like the Codex relay does.
+
+    `await request.body()` buffers the whole payload with no ceiling, so a
+    loopback client could grow the router without bound. Content-Length is
+    trusted for the fast path and the stream is counted as it arrives, which
+    also catches chunked lies.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > settings.max_request_bytes:
+        raise HTTPException(
+            status_code=413, detail="request exceeds the size limit"
+        )
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > settings.max_request_bytes:
+            raise HTTPException(
+                status_code=413, detail="request exceeds the size limit"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _mock_response(req: MessagesRequest, text: str) -> MessagesResponse:
     return MessagesResponse(
         id=f"msg_{uuid.uuid4().hex}",
@@ -790,7 +831,7 @@ async def create_message(
     request: Request,
     settings: Settings = Depends(get_settings),
 ):
-    body = await request.body()
+    body = await _read_bounded_body(request, settings)
     client: ProviderClient | None = None
     # Set only when the failover path successfully stripped the harness; it then
     # replaces the parsed request below so the stripped version is what is sent.
@@ -1278,8 +1319,15 @@ async def _stream(
 
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request, settings: Settings = Depends(get_settings)):
-    body = await request.body()
-    if settings.router_mode == "hybrid" and _model_from_body(body) not in MODEL_ROUTES:
+    body = await _read_bounded_body(request, settings)
+    # resolve_model_route, not `in MODEL_ROUTES`: the messages path resolves
+    # names case-insensitively, so `/model Qwen` would serve locally while a raw
+    # dict lookup here relayed the same session's transcript to Anthropic for
+    # counting. See test_qwen_alias_and_ram_interlock for the alias fix.
+    if (
+        settings.router_mode == "hybrid"
+        and resolve_model_route(_model_from_body(body)) is None
+    ):
         # While the failover breaker is open, count locally instead of failing.
         if not (settings.failover_to_local and get_breaker(settings).open):
             relayed = await _guarded_passthrough(request, body, settings)
@@ -1307,7 +1355,9 @@ async def health():
 async def passthrough_any(path: str, request: Request, settings: Settings = Depends(get_settings)):
     if settings.router_mode != "hybrid":
         raise HTTPException(status_code=404, detail="Not found")
-    relayed = await _guarded_passthrough(request, await request.body(), settings)
+    relayed = await _guarded_passthrough(
+        request, await _read_bounded_body(request, settings), settings
+    )
     if relayed is None:
         # No local equivalent for an arbitrary endpoint, so the failure has to
         # surface — but as a 502 the client can retry, not a dropped connection.

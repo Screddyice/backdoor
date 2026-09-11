@@ -37,6 +37,7 @@ behaviour (release on the global timer), which is degraded, not broken.
 
 import logging
 import os
+from urllib.parse import urlsplit
 
 from httpx import AsyncClient
 
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Bound as a module attribute, not reached through `httpx.`, so a test can
 # replace THIS name without patching the httpx module every other component
 # (including the test's own ASGI client) is sharing.
-__all__ = ["native_base", "is_ollama", "set_keep_alive", "unload", "resident_models", "evict_all"]
+__all__ = ["native_base", "is_local_base_url", "is_ollama", "set_keep_alive", "unload", "resident_models", "evict_all"]
 
 # Short: this is an out-of-band housekeeping call on localhost, and blocking a
 # real request behind it would trade the problem for a worse one.
@@ -61,6 +62,26 @@ def native_base(provider_base_url: str) -> str:
     return provider_base_url.rstrip("/").removesuffix("/v1")
 
 
+# A provider base URL is local when its HOSTNAME is loopback — not when the
+# string contains a loopback-looking substring. "http://127.0.0.1.evil.com/v1"
+# passed the substring test, which would grant keep-alive writes, unloads, and
+# durable-memory injection to a remote host.
+_LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def is_local_base_url(provider_base_url: str) -> bool:
+    url = (
+        provider_base_url
+        if "://" in provider_base_url
+        else f"http://{provider_base_url}"
+    )
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    return (host or "").lower() in _LOCAL_HOSTNAMES
+
+
 def is_ollama(provider_base_url: str) -> bool:
     """Is this profile served by a local Ollama we may administer?
 
@@ -70,8 +91,7 @@ def is_ollama(provider_base_url: str) -> bool:
     the whole justification for unloading is reclaiming *this* machine's memory,
     so a remote Ollama is not our residency to manage.
     """
-    url = provider_base_url.lower()
-    return "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url
+    return is_local_base_url(provider_base_url)
 
 
 async def _admin_call(provider_base_url: str, model: str, keep_alive) -> bool:
