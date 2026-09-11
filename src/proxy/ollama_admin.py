@@ -35,6 +35,7 @@ admin endpoint must still route; the failure mode of doing nothing is the old
 behaviour (release on the global timer), which is degraded, not broken.
 """
 
+import asyncio
 import logging
 import os
 from urllib.parse import urlsplit
@@ -46,11 +47,32 @@ logger = logging.getLogger(__name__)
 # Bound as a module attribute, not reached through `httpx.`, so a test can
 # replace THIS name without patching the httpx module every other component
 # (including the test's own ASGI client) is sharing.
-__all__ = ["native_base", "is_local_base_url", "is_ollama", "set_keep_alive", "unload", "resident_models", "evict_all"]
+__all__ = ["native_base", "is_local_base_url", "is_ollama", "set_keep_alive",
+           "clamp_soon", "unload", "resident_models", "evict_all"]
 
-# Short: this is an out-of-band housekeeping call on localhost, and blocking a
-# real request behind it would trade the problem for a worse one.
-ADMIN_TIMEOUT = 5.0
+# Reading residency (`/api/ps`) is a cheap lookup that answers immediately, so a
+# short timeout is right: if the server cannot say what is loaded within five
+# seconds, waiting longer will not produce a better answer.
+ADMIN_READ_TIMEOUT = 5.0
+
+# Mutating residency (`/api/generate` with a bare `keep_alive`) is NOT cheap,
+# and five seconds was wrong for it. Ollama serialises work per model, so the
+# call queues behind whatever that model is doing:
+#
+#   * a cold load — measured 2026-09-06, 8.2s for a 2.5 GB model, and the
+#     default route tier is 17 GB;
+#   * an in-flight inference — the clamp is issued around a request, so the
+#     turn it belongs to is usually still generating.
+#
+# With the old 5s ceiling the call therefore timed out essentially always. The
+# live router logged 11 clamp attempts between 2026-09-03 and 2026-09-06 and
+# ZERO successes, so every route tier silently fell back to Ollama's global 5m
+# idle timer — the exact cold-prefill cost the clamp exists to prevent, and
+# invisible because httpx timeouts stringify to "" (see _admin_call).
+#
+# Waiting this long is only safe because no live request awaits it; the route
+# path schedules the clamp through clamp_soon().
+ADMIN_MUTATE_TIMEOUT = 120.0
 
 
 def native_base(provider_base_url: str) -> str:
@@ -99,7 +121,7 @@ async def _admin_call(provider_base_url: str, model: str, keep_alive) -> bool:
         return False
     url = f"{native_base(provider_base_url)}/api/generate"
     try:
-        async with AsyncClient(timeout=ADMIN_TIMEOUT) as client:
+        async with AsyncClient(timeout=ADMIN_MUTATE_TIMEOUT) as client:
             resp = await client.post(url, json={"model": model, "keep_alive": keep_alive})
         resp.raise_for_status()
         return True
@@ -107,7 +129,13 @@ async def _admin_call(provider_base_url: str, model: str, keep_alive) -> bool:
         # Debug, not warning: the consequence of failing is that Ollama's global
         # timer releases the tier later than we wanted. Worth having in a log
         # when diagnosing residency, not worth a line in the normal path.
-        logger.debug("ollama admin %s keep_alive=%r failed: %s", model, keep_alive, exc)
+        #
+        # The TYPE is logged as well as the message because httpx's timeout
+        # exceptions carry an empty one: `str(httpx.ReadTimeout())` is "", so
+        # the old format produced "... failed: " and named no cause at all.
+        # That is how a clamp that never once succeeded stayed invisible.
+        logger.debug("ollama admin %s keep_alive=%r failed: %s: %s",
+                     model, keep_alive, type(exc).__name__, exc)
         return False
 
 
@@ -121,6 +149,44 @@ async def set_keep_alive(provider_base_url: str, model: str, duration: str) -> b
     if not duration:
         return False
     return await _admin_call(provider_base_url, model, duration)
+
+
+# Clamps in flight, keyed by (base URL, model). Two jobs: hold a strong
+# reference so the event loop cannot garbage-collect a running task, and keep
+# one pending clamp per tier instead of one per request — they are idempotent,
+# they serialise behind the same model anyway, and ADMIN_MUTATE_TIMEOUT is long
+# enough that an unbounded pile would matter.
+_clamps_in_flight: dict[tuple[str, str], asyncio.Task] = {}
+
+
+def clamp_soon(provider_base_url: str, model: str, duration: str) -> None:
+    """Clamp residency in the background, so no live request waits on it.
+
+    The clamp has to survive a cold load or an in-flight inference, which is
+    why ADMIN_MUTATE_TIMEOUT is minutes rather than seconds. Awaiting that on
+    the request path would trade a late release for a stalled turn, which is
+    the worse of the two, so the route path calls this instead of
+    :func:`set_keep_alive` and never learns whether it worked.
+
+    Ordering is not a problem: Ollama resets the idle timer on every inference,
+    so a clamp that lands *after* the turn it was issued for is exactly the
+    one that sticks.
+    """
+    if not duration or not model or not is_ollama(provider_base_url):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # no loop (sync context) — nothing to schedule onto
+        return
+
+    key = (provider_base_url, model)
+    pending = _clamps_in_flight.get(key)
+    if pending is not None and not pending.done():
+        return
+
+    task = loop.create_task(set_keep_alive(provider_base_url, model, duration))
+    _clamps_in_flight[key] = task
+    task.add_done_callback(lambda t: _clamps_in_flight.pop(key, None))
 
 
 async def unload(provider_base_url: str, model: str) -> bool:
@@ -152,7 +218,7 @@ async def resident_models(base_url: str = DEFAULT_OLLAMA_BASE) -> list[str]:
     try:
         # AsyncClient via the module attribute, matching _admin_call: a test
         # replaces THIS name rather than patching httpx globally.
-        async with AsyncClient(timeout=ADMIN_TIMEOUT) as client:
+        async with AsyncClient(timeout=ADMIN_READ_TIMEOUT) as client:
             response = await client.get(f"{root}/api/ps")
             response.raise_for_status()
             payload = response.json()

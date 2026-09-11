@@ -812,7 +812,7 @@ async def _tracked_local_stream(
             # measured on 2026-09-05 needed, when the residency timer read the
             # global default right after a routed stream finished.
             if tier is not None and keep_alive:
-                await ollama_admin.set_keep_alive(tier[0], tier[1], keep_alive)
+                ollama_admin.clamp_soon(tier[0], tier[1], keep_alive)
         except Exception:  # release is housekeeping; never mask the response
             logger.exception("deferred tier release failed")
 
@@ -1372,8 +1372,11 @@ async def create_message(
     # minutes, so any think-time longer than that silently re-imposes a cold
     # prefill of 70-100s at 18K. Extending residency past ordinary think-time
     # is what makes the stable prefix worth having.
+    # Scheduled, not awaited: the clamp queues behind this model's cold load or
+    # its in-flight turn, so awaiting it would put minutes of Ollama queue time
+    # in front of the user's request. See ollama_admin.clamp_soon.
     if settings.provider_keep_alive and ollama_admin.is_ollama(settings.provider_base_url):
-        await ollama_admin.set_keep_alive(
+        ollama_admin.clamp_soon(
             settings.provider_base_url, provider, settings.provider_keep_alive
         )
 
@@ -1453,7 +1456,7 @@ async def create_message(
         )
         _note_provider_count(provider, est_in, usage.get("input_tokens"), settings)
         if settings.provider_keep_alive and ollama_admin.is_ollama(settings.provider_base_url):
-            await ollama_admin.set_keep_alive(
+            ollama_admin.clamp_soon(
                 settings.provider_base_url, provider, settings.provider_keep_alive
             )
         return result

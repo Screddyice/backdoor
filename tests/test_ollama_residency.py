@@ -14,7 +14,9 @@ Two independent guards, tested separately because either alone leaves a hole:
     sessions abandoned and no successful upstream call to close the breaker.
 """
 
+import asyncio
 import json
+import logging
 import tempfile
 from pathlib import Path
 
@@ -302,6 +304,16 @@ async def _post(app, body: dict) -> httpx.Response:
         )
 
 
+async def _settle_clamps() -> None:
+    """Let background clamp tasks finish, the way a live loop would."""
+    for _ in range(10):
+        pending = [t for t in ollama_admin._clamps_in_flight.values() if not t.done()]
+        if not pending:
+            await asyncio.sleep(0)
+            break
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 def _huge_request() -> dict:
     # Post-strip size must clear the ladder's 28K bound so this lands on the
     # 256k tier — the expensive one the incident was about. A user message is
@@ -332,6 +344,12 @@ async def test_outage_claims_and_clamps_then_recovery_unloads(monkeypatch, fake_
     try:
         # 1) Outage: served locally by the 256k tier, which must be clamped.
         assert (await _post(app, _huge_request())).status_code == 200
+
+        # The clamp is scheduled, not awaited — a request must never wait on
+        # Ollama's admin queue (see ollama_admin.clamp_soon) — so let the loop
+        # run the task it was handed. What matters is that the clamp LANDS,
+        # not that the response was held up until it did.
+        await _settle_clamps()
 
         clamps = [b for _, b in fake_http.calls if b["keep_alive"] == "45s"]
         assert clamps, f"tier was never clamped; admin calls: {fake_http.calls}"
@@ -608,3 +626,117 @@ async def test_a_route_response_defers_a_breaker_release_too(quiet_inflight, fak
 
     assert _unloads(fake_http) == []
     assert routes._deferred_unloads == {(OLLAMA, "qwen3.5:4b-256k")}
+
+
+# --------------------------------------------------------------------------
+# Clamp delivery — regression cover for 2026-09-06
+#
+# The live router logged 11 clamp attempts between 2026-09-03 and 2026-09-06
+# and zero successes. Two independent faults kept that invisible for days, and
+# each needs its own test because either alone is enough to hide the other.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_timed_out_clamp_still_names_its_cause(monkeypatch, caplog):
+    """httpx timeouts stringify to "", so the message alone identifies nothing.
+
+    The old format was "... failed: %s" on the exception, which rendered
+    "ollama admin qwen3.8:27b-obliterated keep_alive='10m' failed: " — a
+    failure with no stated cause. Logging the type is what makes a blank
+    message diagnosable.
+    """
+    class Timeout(FakeClient):
+        async def post(self, url, json=None):
+            raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(ollama_admin, "AsyncClient", Timeout)
+    caplog.set_level(logging.DEBUG, logger="src.proxy.ollama_admin")
+
+    assert await ollama_admin.set_keep_alive(OLLAMA, "qwen3.8:27b-obliterated", "10m") is False
+
+    line = "\n".join(caplog.messages)
+    assert "ReadTimeout" in line, f"a blank-message timeout named no cause: {line!r}"
+
+
+def test_mutating_a_tier_outlives_a_cold_load():
+    """Five seconds was shorter than the work the call has to wait for.
+
+    Ollama serialises per model, so `/api/generate` queues behind a cold load
+    or an in-flight turn. Measured 2026-09-06: 8.2s to load a 2.5 GB model,
+    and the default route tier is 17 GB. A ceiling under that does not clamp
+    late — it never clamps at all.
+    """
+    assert ollama_admin.ADMIN_MUTATE_TIMEOUT >= 60.0, (
+        "a clamp must survive a cold load of the 17 GB route tier"
+    )
+    # Reading residency is a genuinely cheap lookup and must stay snappy;
+    # evict_all consults it before freeing memory under pressure.
+    assert ollama_admin.ADMIN_READ_TIMEOUT <= 10.0
+
+
+@pytest.mark.asyncio
+async def test_clamp_soon_does_not_make_a_request_wait(monkeypatch):
+    """The reason the long timeout is safe.
+
+    ADMIN_MUTATE_TIMEOUT is minutes. If the route path awaited it, a clamp
+    stuck behind Ollama's queue would stall the user's turn for exactly as
+    long — trading a late release for a dead session, which is worse.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Slow(FakeClient):
+        async def post(self, url, json=None):
+            started.set()
+            await release.wait()
+            FakeClient.calls.append((url, json))
+            return self
+
+    monkeypatch.setattr(ollama_admin, "AsyncClient", Slow)
+    FakeClient.calls = []
+
+    ollama_admin.clamp_soon(OLLAMA, "qwen3.8:27b-obliterated", "10m")  # must return at once
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert FakeClient.calls == [], "clamp_soon blocked until the admin call finished"
+
+    release.set()
+    await _settle_clamps()
+    assert FakeClient.calls[-1][1]["keep_alive"] == "10m"
+
+
+@pytest.mark.asyncio
+async def test_clamp_soon_keeps_one_clamp_per_tier(monkeypatch):
+    # Every turn asks for a clamp. They are idempotent and serialise behind the
+    # same model anyway, so a queue of them is pure cost against a timeout
+    # measured in minutes.
+    release = asyncio.Event()
+
+    class Slow(FakeClient):
+        async def post(self, url, json=None):
+            await release.wait()
+            FakeClient.calls.append((url, json))
+            return self
+
+    monkeypatch.setattr(ollama_admin, "AsyncClient", Slow)
+    FakeClient.calls = []
+
+    for _ in range(5):
+        ollama_admin.clamp_soon(OLLAMA, "qwen3.8:27b-obliterated", "10m")
+    assert len(ollama_admin._clamps_in_flight) == 1
+
+    release.set()
+    await _settle_clamps()
+    assert len(FakeClient.calls) == 1, f"clamps piled up: {FakeClient.calls}"
+    # Drained, so the next turn can clamp again rather than being deduped
+    # against a task that already finished.
+    assert not ollama_admin._clamps_in_flight
+
+
+@pytest.mark.asyncio
+async def test_clamp_soon_ignores_what_it_must_not_administer(fake_http):
+    ollama_admin.clamp_soon("https://api.anthropic.com/v1", "claude-opus-5", "10m")
+    ollama_admin.clamp_soon(OLLAMA, "", "10m")
+    ollama_admin.clamp_soon(OLLAMA, "qwen3.8:27b-obliterated", "")  # unset = leave global
+    await _settle_clamps()
+    assert fake_http.calls == []
+    assert not ollama_admin._clamps_in_flight
