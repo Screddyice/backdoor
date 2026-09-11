@@ -1,0 +1,26 @@
+# Account-synced product MCP bridge. Install as the hermes user service.
+#
+# Each instance gets credentials from %h/.config/products-mcp/<name>.env and
+# public connector settings from products-mcp-<name>.env.
+[Unit]
+Description=%i MCP bridge for Claude mobile and web
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hermes-mcp/http.env
+EnvironmentFile=%h/.hermes/.env
+EnvironmentFile=%h/.config/products-mcp/%i.env
+EnvironmentFile=%h/backdoor-products-mcp/deploy/products-mcp-%i.env
+WorkingDirectory=%h/backdoor-products-mcp
+ExecStart=%h/backdoor-products-mcp/.venv/bin/python -m src.products_mcp.server
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=append:%h/logs/products-mcp-%i.log
+StandardError=append:%h/logs/products-mcp-%i.log
+
+[Install]
+WantedBy=default.target
