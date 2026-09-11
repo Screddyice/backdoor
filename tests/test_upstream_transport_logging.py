@@ -3,6 +3,14 @@
 Regression coverage for the 2026-08-20 VPN incident: isolated ConnectTimeouts
 below the breaker threshold returned bare 502s, so the retry banners the user
 saw had no counterpart anywhere in the router log.
+
+`failover_min_outage_seconds=0` is what keeps this test about LOGGING. At the
+production 20s gate a failure is a pending verdict, which `_try_upstream` now
+holds rather than answers (see test_failover_decision_hold.py for why, and for
+the outcome semantics); the hold would decide this test's result for it. With
+the gate at zero the verdict is delivered immediately, which is the original
+2026-08-20 shape — one isolated failure, relayed as a 502 — and the assertion
+below is once again about the line that failure leaves behind.
 """
 
 import json
@@ -38,6 +46,7 @@ def timing_out_app():
         router_mode="hybrid",
         failover_to_local=True,
         failover_threshold=5,
+        failover_min_outage_seconds=0.0,
     )
     try:
         yield app

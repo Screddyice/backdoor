@@ -1,8 +1,10 @@
 """FastAPI route handlers."""
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
 import uuid
 from typing import AsyncIterator
 
@@ -267,6 +269,28 @@ async def _guarded_passthrough(request: Request, body: bytes, settings: Settings
 # ── Cloud→local failover ─────────────────────────────────────────────────────
 # One breaker for the process (hybrid mode has a single upstream). Lazily
 # built from settings so env overrides apply.
+
+# How long a turn may be held while the breaker decides, on top of the breaker's
+# own `min_outage` gate. The grace covers the probe `record_failure` runs plus
+# the retry cadence below, so a verdict that lands right on the gate is not
+# missed by a fraction of a second.
+_HOLD_GRACE_SECONDS = 5.0
+# Cadence for re-attempting upstream during a hold. Short enough that a blip
+# clearing in a second or two costs the turn about that much, long enough that a
+# held turn is not re-running the connectivity probe continuously.
+_HOLD_RETRY_SECONDS = 0.5
+
+def _request_never_left(exc: BaseException) -> bool:
+    """True only when `exc` proves no request reached Anthropic.
+
+    The hold re-sends, and a POST to /v1/messages is NOT idempotent: Anthropic
+    may have accepted it and begun generating before the transport died, so a
+    re-send bills a second turn nobody asked for. `_upstream_send` already
+    settled which failures are replayable for its own internal retry, and the
+    answer is the same one — reuse it rather than keep a second list that can
+    drift out of agreement with the first.
+    """
+    return isinstance(exc, _RETRYABLE_PRE_SEND_ERRORS)
 
 _breaker: FailoverBreaker | None = None
 # Serialises every breaker verdict. See `_record_failure`.
@@ -638,6 +662,97 @@ async def _release_deferred(
         await ollama_admin.unload(base_url, model)
 
 
+# What the real API sends to keep a slow stream alive, byte for byte. Claude
+# Code already tolerates these mid-stream from Anthropic itself, which is what
+# makes it the safe frame to inject: an unknown one would have to be guessed at.
+_PING_EVENT = 'event: ping\ndata: {"type": "ping"}\n\n'
+# Gap after which a local stream sends one. Five seconds is far under any
+# plausible client idle timeout and costs ~30 bytes, so the cheap side of the
+# trade is also the safe one.
+_LOCAL_STREAM_PING_SECONDS = 5.0
+
+
+async def _locked_events(
+    inner: AsyncIterator[str],
+    tier: tuple[str, str] | None,
+    lock_timeout: float,
+) -> AsyncIterator[str]:
+    """`inner`, with the tier's serialization lock held across the whole run.
+
+    Split out of `_tracked_local_stream` so the lock WAIT sits inside the
+    iterator rather than around it. That is what lets one heartbeat cover both
+    slow phases: waiting for the tier and waiting for the first token are both
+    just a slow first `__anext__` from here.
+    """
+    if tier is None:
+        async for event in inner:
+            yield event
+        return
+    async with tier_lock.hold(tier[0], tier[1], timeout=lock_timeout):
+        async for event in inner:
+            yield event
+
+
+async def _with_heartbeat(inner: AsyncIterator[str], interval: float) -> AsyncIterator[str]:
+    """Emit a ping whenever `inner` has produced nothing for `interval`.
+
+    A local turn commits to its response early: FastAPI puts 200 and the SSE
+    headers on the wire as soon as the StreamingResponse starts, and only then
+    does the work begin. Two phases of that work produce no bytes at all, and
+    both can run to a minute or more:
+
+      * waiting for the tier lock, when another session is already generating
+      * the cold prefill, before the first token exists
+
+    Until 2026-09-08 the client got headers and then silence for as long as
+    that took, which it renders as `API Error: The response stopped arriving.
+    The response above may be incomplete.` — indistinguishable from a dead
+    connection, and it lands on the turn that failover was supposed to rescue.
+    Measured that night at 01:20:38: a failed-over turn queued behind a live
+    one and did not acquire the tier for 75.2 seconds, 47 of them after
+    Anthropic was already reachable again.
+
+    So the fix is not to make the wait shorter — a single GPU cannot serve two
+    17K-token prefills at once, and serializing them is the right call (see
+    tier_lock) — but to stop the wait looking like a failure. A ping every few
+    seconds says "still here" in the one dialect the client already speaks.
+    """
+    if interval <= 0:
+        async for event in inner:
+            yield event
+        return
+    it = inner.__aiter__()
+    pending: asyncio.Task[str] | None = None
+    try:
+        while True:
+            pending = asyncio.ensure_future(it.__anext__())
+            while True:
+                done, _ = await asyncio.wait({pending}, timeout=interval)
+                if done:
+                    break
+                yield _PING_EVENT
+            try:
+                event = pending.result()
+            except StopAsyncIteration:
+                pending = None
+                return
+            pending = None
+            yield event
+    finally:
+        # The consumer can vanish mid-wait (client hung up). Cancelling the
+        # in-flight pull raises into `inner` at its await point, which is what
+        # runs the `async with` in `_locked_events` and hands the tier back;
+        # aclose() covers the case where it was parked between yields instead.
+        if pending is not None:
+            pending.cancel()
+            with contextlib.suppress(BaseException):
+                await pending
+        aclose = getattr(it, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(BaseException):
+                await aclose()
+
+
 async def _tracked_local_stream(
     inner: AsyncIterator[str],
     settings: Settings,
@@ -658,16 +773,18 @@ async def _tracked_local_stream(
     generator, and a lock taken in the handler would then be released by
     nobody. Acquiring inside means the lock's lifetime is exactly the
     generator's.
+
+    Everything it produces goes out through :func:`_with_heartbeat`, because
+    the two slowest parts of a local turn both happen AFTER the response is
+    committed — headers are already on the wire, and the client is waiting on a
+    body that has not started. See that function for the incident.
     """
     _local_stream_started()
     try:
-        if tier is not None:
-            async with tier_lock.hold(tier[0], tier[1], timeout=lock_timeout):
-                async for event in inner:
-                    yield event
-        else:
-            async for event in inner:
-                yield event
+        async for event in _with_heartbeat(
+            _locked_events(inner, tier, lock_timeout), _LOCAL_STREAM_PING_SECONDS
+        ):
+            yield event
     finally:
         due = _local_stream_ended()
         try:
@@ -689,21 +806,118 @@ async def _try_upstream(request: Request, body: bytes, settings: Settings):
 
     Returns a response to relay, or None when the caller should serve the
     request from the local failover profile instead. Mid-stream failures after
-    headers are NOT intercepted — the client's retry then hits the breaker."""
+    headers are NOT intercepted — the client's retry then hits the breaker.
+
+    A transport failure while the breaker is still DECIDING is held, not
+    answered. `min_outage` deliberately makes the breaker wait out a brief blip
+    before claiming the GPU, and until 2026-09-08 every request that failed
+    inside that gate was answered with a 502. That is the one status Claude Code
+    treats as "retry later", so the gate's cost was paid in client backoff: at
+    00:50:44 seven consecutive requests took a 502 in the 20s before the breaker
+    opened at 00:51:04, and the session was still counting down `will retry in
+    2m 29s` at 01:01:24 — 13 seconds after the SECOND outage had fully closed.
+    The router recovered in 26 seconds and the session stayed frozen for
+    minutes, which is the whole bug: recovery of the router did not recover the
+    client.
+
+    Holding converts that window into latency the client already tolerates. Both
+    exits serve a real answer — upstream comes back and the response relays, or
+    the breaker opens and the turn is served locally — so a blip shorter than
+    `min_outage` never reaches the client as a retryable error at all. The hold
+    is bounded by the breaker's own gate plus a grace, because that is the
+    longest a pending verdict can legitimately take; past it the 502 stands,
+    which is the honest answer to an upstream that is genuinely down while this
+    host is online."""
     br = get_breaker(settings)
     if not br.allow_upstream():
         return None
-    try:
-        uresp = await _upstream_send(request, body, settings)
-    except httpx.TransportError as e:
-        # Below the breaker threshold this becomes a bare 502 with no other
-        # trace, yet the client renders a retry banner for it — the 2026-08-20
-        # VPN diagnosis meant correlating banners against a log that never
-        # mentioned them. Every transport failure gets a line.
-        logger.warning("upstream transport failure (%s): %s", type(e).__name__, e)
-        if await _record_failure(br, type(e).__name__):
+    hold_deadline: float | None = None
+    # Cleared by the first failure that might already have been delivered. From
+    # then on the turn holds for the verdict without asking upstream again.
+    resend_is_safe = True
+    last_exc: BaseException | None = None
+    while True:
+        if not resend_is_safe:
+            # Holding without re-sending. The breaker's own recovery probe, not
+            # this request, is what notices upstream coming back.
+            now = time.monotonic()
+        else:
+            try:
+                if hold_deadline is None:
+                    uresp = await _upstream_send(request, body, settings)
+                else:
+                    # Bound the attempt by what is LEFT of the hold, not by the
+                    # client's own timeout. Checking the deadline only between
+                    # sends let an attempt that started a tick before it run a
+                    # full timeout past it, so the turn could be held for the
+                    # first attempt plus the gate plus another whole attempt —
+                    # the long freeze this hold exists to prevent. The first
+                    # attempt is deliberately unbounded: that one is ordinary
+                    # upstream latency, not time the hold added.
+                    uresp = await asyncio.wait_for(
+                        _upstream_send(request, body, settings),
+                        timeout=max(0.0, hold_deadline - time.monotonic()),
+                    )
+                break
+            except (httpx.TransportError, asyncio.TimeoutError) as e:
+                # Below the breaker threshold this becomes a bare 502 with no other
+                # trace, yet the client renders a retry banner for it — the 2026-08-20
+                # VPN diagnosis meant correlating banners against a log that never
+                # mentioned them. Every transport failure gets a line.
+                #
+                # Only the FIRST gets a WARNING. A held turn re-attempts every
+                # `_HOLD_RETRY_SECONDS`, so warning on each one would put ~50 lines
+                # per turn into the log at exactly the moment several turns are
+                # holding at once — burying the transitions the log exists to show.
+                # The guarantee the 2026-08-20 incident asked for is that a failure
+                # is never invisible, and the first line delivers it.
+                last_exc = e
+                logger.log(
+                    logging.DEBUG if hold_deadline is not None else logging.WARNING,
+                    "upstream transport failure (%s): %s", type(e).__name__, e,
+                )
+                if await _record_failure(br, type(e).__name__):
+                    return None
+                if not br.deciding:
+                    # A delivered verdict, not a pending one: the breaker ruled that
+                    # this host is online and the error should reach the client.
+                    raise HTTPException(
+                        status_code=502, detail=f"Anthropic unreachable: {e}"
+                    ) from e
+                if not _request_never_left(e):
+                    # Might already be generating upstream. Keep holding for the
+                    # verdict, but never ask twice.
+                    if resend_is_safe:
+                        logger.warning(
+                            "not re-sending this turn: %s can occur after Anthropic "
+                            "accepted the request, and /v1/messages is not idempotent",
+                            type(e).__name__,
+                        )
+                    resend_is_safe = False
+                now = time.monotonic()
+                if hold_deadline is None:
+                    hold_deadline = now + br.min_outage + _HOLD_GRACE_SECONDS
+                    logger.warning(
+                        "holding this turn while the breaker decides (%s) rather "
+                        "than answering 502 — a 502 costs the client minutes of "
+                        "backoff for a blip that may last seconds",
+                        type(e).__name__,
+                    )
+        if now >= hold_deadline:
+            logger.warning(
+                "breaker still undecided after %.0fs of holding; "
+                "surfacing the transport failure to the client",
+                br.min_outage + _HOLD_GRACE_SECONDS,
+            )
+            raise HTTPException(
+                status_code=502, detail=f"Anthropic unreachable: {last_exc}"
+            ) from last_exc
+        await asyncio.sleep(_HOLD_RETRY_SECONDS)
+        if not br.allow_upstream():
+            # Another request opened the breaker while this one waited.
+            # Serve this turn locally rather than spending the hold on an
+            # upstream the router has already given up on.
             return None
-        raise HTTPException(status_code=502, detail=f"Anthropic unreachable: {e}") from e
     if uresp.status_code in FAILOVER_STATUSES or uresp.status_code == 404:
         err_body = await uresp.aread()  # decoded: content-encoding is undone here
         err_headers = _decoded_relay_headers(uresp)
