@@ -562,6 +562,27 @@ class FailoverBreaker:
         except OSError:
             pass
 
+    @property
+    def deciding(self) -> bool:
+        """Is a failure recorded but the open/relay verdict still pending?
+
+        True only in the gap `min_outage` creates: failures are accumulating,
+        the breaker has not opened, and it has not ruled the other way either.
+        The two ways out both clear it — opening sets `open`, and the
+        "this host is online, relay the error" verdict resets `_failures` to 0.
+
+        `_try_upstream` needs the distinction because both outcomes look the
+        same from `record_failure`'s return value (False), yet they call for
+        opposite handling: a pending verdict is worth waiting out, a delivered
+        one is the answer. See the hold loop there for what that buys.
+        """
+        if self.open or self._failures == 0:
+            return False
+        now = self._now()
+        if (now - self._first_failure_at) > self.window:
+            return False
+        return (now - self._first_failure_at) < self.min_outage
+
     def allow_upstream(self) -> bool:
         """Should this request attempt the real API? Always yes while CLOSED;
         while OPEN, yes once per probe interval (half-open)."""

@@ -618,9 +618,48 @@ The shared 20-second gate is the operator policy for Codex and Claude. During
 that window, each client retains its normal retry or error behavior.
 Authentication and request errors still bypass failover on both paths.
 
-During the gate the real errors are relayed, and Claude Code retries through
-them. That avoids moving a live Claude session onto a local
-model for a short link stall.
+During the gate the router **holds the turn** rather than answering it. That
+sentence used to read "the real errors are relayed, and Claude Code retries
+through them", and the retry was assumed to be cheap. It is not. A 502 is the
+one status Claude Code treats as *retry later*, and its backoff escalates: on
+2026-09-08 seven consecutive requests took a 502 in the 20 seconds before the
+breaker opened at `00:51:04`, and the session was still counting down
+`will retry in 2m 29s` at `01:01:24` — thirteen seconds after a *second*,
+separate outage had already closed. Both outages lasted under 30 seconds. The
+router recovered in half a minute and the session stayed frozen for minutes,
+because nothing about the router coming back reaches a client that is asleep in
+its own backoff.
+
+So a failure inside the gate now waits there. Both exits serve a real answer —
+upstream returns and the response relays, or the breaker opens and the turn is
+served locally — and a blip shorter than `failover_min_outage_seconds` never
+reaches the client as a retryable error at all. The gate's purpose is unchanged:
+it still keeps a live session off the local model for a short link stall. What
+changed is who pays for it. It costs the held turn some latency instead of
+costing the session minutes of backoff.
+
+**The hold bounds itself, and never asks twice.** Two limits keep it from becoming the
+freeze it replaces.
+
+Each re-attempt is capped by what is *left* of the deadline, not by the client's own
+timeout. Checking the deadline only between sends let an attempt starting a tick before
+it run a full timeout past it, so a turn could be held for the first attempt, plus the
+gate, plus another whole attempt. The first attempt stays unbounded on purpose: that is
+ordinary upstream latency, not time the hold added.
+
+And `/v1/messages` is **not idempotent**. A read timeout, a reset mid-flight or a server
+hang-up can all happen after Anthropic accepted the request and began generating, so
+re-sending would bill a second turn nobody asked for — potentially several times a second
+and with no trace. Only failures that prove the request never left this host are repeated
+(`_RETRYABLE_PRE_SEND_ERRORS`: connect, connect-timeout, pool-timeout — the same set
+`_upstream_send` uses for its own internal retry). An ambiguous failure still holds for the
+verdict, it just stops asking upstream; the breaker's recovery probe, not the held request,
+is what notices Anthropic returning.
+
+The hold is bounded by the gate plus a five-second grace, because that is the
+longest a pending verdict can legitimately take. Past it the 502 stands. A
+verdict the breaker actually *delivered* is never held: when it rules that this
+host is online and the error belongs to the client, that error goes out at once.
 
 Worth knowing when reading the log: **a short outage shows as a long open.** Half-open only retries once per `failover_probe_seconds`, so a five-second blip can appear as a 60–90 second open with nothing wrong.
 
@@ -679,6 +718,25 @@ Backdoor cannot rescue the truncated request. It now does the two things still a
 A dead stream still counts against the 20-second duration gate before anything opens. Backdoor relays brief failures and keeps the GPU free.
 
 Hanging up yourself does not count. `CancelledError` and `GeneratorExit` are not `httpx.TransportError`, so pressing Ctrl-C never pushes the breaker toward claiming the GPU.
+
+### The same error, from the local side: a stream that never starts
+
+`The response stopped arriving` has a second cause, and it is not a dead upstream at all — it is the failover turn that was supposed to rescue you, sitting mute.
+
+A local turn commits to its response early. FastAPI puts `200` and the SSE headers on the wire when the `StreamingResponse` starts, and only *then* does the work begin. Two phases of that work produce no bytes, and either can run past a minute:
+
+| Phase | Why it is silent |
+|---|---|
+| Waiting for the tier lock | another session is already generating, and one GPU serves one prefill |
+| The cold prefill | the first token does not exist yet — a 17K-token context on the 27B is not fast |
+
+Measured 2026-09-08 at `01:20:38`: a failed-over turn queued behind a live one and did not acquire the tier for **75.2 seconds**, 47 of them after Anthropic was already reachable again. The client had headers and nothing else for that whole time, which is indistinguishable from a dead connection — so the turn Backdoor had just rescued from an outage died anyway, with the same message a truncated upstream produces.
+
+The wait itself is correct and stays. Interleaving two large prefills costs both sessions roughly 100x against one turn of queueing (see the measurements in `tier_lock`), so serializing is the right call. What was wrong is that the wait looked like a failure.
+
+Every locally served stream — failover and deliberate `/model qwen` alike — now goes out through a heartbeat that emits `event: ping` after five seconds of silence, the same frame the real API sends to hold a slow stream open. Claude Code already tolerates those mid-stream from Anthropic itself, which is what makes it the safe thing to inject rather than a guess.
+
+The lock wait sits *inside* the iterator being watched, not around it, so one heartbeat covers both phases: from the watcher's side, waiting for the tier and waiting for the first token are both just a slow first pull. A client that hangs up mid-wait cancels that pull, which raises into the generator at its await point and hands the tier back — the queue must not outlive the turn that was in it.
 
 
 ### A local tier that stops answering
