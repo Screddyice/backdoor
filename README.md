@@ -553,6 +553,14 @@ Four handlers forward to Anthropic: `/v1/messages`, `/v1/messages/count_tokens`,
 
 Until 2026-08-24 only the first did. The other three called the passthrough with no `except` around it, so a `ConnectTimeout` propagated out of the handler, uvicorn dropped the client socket, and Claude Code printed `Connection dropped (ECONNRESET) · Retrying`. Retrying hit the same unguarded handler, so the banner climbed to attempt 8 of 10 while the router log filled with tracebacks rather than the single line naming the failure.
 
+**A locally routed session stays local, whatever the case.** `count_tokens` used to decide by raw
+`MODEL_ROUTES` membership while `/v1/messages` resolved through `resolve_model_route`, which lowers
+case deliberately — a model name is an identifier a person types, not data. The two disagreed, so
+`/model Qwen` ran its completions on Ollama and relayed every `count_tokens` body — the entire
+conversation, on nearly every turn — to Anthropic. That is the worst shape a leak can take: the
+session is locally served, reports itself as locally served, and mirrors its transcript to a third
+party anyway. Both paths now resolve identically.
+
 Losing the count was the expensive half. `count_tokens` runs on nearly every turn, so during an outage it produced most of the evidence that Anthropic was unreachable, and every bit of it was raised and thrown away. The breaker saw a fraction of the failures, which pushed it past `failover_window_seconds` before it reached `failover_threshold`.
 
 What each route does now when upstream will not answer:
@@ -561,7 +569,7 @@ What each route does now when upstream will not answer:
 |---|---|
 | `/v1/messages` (failover on) | Local profile once the breaker opens, `502` below the threshold |
 | `/v1/messages` (failover off) | `502` |
-| `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage |
+| `/v1/messages/count_tokens` | Counts from the request body. Arithmetic needs no model, no tier and no GPU, so this one answers through any outage. It resolves the route with `resolve_model_route`, the same case-insensitive helper `/v1/messages` uses, so a locally routed session never relays its transcript upstream |
 | `/{path:path}` | `502` |
 
 Recording one failure never opens the breaker before the 20-second duration gate. These routes do not call `record_success`: closing the breaker obliges the caller to unload the tiers it claimed, and only the `/v1/messages` path knows how.

@@ -1493,7 +1493,14 @@ async def _stream(
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request, settings: Settings = Depends(get_settings)):
     body = await request.body()
-    if settings.router_mode == "hybrid" and _model_from_body(body) not in MODEL_ROUTES:
+    # `resolve_model_route`, not a raw MODEL_ROUTES lookup: the completions path
+    # resolves case-insensitively, so a plain membership test here disagreed with
+    # it. `/model Qwen` then ran its COMPLETIONS locally while relaying every
+    # count_tokens body — the whole transcript, on nearly every turn — to
+    # Anthropic. A session that is locally served, and says it is, must not
+    # mirror its conversation to a third party.
+    if (settings.router_mode == "hybrid"
+            and resolve_model_route(_model_from_body(body)) is None):
         # While the failover breaker is open, count locally instead of failing.
         if not (settings.failover_to_local and get_breaker(settings).open):
             relayed = await _guarded_passthrough(request, body, settings)
