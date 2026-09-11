@@ -429,7 +429,7 @@ class FailoverBreaker:
         window: float = 120.0,
         probe_interval: float = 60.0,
         now_fn: Callable[[], float] = time.monotonic,
-        notify_fn: Callable[[str, str], None] = _notify,
+        notify_fn: Callable[[str, str], None] | None = None,
         online_fn: Callable[[], bool] = internet_usable,
         state_path: Path | None = None,
         source: str = "anthropic",
@@ -455,7 +455,13 @@ class FailoverBreaker:
         self.window = window
         self.probe_interval = probe_interval
         self._now = now_fn
-        self._notify = notify_fn
+        # Resolved here, not bound as a default argument. A default is
+        # evaluated once at def time, which captured THIS module's `_notify`
+        # object and made the real osascript call unpatchable: a test suite
+        # could redirect the state file (conftest does) and still fire a live
+        # desktop notification for every breaker it opened. Looking the module
+        # attribute up per construction makes the side effect suppressible.
+        self._notify = notify_fn if notify_fn is not None else _notify
         self._online = online_fn
         self._state_path = STATE_PATH if state_path is None else state_path
         self.source = source
