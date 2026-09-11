@@ -152,3 +152,88 @@ async def test_messages_without_failover_returns_502(
 
     assert response.status_code == 502
     assert "upstream transport failure (ConnectTimeout)" in caplog.text
+
+
+class RecordingClient:
+    """Records every request aimed at Anthropic, then fails the connection.
+
+    Failing afterwards keeps these tests about ONE question — did the body
+    leave for Anthropic at all — without needing a byte-faithful streaming
+    relay to assert on. The local counter answers either way.
+    """
+
+    def __init__(self):
+        self.requests = []
+
+    def build_request(self, method, url, *, content, headers):
+        return httpx.Request(
+            method, f"https://api.anthropic.com{url}", content=content, headers=headers
+        )
+
+    async def send(self, request, *, stream):
+        self.requests.append(request)
+        raise httpx.ConnectTimeout("timed out")
+
+    async def aclose(self):
+        pass
+
+
+def _recording_app(**overrides):
+    recorder = RecordingClient()
+    routes._upstream_client = recorder
+    routes._breaker = None
+    app = create_app()
+    kwargs = {"router_mode": "hybrid", "failover_to_local": True, "failover_threshold": 99}
+    kwargs.update(overrides)
+    settings = Settings(**kwargs)
+    app.dependency_overrides[get_settings] = lambda: settings
+    return app, recorder
+
+
+@pytest.mark.anyio
+async def test_count_tokens_keeps_a_locally_routed_session_local():
+    """A session routed to local weights must not ship its transcript to Anthropic.
+
+    `/v1/messages` resolves its route with `resolve_model_route`, which lowers
+    case on purpose — model names are identifiers a person types. `count_tokens`
+    tested raw `MODEL_ROUTES` membership instead, so `/model Qwen` sent its
+    COMPLETIONS to Ollama while relaying every count_tokens body — the whole
+    conversation, on nearly every turn — to Anthropic.
+
+    That is the worst shape a leak can take: the session is locally served,
+    reports itself as locally served, and mirrors its transcript to a third
+    party anyway.
+    """
+    app, recorder = _recording_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for model in ("Qwen", "qwen", "QWEN", " qwen "):
+            resp = await client.post(
+                "/v1/messages/count_tokens",
+                json={"model": model,
+                      "messages": [{"role": "user", "content": "a private transcript"}]},
+            )
+            assert resp.status_code == 200, model
+
+    assert recorder.requests == [], (
+        "a locally routed model must never relay count_tokens upstream; "
+        f"{len(recorder.requests)} request(s) leaked"
+    )
+
+
+@pytest.mark.anyio
+async def test_count_tokens_still_reaches_upstream_for_a_cloud_model():
+    """The fix must not turn every count into a local estimate."""
+    app, recorder = _recording_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/messages/count_tokens",
+            json={"model": "claude-opus-5",
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 200
+
+    # `_upstream_send` retries once internally, so the count is >= 1; the
+    # property under test is that a cloud model still reaches Anthropic.
+    assert recorder.requests, "a cloud model must still be counted upstream"
