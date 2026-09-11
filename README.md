@@ -1462,7 +1462,19 @@ Memories sit between the history and the active turn on purpose: the block is re
 
 The router sizes a request with tiktoken; Ollama prices the rendered chat template. Every local response now logs both — `prompt: 17677 provider tokens for an estimate of 19905 (ratio 0.89)` — and warns when a prompt reaches the window, because Ollama truncates from the front silently and the symptom is a model that answers nothing.
 
-Measured across a real routed Claude Code session on 2026-09-05, the ratio sat at **0.89–0.90** on ordinary traffic and fell to 0.18–0.41 when a single enormous message dominated. The router over-counts, mildly. `LOCAL_TOKEN_ESTIMATE_RATIO` therefore defaults to **1.0**, and `PROVIDER_CONTEXT_TOKENS` records each tag's real `num_ctx` so `_window_guard` can cap the working set at `(window − reply reserve − template slack) ÷ ratio`.
+Measured on a dev router on 2026-09-05, the ratio sat at **0.89–0.90** on ordinary traffic and fell to 0.18–0.41 when a single enormous message dominated, which read as "the router over-counts, mildly" and set the default to **1.0**. Re-measured against the *deployed* router on 2026-09-06, ordinary local traffic runs **0.99–1.12** — it under-counts as often as it over-counts, and 1.0 was the average of a range rather than its ceiling.
+
+`LOCAL_TOKEN_ESTIMATE_RATIO` therefore defaults to **1.15**, and `PROVIDER_CONTEXT_TOKENS` records each tag's real `num_ctx` so `_window_guard` can cap the working set at `(window − reply reserve − template slack) ÷ ratio`.
+
+**The guard has to hold at the top of the measured range, not the average.** At 1.0 it returned 27,172 — above `ROUTE_MAX_INPUT_TOKENS` (27,000), so it never bound on anything:
+
+| estimate | × 1.12 observed | + 4,096 reply | vs 32,768 window |
+|---|---|---|---|
+| 24,888 (largest seen live) | 27,874 | 31,970 | fits, by **798** |
+| 25,599 (overflow threshold) | 28,671 | 32,767 | the edge |
+| 27,000 (`ROUTE_MAX_INPUT_TOKENS`) | 30,240 | 34,336 | **overflows by 1,568** |
+
+Nothing had truncated yet — zero `prompt reached the window` warnings, and the largest local prompt cleared by 798 tokens — but the backstop was calibrated so it could not catch the case it exists for. At 1.15 the guard is 23,627, which still clears the ~19K that the system block and tool schemas cost on their own, so it bounds oversized tails without becoming the off switch 1.8 was. Tails above it escalate to the ladder rather than running near the edge.
 
 This setting shipped at 1.8 for one revision, on the belief the provider counted more. That number came from comparing two different requests, and the session that caught it is worth keeping: at 1.8 the guard is 15,095, which is **below** the ~19K that the system block and tool schemas cost on their own, so the working set could never fit inside it and five turns in a row logged `cannot reach 15095 tokens (tail alone is 19877)` and fell through to the ladder. A guard smaller than a request's irreducible overhead is not a guard, it is an off switch. Raise the ratio only from logged pairs.
 
@@ -1475,7 +1487,7 @@ This setting shipped at 1.8 for one revision, on the belief the provider counted
 | `LOCAL_WORKING_SET_MAX_TOKENS` | `22000` | What triggers one |
 | `LOCAL_TIER_LOCK_TIMEOUT_SECONDS` | `900` | How long a second session waits before proceeding unlocked |
 | `PROVIDER_CONTEXT_TOKENS` | per tag | The tier's real `num_ctx`, which the window guard sizes against |
-| `LOCAL_TOKEN_ESTIMATE_RATIO` | `1.0` | Provider tokens per estimated token; raise only from logged pairs |
+| `LOCAL_TOKEN_ESTIMATE_RATIO` | `1.15` | Provider tokens per estimated token; covers the top of the measured range, not its average. Change only from logged pairs |
 
 Bounding applies only where the provider is a local Ollama tier. The ceiling is a property of this machine's GPU, so applying it to a hosted provider would discard context for nothing. The client keeps its full transcript either way — this decides what is forwarded, exactly as bare mode decides how much of each message is forwarded.
 

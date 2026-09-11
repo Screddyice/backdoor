@@ -296,7 +296,11 @@ class Settings(BaseSettings):
     # local response now records "prompt: N provider tokens for an estimate of
     # M (ratio R)", so the number can be set from evidence instead of belief.
     provider_context_tokens: int = 32_768
-    local_token_estimate_ratio: float = 1.0
+    # 1.15, from logged pairs on the deployed router (2026-09-06): ordinary
+    # local traffic measured 0.99-1.12 provider tokens per estimated token.
+    # The guard must hold at the TOP of that range, not the average -- see
+    # _window_guard, and see the README for why 1.8 was an off switch.
+    local_token_estimate_ratio: float = 1.15
 
     # Optional runtime identity for profiles whose server lifecycle must be
     # supervised before a request can load weights. Unlike the hybrid router's
