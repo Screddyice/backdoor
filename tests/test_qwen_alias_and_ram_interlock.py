@@ -194,3 +194,27 @@ async def test_nothing_resident_means_nothing_evicted(monkeypatch):
     monkeypatch.setattr(ollama_admin, "unload", fake_unload)
     assert await ollama_admin.evict_all() == []
     assert unloads == 0
+
+
+def test_qwen_wrapper_resolves_its_own_files_from_its_own_location():
+    """The wrapper must work from any directory, not only ~/backdoor.
+
+    `QWEN_SOURCE` is computed from the script's own path, but seven later sites
+    ignored it and hardcoded `$HOME/backdoor`: the profile lookup, the MCP
+    configs, the settings file, both prompt files and the port read. Installed
+    anywhere else — a worktree, a clone, a checkout under a different name —
+    those silently missed while the rest of the script worked, which is the
+    hardest kind of half-broken to diagnose.
+    """
+    from pathlib import Path
+
+    script = (Path(__file__).parents[1] / "qwen").read_text()
+    _, sep, after = script.partition('QWEN_MCP_HELPER="$QWEN_SOURCE/local/qwen-mcp-config.py"')
+    assert sep, "QWEN_SOURCE anchor moved; this guard needs updating"
+    offenders = [
+        line.strip() for line in after.splitlines() if "$HOME/backdoor" in line
+    ]
+    assert not offenders, (
+        "these lines bypass $QWEN_SOURCE and only work from ~/backdoor:\n  "
+        + "\n  ".join(offenders)
+    )

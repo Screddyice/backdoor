@@ -168,7 +168,7 @@ fi
 
 # 2. Verify the model for this profile is actually pulled (offline-ready).
 #    Query the API with a small retry — `ollama list` can race a fresh daemon.
-MODEL="$(grep -E '^PROVIDER_MODEL=' "$HOME/backdoor/profiles/$PROFILE.env" | cut -d= -f2-)"
+MODEL="$(grep -E '^PROVIDER_MODEL=' "$QWEN_SOURCE/profiles/$PROFILE.env" | cut -d= -f2-)"
 if [ "$PROFILE" = "local-qwen38-action" ]; then
   # The MLX tier has no Ollama tag to find — PROVIDER_MODEL is a label the
   # mlx_vlm server answers to, and /api/tags will never list it. Checking for it
@@ -206,7 +206,7 @@ fi
 MCP_DEFAULT=0
 MCP_ARGS=()
 if [ "${QWEN_MCP:-$MCP_DEFAULT}" != "1" ]; then
-  MCP_ARGS=(--strict-mcp-config --mcp-config "$HOME/backdoor/empty-mcp.json")
+  MCP_ARGS=(--strict-mcp-config --mcp-config "$QWEN_SOURCE/empty-mcp.json")
 else
   # Regenerated every launch from ~/.claude.json so key rotations carry over.
   # Lives in ~/.cache (NOT the backdoor repo) because it contains API keys.
@@ -255,7 +255,7 @@ fi
 if [ "$MODE" = "full" ]; then
   # AUTO-HOOK mode: enable harness + claude-mem + ralph-loop (and their hooks),
   # disable the other heavy plugins so the prompt (~29K) stays manageable.
-  EXTRA_ARGS=(--settings "$HOME/backdoor/hook-mode.settings.json")
+  EXTRA_ARGS=(--settings "$QWEN_SOURCE/hook-mode.settings.json")
   if [ -n "${QWEN_MCP_SERVERS:-}" ]; then
     EXTRA_ARGS+=(--append-system-prompt "MCP servers attached for this session: ${QWEN_MCP_SERVERS}. Use only the attached MCP tools needed for the request.")
   fi
@@ -282,8 +282,8 @@ else
   # for context that is mostly irrelevant to a local coding turn. `--append-
   # system-prompt` takes the text inline; there is no `-file` form despite what
   # the --bare help text implies.
-  PR_RULES="$HOME/backdoor/prompts/qwen-pr-rules.md"
-  ONLINE_RULES="$HOME/backdoor/prompts/qwen-online-tools.md"
+  PR_RULES="$QWEN_SOURCE/prompts/qwen-pr-rules.md"
+  ONLINE_RULES="$QWEN_SOURCE/prompts/qwen-online-tools.md"
   LEAN_RULES=""
   [ -f "$PR_RULES" ] && LEAN_RULES="$(cat "$PR_RULES")"
   if [ -f "$ONLINE_RULES" ]; then
@@ -307,7 +307,7 @@ EXTRA_ARGS+=(--model qwen)
 #    file paths) so it runs in YOUR current directory.
 bd switch "$PROFILE" >/dev/null
 bd start >/dev/null 2>&1
-PORT="$(grep -E '^PORT=' "$HOME/backdoor/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"; PORT="${PORT:-8082}"
+PORT="$(grep -E '^PORT=' "$QWEN_SOURCE/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"; PORT="${PORT:-8082}"
 # bd switch/start can restart the proxy and return before uvicorn is listening;
 # launching claude into that gap = instant "API Error: Connection error"
 # (fatal in -p mode). Wait for /health before exec.
@@ -367,7 +367,7 @@ else
     >/dev/null 2>&1 &
 fi
 
-if [ "${MCP_ARGS[2]:-}" = "$HOME/backdoor/empty-mcp.json" ]; then
+if [ "${MCP_ARGS[2]:-}" = "$QWEN_SOURCE/empty-mcp.json" ]; then
   MCP_NOTE="offline"
 else
   MCP_NOTE="MCP: ${QWEN_MCP_SERVERS:-<none set>} (net)"
