@@ -114,6 +114,22 @@ does not hide which savings are measured and which depend on a counterfactual. L
 stays separate from OpenRouter routing. The local section splits agent usage between Claude and
 Codex, while the OpenRouter section only reports usage found in the client transcripts.
 
+**The headline reports money not spent, and nothing else.** It used to read "$X saved this
+week" over a figure that summed local-model savings with Codex *plan value* — what the
+subscription was worth, not money avoided. Plan value dominated: a measured week showed
+**$976.38 of it against $24.63 genuinely saved**, overstating the real figure roughly 40x. A
+headline nobody can substantiate is worse than a smaller one that survives being questioned.
+
+Three claims, reported apart and never summed:
+
+| Figure | What it is |
+|---|---|
+| **Measured** | tokens local weights served; counterfactual pricing, measured tokens |
+| **Estimated** | frontier escalations a Codex/Claude subscription absorbed instead of OpenRouter billing them — real, but the CLIs return text not token counts |
+| **Value delivered** | metered API value of Codex and Claude work, less plan cost. The plan is paid either way and there is no per-token bill to avoid, so this is **not** savings |
+
+Only the first two are added together. The third gets its own section, labelled as value.
+
 Prompt caching is tracked as a separate efficiency stat, never counted as dollars saved — on a
 flat-rate subscription plan there's no per-token bill for it to discount off of.
 
