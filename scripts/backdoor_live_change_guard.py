@@ -2,8 +2,9 @@
 """Block agent tools from changing the live Backdoor control plane.
 
 The router carries the sessions that would otherwise repair it. Source work and
-read-only diagnostics remain available; live deployment and launchd operations
-belong to the user in an independent Terminal session.
+read-only diagnostics remain available. Live changes use the reviewed QA release
+controller or the user's independent Terminal session. This hook blocks ad hoc
+agent mutations and remains enabled for both workflows.
 """
 
 from __future__ import annotations
@@ -65,7 +66,7 @@ PROCESS_MUTATIONS = re.compile(
 )
 
 BLOCK_REASON = (
-    "Backdoor's live control plane is user-operated. Agents may inspect it and edit source, "
+    "Backdoor live changes require the reviewed QA controller or Shawn's Terminal. Agents may inspect and edit source, "
     "but may not change the live launch agent, deployed checkout, dependencies, or router "
     "process. Use an independent Terminal session and keep a direct Claude or Codex rescue "
     "path open before any live operation."

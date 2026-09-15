@@ -27,8 +27,8 @@ budget. Neither default failover path selects 27B.
 
 Existing installations need the source update and any saved model overrides
 updated together: `FAILOVER_PROFILE=local-qwen4b` and
-`CODEX_LOCAL_MODEL=qwen3.5:4b-64k`. Shawn applies live router changes from an
-independent Terminal session under the repository's live-control rules.
+`CODEX_LOCAL_MODEL=qwen3.5:4b-64k`. The QA deployment controller applies both
+overrides with the merged release.
 
 
 **Backdoor lets you run Claude Code against any AI — DeepSeek, Groq, Ollama, OpenRouter, or your own local model. Same UI. Same tools. Same agentic loops. Zero lock-in.**
@@ -523,16 +523,15 @@ Token counts only pick a local-model failover profile, so an estimate costs prec
 threshold and nothing else. Override the cache location with `TIKTOKEN_CACHE_DIR`.
 
 A restart still severs requests already in flight. Those sessions recover on their next retry, or
-at once with Esc and resend. Claude and Codex agents must not restart this service: the router is
-their repair path, so a failed restart can strand both clients. Machine-level pre-tool hooks block
-live launchd, deploy-checkout, dependency, and process mutations while leaving read-only health
-checks available.
+at once with Esc and resend. QA Assist deploys through the independent controller described
+below. Machine hooks continue to block ad hoc live launchd, checkout, dependency, and process
+mutations; read-only health checks remain available.
 
 **The router is serving code you did not just edit**
 The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), in detached HEAD,
-not from your dev clone. Editing the dev clone changes nothing until a human performs a live
-deployment from an independent Terminal session. Agents may inspect the checkout and prepare a
-tested commit, but the live checkout and launchd job are user-operated control-plane state.
+not from your dev clone. Editing the dev clone changes nothing until QA Assist merges the PR
+and the local release controller applies its GitHub Deployment. Shawn can also deploy from an
+independent Terminal session. Agents prepare changes in source worktrees.
 
 A dev-clone process started by hand on the same port hides this completely, because it answers
 first and serves current code. Kill it and the stale service takes over, which reads as a sudden
@@ -767,7 +766,7 @@ Deploying the router is a fast-forward and a restart, and on 2026-09-03 doing it
 - it verifies the **new** code is running by finding the startup marker in the log written *after* the restart, not merely that something restarted
 - it rolls back and restarts again automatically when that verification fails
 
-The restart itself is not in the file. It arrives in `RESTART_CMD`, supplied by whoever runs the deploy, because operating this machine's live control plane is a human's job and the repo should not encode one host's launch agent.
+The restart itself is not in the file. It arrives in `RESTART_CMD`, supplied by whoever runs the deploy, for this legacy manual deployment path. QA Assist uses the separate controller below.
 
 ```bash
 RESTART_CMD='<restart the router>' scripts/deploy-router.sh <service-checkout-dir> [ref]
@@ -1049,9 +1048,9 @@ must copy that `SoftResourceLimits` block, switch `ProgramArguments` to
 `PORT` environment keys shown in the example. The startup-safe launcher creates bounded logging
 before uvicorn imports the application. Replace every `/Users/you` placeholder before installing
 the file. `kickstart` does not reload a changed plist. Boot out the loaded definition, bootstrap
-the file. Applying a changed launch agent is a live control-plane operation. Do it only from an
-independent Terminal session with direct-cloud rescue access and a rollback copy already in place.
-After the user-operated change, inspect the applied limit with:
+the file. Applying a changed launch agent is a live control-plane operation. Apply it through the QA controller or an
+independent Terminal session with direct-cloud rescue access and a rollback copy.
+After deployment, inspect the applied limit with:
 
 ```bash
 launchctl print gui/$(id -u)/com.screddy.backdoor-router | grep -A3 resource-limits
@@ -2076,10 +2075,9 @@ uv run pytest -q --tb=no tests/<file>::<test> 2>&1 | tail -1
 echo "EXPECTED-RED: fails without the fix, as designed"
 ```
 
-This repo is the **source**. The live control plane is operated by hand from an
-independent Terminal session, and machine hooks reject agent attempts to touch it —
-see `~/.claude/CLAUDE.md`, section "Backdoor live-control boundary". Agent
-instructions live in `CLAUDE.md`.
+This repo is the **source**. QA Assist may merge and deploy through the controlled
+release process below. Machine hooks block ad hoc live changes. Agent instructions
+live in `CLAUDE.md`.
 
 ## Memory: claude-mem replica (since 2026-09-04)
 
@@ -2114,3 +2112,40 @@ The suite is the gate: failover, memory recall, the working set, tier serializat
 provider edges. The count is deliberately not quoted here — it moves every time a regression gets
 cover, and a number in prose only ever goes stale. Nothing here needs a secret, so the workflow runs with `contents: read` and no
 environment.
+
+
+## QA Assist merge and production deployment
+
+Shawn authorizes QA Assist to merge verified PRs and promote their exact merge
+commits to production. `.shawns-qa.toml` enables this policy. A separate Mac
+LaunchAgent, `com.screddy.backdoor-deployer`, polls GitHub Deployments once per
+minute using the existing `gh` login. It needs no inbound SSH connection.
+
+Install the reviewed controller from a source checkout:
+
+```bash
+python3 scripts/install-qa-deployer.py
+```
+
+The controller accepts only production requests created by `shawns-qa-assist[bot]`
+for a merged PR whose commit remains at the head of main and passes GitHub's
+`verify` check. It requires a clean detached service checkout, the expected router
+LaunchAgent, installed 4B model tags, and a quiet window. It does not pull or load
+models. It applies the frozen dependencies and the two 4B environment overrides,
+then reloads the router. `/health` must report the exact commit, default 4B, failover
+4B, Codex 4B, and explicit obliterated 27B before it posts success to GitHub.
+
+The controller stores a private recovery journal and previous LaunchAgent under
+`~/.local/share/backdoor-deployer`. A failed or interrupted deployment restores the
+previous commit, dependencies, and LaunchAgent. An uncertain GitHub receipt is
+retried without repeating the deployment. Its GitHub requests bypass proxy
+environment variables so recovery can continue while the router is down.
+
+A quiet window reduces interruption risk; requests can arrive between the check
+and reload. Existing router versions lack an active-request count, so the first
+upgrade also relies on ten seconds without log activity. Later releases include
+streaming requests in the count. Socket activation on 8083/8084 remains prohibited.
+Ad hoc agent mutations of the live router remain blocked by machine hooks.
+
+Validation: `uv run pytest -q` includes deployment authorization, recovery receipt,
+and streaming request-count tests. Tests never operate launchd or load local models.

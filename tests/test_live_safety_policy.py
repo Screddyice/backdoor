@@ -17,11 +17,13 @@ def test_launch_agent_does_not_delegate_router_sockets() -> None:
     assert "Sockets" not in config
 
 
-def test_qa_assist_cannot_automerge_backdoor() -> None:
+def test_qa_assist_can_merge_and_promote_through_controller() -> None:
     with (ROOT / ".shawns-qa.toml").open("rb") as handle:
         config = tomllib.load(handle)
 
-    assert config["merge"]["enabled"] is False
+    assert config["merge"]["enabled"] is True
+    assert config["promotion"]["enabled"] is True
+    assert config["promotion"]["stages"] == [{"name": "production", "timeout_seconds": 900}]
 
 
 def test_readme_does_not_tell_agents_to_restart_the_live_router_directly() -> None:

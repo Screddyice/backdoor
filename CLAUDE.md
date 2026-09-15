@@ -12,28 +12,24 @@ of the internet may still work; some networks can reach ChatGPT while blocking
 Anthropic's edge. HTTP 429, 529, 401 and 403 responses still get relayed because
 the provider answered and the caller needs to see that response.
 
-## Live-control boundary — read before running anything
+## Live-control policy
 
-This repo is the **source**, and the source is where agents work. You may inspect
-the live router, edit code here, run tests, and open PRs.
+Shawn authorizes **Shawn's QA Assist** to merge verified PRs and deploy their
+exact merge commits through `scripts/qa_deploy.py`, the independent Mac release
+controller. `.shawns-qa.toml` enables merge and production promotion.
 
-You may **not** touch the live control plane. Shawn operates it himself from an
-independent Terminal session with a rescue path open. Machine PreToolUse hooks
-enforce this, and they will reject a command or a file edit that merely *names* the
-protected artifacts — including this file, which is why the specifics are not
-restated here.
+The controller accepts production GitHub Deployments from `shawns-qa-assist[bot]`
+only. It checks the merged PR, current main commit, successful native CI, clean
+detached service checkout, installed model tags, and a quiet router before applying
+the release. It preserves the previous commit and LaunchAgent, verifies the running
+revision and model routes, and restores the previous release if verification fails.
+It uses direct GitHub connections so router failure cannot cut off its recovery path.
 
-**That section of `~/.claude/CLAUDE.md` no longer exists.** It was removed on
-2026-09-10 along with the router itself, so this file spent that time pointing
-agents at safety guidance that was not there — and "go read the rules" failing
-silently is worse than having no pointer at all. Until a live router exists again
-and the machine rules describe it, treat the boundary as: **inspect freely, change
-nothing that is running.** Anything that starts, stops, restarts, deploys to, or
-repoints a live router or its launchd job is Shawn's to run, from his own session.
-
-If a tool call comes back refused with a message about the live control plane, that
-is this guard doing its job. Do not try to route around it; hand the operation to
-Shawn.
+Agents may maintain and install this controller. Ad hoc edits to the live checkout,
+router LaunchAgent, dependencies, and router lifecycle remain prohibited. Changes
+to that state must use the reviewed QA controller, or Shawn's independent Terminal
+session. Keep the machine hooks enabled. Do not add socket activation on 8083/8084.
+If a hook rejects an operation, report the rejection; do not bypass it.
 
 ## Stack
 
@@ -86,7 +82,7 @@ modelfiles/build.sh qwen3.5-4b-64k.Modelfile qwen3.5-4b-256k.Modelfile
 Claude failover selects `local-qwen4b` up to 54K estimated input tokens and
 `local-failover-256k` above that. Codex uses the 64K tag with its existing 32K
 request budget. Existing live environment overrides need updating alongside
-the source, by Shawn under the live-control boundary above.
+the source through the QA controller described above.
 
 For explicit 27B use, build `qwen3.8:27b-obliterated` with
 `modelfiles/bare/qwen3.8-27b-obliterated.Modelfile`; it supplies the tool

@@ -1,10 +1,12 @@
-# Backdoor carries the repair channel used by both Claude and Codex. Automated
-# review remains useful, but a bot must never land a control-plane change.
-
+# Shawn authorizes QA Assist to merge verified PRs and deploy through the
+# independent Mac controller. Ad hoc live-router mutations remain prohibited.
 [merge]
-enabled = false
+enabled = true
 
 [verify]
 test = "pytest -q"
 timeout_seconds = 900
 
+[promotion]
+enabled = true
+stages = [{ name = "production", timeout_seconds = 900 }]
