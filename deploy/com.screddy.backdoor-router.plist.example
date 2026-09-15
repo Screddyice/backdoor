@@ -56,6 +56,15 @@
         <string>/Users/you/.claude-mem/claude-mem.db</string>
         <key>MEMORY_WORKER_URL</key>
         <string>http://127.0.0.1:37701</string>
+        <!-- Compact long Claude transcripts before local failover. The router
+             still returns a continuity response when the active turn itself
+             exceeds the widest local model's physical window. -->
+        <key>CONTEXT_VIRTUALIZATION</key>
+        <string>true</string>
+        <key>CONTEXT_TARGET_INPUT_TOKENS</key>
+        <string>18000</string>
+        <key>CONTEXT_HARD_INPUT_TOKENS</key>
+        <string>22000</string>
     </dict>
 
     <!-- Each CONNECT tunnel consumes two descriptors. Intercepted Anthropic

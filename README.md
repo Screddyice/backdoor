@@ -765,7 +765,17 @@ The service checkout on this machine is a **detached worktree** sharing one repo
 
 ### The ladder always answers
 
-`pick_failover_profile` ends in `return FAILOVER_LADDER[-1][1]`, so an oversized session gets the widest tier rather than nothing. That is the guarantee worth holding: **an outage never leaves a session with no local tier at all.**
+`pick_failover_profile` classifies every session, including one larger than the
+widest tier. The request guard then compares the estimate with the selected
+Ollama window. A request that still cannot fit receives a continuity response
+instead of starting a prefill that will run until timeout. This protects the
+GPU during an outage and tells Claude Code to retry the cloud route when it
+recovers.
+
+The committed macOS launchd example enables `CONTEXT_VIRTUALIZATION`. The
+router archives the stable portion of a long Claude transcript and assembles a
+bounded local working set before failover. The active turn still has to fit the
+widest local window; the continuity response handles that case.
 
 It used to be asserted as `bounds[-1] == float("inf")` — the shape of the data rather than the behaviour, and redundant with that trailing return. The test now asserts the behaviour, which both passes today and fails loudly for anyone who changes the selector to return `None` for a session no tier can serve. That is a legitimate design (it pairs with shrinking the prompt before the selector runs, so an impossible request gets an honest answer instead of a model call that cannot complete) — but it is a change in contract, and a failing test is where that should surface.
 

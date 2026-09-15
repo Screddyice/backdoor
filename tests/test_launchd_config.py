@@ -31,6 +31,9 @@ def test_launchd_example_has_capacity_for_concurrent_claude_sessions() -> None:
     assert config["EnvironmentVariables"]["CODEX_LOCAL_MODEL"] == "qwen3.8:27b-obliterated"
     assert config["EnvironmentVariables"]["MEMORY_DB_PATH"] == "/Users/you/.claude-mem/claude-mem.db"
     assert config["EnvironmentVariables"]["MEMORY_WORKER_URL"] == "http://127.0.0.1:37701"
+    assert config["EnvironmentVariables"]["CONTEXT_VIRTUALIZATION"] == "true"
+    assert config["EnvironmentVariables"]["CONTEXT_TARGET_INPUT_TOKENS"] == "18000"
+    assert config["EnvironmentVariables"]["CONTEXT_HARD_INPUT_TOKENS"] == "22000"
     assert config["EnvironmentVariables"]["LOG_FILE"].startswith("/Users/you/")
     assert config["StandardOutPath"] == "/dev/null"
     assert config["StandardErrorPath"] == "/dev/null"

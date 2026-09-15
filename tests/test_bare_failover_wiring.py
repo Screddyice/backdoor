@@ -156,10 +156,17 @@ async def test_bare_mode_can_be_disabled(offline_app, monkeypatch):
     old behavior without a code change."""
     app, recorder = offline_app
     app.dependency_overrides[get_settings] = lambda: Settings(
-        router_mode="hybrid", failover_to_local=True, failover_threshold=1,
-        failover_bare=False, qwen_memory=False,
+        router_mode="hybrid", provider_base_url="http://127.0.0.1:11434/v1",
+        failover_to_local=True, failover_threshold=1,
+        failover_bare=False, failover_profile="local-failover-256k",
+        local_working_set=False,
+        qwen_memory=False,
     )
-    await _post(app, _harness_request())
+    await _post(app, {
+        "model": "claude-opus-5",
+        "system": "You are Claude Code. official CLI",
+        "messages": [{"role": "user", "content": "answer this"}],
+    })
     assert "official CLI" in json.dumps(recorder.payload)
 
 
@@ -269,7 +276,9 @@ async def test_profile_mode_oversized_session_escalates(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
+        provider_base_url="http://127.0.0.1:11434/v1",
         provider_model="qwen3.5:4b-64k",
+        provider_context_tokens=131_072,
         route_max_input_tokens=28_000,
     )
     try:
@@ -295,7 +304,9 @@ async def test_profile_mode_normal_session_stays_put(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
+        provider_base_url="http://127.0.0.1:11434/v1",
         provider_model="qwen3.5:4b-64k",
+        provider_context_tokens=131_072,
         route_max_input_tokens=28_000,
     )
     try:
@@ -375,26 +386,21 @@ async def test_oversized_route_session_is_trimmed_and_keeps_the_strong_tier(rout
     assert len(sent) < 20, "the transcript was not bounded at all"
 
 
-async def test_a_session_that_cannot_be_trimmed_still_escalates(route_app):
-    """One message larger than the ceiling: nothing to drop, so the ladder runs.
-
-    Bounding removes whole turns. When the newest turn alone is over the
-    ceiling there is no smaller working set to build, and the wide tier is the
-    only thing that can answer at all.
-    """
-    app, _recorder, seen = route_app
-    huge = "Read this build log and explain the failure. " * 12_000
+async def test_a_failed_over_session_that_cannot_fit_the_widest_tier_returns_continuity_message(
+    offline_app,
+):
+    """An irreducibly large turn must not start an unbounded Ollama prefill."""
+    app, recorder = offline_app
+    huge = "Read this build log and explain the failure. " * 30_000
     resp = await _post(app, {
-        "model": "qwen",
+        "model": "claude-opus-5",
         "system": HARNESS_SYSTEM,
         "messages": [{"role": "user", "content": huge}],
     })
 
     assert resp.status_code == 200
-    assert seen[-1] == "local-failover-256k", (
-        f"un-trimmable session stayed on {seen[-1]}; the ladder is still the "
-        "fallback when there is nothing to trim"
-    )
+    assert "local inference could not fit" in resp.text
+    assert recorder.payload is None, "an oversized request reached Ollama"
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +580,9 @@ async def test_tier_escalation_frees_the_tier_it_left(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
+        provider_base_url="http://127.0.0.1:11434/v1",
         provider_model="qwen3.5:4b-64k",
+        provider_context_tokens=131_072,
         route_max_input_tokens=28_000,
     )
     try:

@@ -662,6 +662,10 @@ _TRIM_NOTE = (
     "the client still holds the full transcript and the cloud model still sees it."
 )
 
+_LOCAL_CONTEXT_OVERFLOW = (
+    "local inference could not fit this turn; retry when the cloud route recovers"
+)
+
 
 # Chat template, role markers and the injected memory block are not in the
 # router's count and come to roughly this much at the provider.
@@ -691,6 +695,19 @@ def _window_guard(settings: Settings) -> int:
     reserve = settings.provider_max_tokens if 0 < settings.provider_max_tokens < window else 4_096
     ratio = max(1.0, float(settings.local_token_estimate_ratio or 1.0))
     return max(0, int((window - reserve - _TEMPLATE_SLACK) / ratio))
+
+
+def _local_input_limit(settings: Settings) -> int:
+    """Return the effective router estimate limit for a local Ollama tier."""
+    if not ollama_admin.is_ollama(settings.provider_base_url):
+        return 0
+    limits = []
+    if settings.route_max_input_tokens:
+        limits.append(settings.route_max_input_tokens)
+    guard = _window_guard(settings)
+    if guard:
+        limits.append(guard)
+    return min(limits) if limits else 0
 
 
 def _note_provider_count(provider: str, estimate: int, real: int | None, settings: Settings) -> None:
@@ -1294,10 +1311,7 @@ async def create_message(
                 profile = pick_failover_profile(est)
             except ContextLimitError:
                 logger.warning("Claude failover context cannot fit the local hard limit")
-                return _mock_response(
-                    fr,
-                    "local inference could not fit this turn; retry when the cloud route recovers",
-                )
+                return _mock_response(fr, _LOCAL_CONTEXT_OVERFLOW)
             except Exception:
                 # Never let stripping break the failover itself — an unstripped
                 # answer beats no answer. The floor profile still serves it.
@@ -1459,10 +1473,7 @@ async def create_message(
             )
         except ContextLimitError as exc:
             if failed_over:
-                return _mock_response(
-                    req,
-                    "local inference could not fit this turn; retry when the cloud route recovers",
-                )
+                return _mock_response(req, _LOCAL_CONTEXT_OVERFLOW)
             raise HTTPException(
                 status_code=413,
                 detail=(
@@ -1510,10 +1521,7 @@ async def create_message(
     # wide 64K/256K ones) are unaffected, which also stops a second escalation
     # firing on top of the hybrid branch's.
     evicting: tuple[str, str] | None = None
-    tier_limit = settings.route_max_input_tokens
-    tier_guard = _window_guard(settings)
-    if tier_guard:
-        tier_limit = min(tier_limit, tier_guard) if tier_limit else tier_guard
+    tier_limit = _local_input_limit(settings)
     if tier_limit and est_in > tier_limit:
         try:
             escalated = pick_failover_profile(est_in)
@@ -1535,6 +1543,30 @@ async def create_message(
             # provider error — which beats dropping it here.
             logger.exception("tier escalation failed; staying on %s", settings.provider_model)
             evicting = None
+
+        # The ladder's final tier is intentionally unbounded as a selector so
+        # existing sessions can still be classified. It is not permission to
+        # send a prompt beyond that tier's physical context window. The old
+        # path did exactly that during an outage, keeping Ollama busy for ten
+        # concurrent 389K-499K-token prefills until each request timed out.
+        tier_limit = _local_input_limit(settings)
+        if tier_limit and est_in > tier_limit:
+            logger.warning(
+                "local request exceeds widest tier: in≈%s over %s (%s); "
+                "returning continuity response",
+                est_in,
+                tier_limit,
+                settings.provider_model,
+            )
+            if failed_over:
+                return _mock_response(req, _LOCAL_CONTEXT_OVERFLOW)
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Local Qwen cannot fit the current instruction. "
+                    "Start a fresh task with a shorter instruction."
+                ),
+            )
 
     # Outside the try above so a failure here cannot be mistaken for a failed
     # escalation, and outside the branch so the swap is already committed: the

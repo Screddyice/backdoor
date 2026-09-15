@@ -158,7 +158,7 @@ async def test_route_without_route_bare_is_left_alone(routed_app):
     prompt and MCP tools out from under callers that selected the full profile.
     """
     app, recorder, monkeypatch = routed_app
-    _pin(monkeypatch, route_bare=False)
+    _pin(monkeypatch, route_bare=False, provider_context_tokens=131_072)
     await _post(app, _harness_request())
     assert "official CLI" in json.dumps(recorder.payload)
 
@@ -166,7 +166,7 @@ async def test_route_without_route_bare_is_left_alone(routed_app):
 async def test_stripping_failure_does_not_drop_the_request(routed_app):
     """An unstripped answer beats no answer — same rule as the failover path."""
     app, recorder, monkeypatch = routed_app
-    _pin(monkeypatch, route_bare=True)
+    _pin(monkeypatch, route_bare=True, provider_context_tokens=131_072)
 
     def boom(*_a, **_k):
         raise RuntimeError("strip exploded")
@@ -327,6 +327,7 @@ async def test_profile_mode_leaves_the_harness_alone_when_route_bare_is_off(monk
         route_bare=False,
         provider_base_url="http://localhost:11434/v1",
         provider_model="qwen3.8:27b-obliterated",
+        provider_context_tokens=131_072,
         qwen_memory=False,
     )
     try:
