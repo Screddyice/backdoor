@@ -40,7 +40,7 @@ def test_blocks_live_router_mutations_from_shell(command: str) -> None:
     )
 
     assert reason is not None
-    assert "user-operated" in reason
+    assert "reviewed QA controller" in reason
 
 
 @pytest.mark.parametrize(
