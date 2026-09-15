@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 
 from .config import get_settings
+from .release_health import ActiveRequests
 from .resolver import install as install_dns_cache
 from .client import ProviderClient
 from .logging_config import configure_logging as _configure_logging
@@ -114,6 +115,8 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="backdoor", version="1.0.0", lifespan=lifespan)
+    app.state.active_requests = 0
+    app.add_middleware(ActiveRequests)
     # Mount before the Anthropic catch-all route so Codex Responses never fall
     # through to api.anthropic.com.
     app.include_router(codex_router)

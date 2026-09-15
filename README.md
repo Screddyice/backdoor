@@ -11,6 +11,26 @@
 
 ### Claude Code is the best coding agent ever built. The model underneath is optional.
 
+## Qwen model selection
+
+Backdoor defaults to **Qwen3.5 4B** (`qwen3.5:4b-64k`) for `qwen`,
+`qwen lean`, `/model qwen`, and Claude and Codex failover.
+Select **27B** with `qwen 27b`, `/model Qwen 27b`, or `/model qwen-27b`.
+Model aliases ignore case. The old `qwen38-obliterated` and `qwen38-action`
+aliases no longer select a local model; use `qwen-27b` for the GGUF 27B.
+The MLX profile remains available for manual profile administration.
+
+Claude failover uses the 64K 4B profile up to 54,000 estimated input tokens,
+then the 256K 4B profile. The working-set guard trims eligible history first.
+Codex failover uses the 64K 4B tag with its existing conservative 32K context
+budget. Neither default failover path selects 27B.
+
+Existing installations need the source update and any saved model overrides
+updated together: `FAILOVER_PROFILE=local-qwen4b` and
+`CODEX_LOCAL_MODEL=qwen3.5:4b-64k`. The QA deployment controller applies both
+overrides with the merged release.
+
+
 **Backdoor lets you run Claude Code against any AI — DeepSeek, Groq, Ollama, OpenRouter, or your own local model. Same UI. Same tools. Same agentic loops. Zero lock-in.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -413,28 +433,26 @@ whether DNS answers cannot be answered from a cache of the times it did.
 
 ## Model tags are custom builds, not pulls
 
-The failover tiers exist on no registry. Build them:
+Build the two 4B tags for default Qwen sessions and failover:
 
 ```bash
-# 1. The 27B failover tier
-ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M   # ~17 GB
-ollama create qwen3.8:27b-obliterated \
-  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
-
-# 2. The 256K escalation tier, for sessions too large for the 27B's window
-ollama pull qwen3.5:4b                                          # registry base
-modelfiles/build.sh qwen3.5-4b-256k.Modelfile                   # -> qwen3.5:4b-256k
+ollama pull qwen3.5:4b
+modelfiles/build.sh qwen3.5-4b-64k.Modelfile qwen3.5-4b-256k.Modelfile
 ```
 
-Use `modelfiles/build.sh` for the 256K tag rather than a raw `ollama create`: it bakes in the
-shared system prompt from `prompts/`, which a plain create would omit.
+The build script includes the shared system prompt. Both tags are needed for
+Claude's size-based failover ladder. The 256K tag serves sessions that remain
+too large after the working-set guard runs.
 
-The custom Modelfile for the 27B is required, not cosmetic: the source GGUF's template carries no
-tool contract, so Ollama returns 400 to any request carrying tools without it.
+Build the 27B tag only for explicit `qwen 27b` sessions:
 
-Both tags are needed. `pick_failover_profile` escalates to `qwen3.5:4b-256k` when a session is too
-large for the 27B's 32K window, so building only the first tag leaves the escalation path 404ing
-on exactly the long sessions that need it most.
+```bash
+ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M
+ollama create qwen3.8:27b-obliterated \
+  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
+```
+
+Its custom Modelfile supplies the tool contract required by Ollama.
 
 Build from the **GGUF** tag, never int4/MLX — the MLX engine ignores `num_ctx` and loads a 262144
 window that grows toward 32 GB. Verify with `ollama ps`, not `ollama show --parameters`.
@@ -446,7 +464,7 @@ clean handoff into a model that is not there, which reads exactly like a broken 
 
 ## Failover stands down when another process owns the GPU
 
-A deliberate `qwen` session loads the 27B — roughly **17 GB resident on a 36 GB host** — and
+An explicit `qwen 27b` session loads the 27B — roughly **17 GB resident on a 36 GB host** — and
 publishes an exclusive lease under `~/.backdoor/compute-leases/` so other local-compute
 consumers stand down. The router published leases of its own and never read anyone else's,
 which left one real hole: **lose your connection during a Qwen session and failover would
@@ -505,16 +523,15 @@ Token counts only pick a local-model failover profile, so an estimate costs prec
 threshold and nothing else. Override the cache location with `TIKTOKEN_CACHE_DIR`.
 
 A restart still severs requests already in flight. Those sessions recover on their next retry, or
-at once with Esc and resend. Claude and Codex agents must not restart this service: the router is
-their repair path, so a failed restart can strand both clients. Machine-level pre-tool hooks block
-live launchd, deploy-checkout, dependency, and process mutations while leaving read-only health
-checks available.
+at once with Esc and resend. QA Assist deploys through the independent controller described
+below. Machine hooks continue to block ad hoc live launchd, checkout, dependency, and process
+mutations; read-only health checks remain available.
 
 **The router is serving code you did not just edit**
 The `:8083` router runs from a *separate* deploy checkout (`backdoor-service`), in detached HEAD,
-not from your dev clone. Editing the dev clone changes nothing until a human performs a live
-deployment from an independent Terminal session. Agents may inspect the checkout and prepare a
-tested commit, but the live checkout and launchd job are user-operated control-plane state.
+not from your dev clone. Editing the dev clone changes nothing until QA Assist merges the PR
+and the local release controller applies its GitHub Deployment. Shawn can also deploy from an
+independent Terminal session. Agents prepare changes in source worktrees.
 
 A dev-clone process started by hand on the same port hides this completely, because it answers
 first and serves current code. Kill it and the stale service takes over, which reads as a sudden
@@ -603,7 +620,7 @@ While ChatGPT inference works, Backdoor relays the original request, OAuth heade
 
 The relay accepts request bodies up to 64 MiB by default. This is a transport safety ceiling, not a model token limit. Set `CODEX_MAX_REQUEST_BYTES` only when a client must send a larger encoded request.
 
-After an eligible failure persists for 20 seconds, the Codex breaker routes the turn to `qwen3.8:27b-obliterated` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
+After an eligible failure persists for 20 seconds, the Codex breaker routes the turn to `qwen3.5:4b-64k` through Ollama. Transport failures and `429,500,502,503,504,529` responses count. HTTP `400`, `401`, and `403` never count, so a malformed request or broken login remains visible instead of being hidden by Qwen.
 
 Cloudflare can also lose a valid provider route and return a bare `404` with a
 `cf-ray` header. Backdoor counts that unstructured response as outage evidence
@@ -692,12 +709,10 @@ Hybrid failover is opt-in, and the quick-start paths (`./backdoor`, `run.sh`) do
 1. **Run the router in hybrid mode.** `ROUTER_MODE=hybrid PORT=8083` in the service environment (the committed launchd example at `deploy/com.screddy.backdoor-router.plist.example` carries the full set).
 2. **Build the failover tiers.** They are custom Ollama tags, not registry pulls:
    ```bash
-   ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M   # ~17 GB
-   ollama create qwen3.8:27b-obliterated -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
    ollama pull qwen3.5:4b
-   ollama create qwen3.5:4b-256k -f modelfiles/qwen3.5-4b-256k.Modelfile
+   modelfiles/build.sh qwen3.5-4b-64k.Modelfile qwen3.5-4b-256k.Modelfile
    ```
-   The custom Modelfile is required: the source GGUF's template lacks the Ollama tool contract, so an unmodified pull 400s on every request that carries tools. Without the tags the breaker opens and every failover fails at Ollama — which reads as a broken agent rather than a missing model.
+   Missing tags make failover fail at Ollama even when the breaker opens.
 3. **Put a session in the path.** `ANTHROPIC_BASE_URL=http://127.0.0.1:8083 claude` is the simple form and costs you Remote Control; the forward proxy below keeps it.
 
 To test without cutting the network: set `ANTHROPIC_UPSTREAM=http://127.0.0.1:9` on the router so every upstream connection is refused, then send two turns ~20 seconds apart. The second turn answers locally, and `proxy.log` shows `⇢ FAILOVER`.
@@ -751,7 +766,7 @@ Deploying the router is a fast-forward and a restart, and on 2026-09-03 doing it
 - it verifies the **new** code is running by finding the startup marker in the log written *after* the restart, not merely that something restarted
 - it rolls back and restarts again automatically when that verification fails
 
-The restart itself is not in the file. It arrives in `RESTART_CMD`, supplied by whoever runs the deploy, because operating this machine's live control plane is a human's job and the repo should not encode one host's launch agent.
+The restart itself is not in the file. It arrives in `RESTART_CMD`, supplied by whoever runs the deploy, for this legacy manual deployment path. QA Assist uses the separate controller below.
 
 ```bash
 RESTART_CMD='<restart the router>' scripts/deploy-router.sh <service-checkout-dir> [ref]
@@ -1033,9 +1048,9 @@ must copy that `SoftResourceLimits` block, switch `ProgramArguments` to
 `PORT` environment keys shown in the example. The startup-safe launcher creates bounded logging
 before uvicorn imports the application. Replace every `/Users/you` placeholder before installing
 the file. `kickstart` does not reload a changed plist. Boot out the loaded definition, bootstrap
-the file. Applying a changed launch agent is a live control-plane operation. Do it only from an
-independent Terminal session with direct-cloud rescue access and a rollback copy already in place.
-After the user-operated change, inspect the applied limit with:
+the file. Applying a changed launch agent is a live control-plane operation. Apply it through the QA controller or an
+independent Terminal session with direct-cloud rescue access and a rollback copy.
+After deployment, inspect the applied limit with:
 
 ```bash
 launchctl print gui/$(id -u)/com.screddy.backdoor-router | grep -A3 resource-limits
@@ -1139,7 +1154,7 @@ Bare mode attacks the other term. Before the request goes to Ollama, Backdoor dr
 answer in 3.6s on qwen3.5:27b, ending in a real tool call
 ```
 
-That is what lets the default tier be a 27B rather than a 4B without repeating the prefill regression. The two changes belong together: switch bare mode off and leave the 27B in place, and you rebuild the original failure on a much larger model.
+Bare mode also keeps explicit 27B sessions within their smaller window. The two changes belong together: switch bare mode off and leave the 27B in place, and you rebuild the original failure on a much larger model.
 
 **Built-in tools survive; MCP tools do not.** `Read`, `Edit`, `Bash`, `Glob`, `Grep`, `WebSearch`, and `WebFetch` are Claude Code tools rather than MCP integrations, so bare mode keeps them. A deliberate local Qwen session can search or fetch when the Mac has internet access, and Bash can call public HTTP APIs with `curl`. If a network call fails, Qwen continues with local tools. True breaker failover gets an explicit offline prompt because the breaker opens only after the connectivity probe confirms that the host cannot reach the internet.
 
@@ -1176,9 +1191,8 @@ Set it only on profiles whose windows assume a stripped prompt. The 64K
 
 | `/model` name | Profile | Model | Window | Stripped |
 |---|---|---|---|---|
-| `qwen` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | 32K | yes |
-| `qwen38-obliterated` | `local-qwen38-obliterated` | the same tier, named directly | 32K | yes |
-| `qwen38-action` | `local-qwen38-action` | action-tuned MLX rollback | 64K | yes |
+| `qwen` | `local-qwen4b` | `qwen3.5:4b-64k` | 64K | yes |
+| `Qwen 27b`, `qwen-27b` | `local-qwen38-obliterated` | `qwen3.8:27b-obliterated` | 32K | yes |
 | `qwen-fast` | `local-fast` | `qwen3.5:4b-64k` | 64K | no |
 
 The `qwen-9b` and `qwen-stock` routes were removed with the local Qwen 3.5 9B
@@ -1267,7 +1281,7 @@ Every launcher needs its own client policy because Claude Code and Codex calcula
 
 The mid-session Claude path cannot change its process environment after `/model` runs. Its router guard supplies the hard boundary. Known Claude model IDs keep their native compaction policy, and cloud output remains uncapped.
 
-The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The default route now uses the OBLITERATED Q4_K_M GGUF. Its OpenAI endpoint returned an ordinary answer alongside internal reasoning in live compaction testing. The MLX checkpoint remains available as `qwen38-action` for measured action-contract work.
+The backend must also return usable summary text. On 2026-08-28 the action-tuned MLX tier reached Claude Code's client limit at 32K. The compact request itself was small: 994 backend tokens. MLX generated nine tokens, all inside its inline thinking block. `PROVIDER_STRIP_INLINE_THINKING=true` removed those tokens and Claude Code received an empty summary twice. The explicit 27B route uses the OBLITERATED Q4_K_M GGUF. Its OpenAI endpoint returned an ordinary answer alongside internal reasoning in live compaction testing. The MLX checkpoint remains available through the `local-qwen38-action` profile for manual administration.
 
 #### Memory is the other half of a small window
 
@@ -1304,7 +1318,7 @@ The runtime interlock follows the same placement rule. Profiles that manage a la
 
 The general lesson: `router_mode` is a real fork in this file, and a guard is only as good as the branch it sits in. Verify a fix against the mode the failure actually used, not the one you were reading when you wrote it.
 
-Making the 27B the deliberate default also keeps it resident far more often, which feeds straight into the arithmetic in the next section. This Qwen3.8 GGUF measures **17GB** resident and a fusion council is roughly 21GB. They do not both fit under this host's wired-memory ceiling, and Ollama caps by model count, so nothing upstream refuses the combination.
+Explicit 27B sessions still need the memory controls in the next section. This Qwen3.8 GGUF measures **17GB** resident and a fusion council is roughly 21GB. They do not both fit under this host's wired-memory ceiling, and Ollama caps by model count, so nothing upstream refuses the combination.
 
 ### Keeping the 27B warm without starving the council
 
@@ -1324,9 +1338,10 @@ The `qwen` wrapper reaches Ollama by a third path and never reads this table. It
 
 | Command | Profile | Model | Why |
 |---|---|---|---|
-| `qwen`, `qwen lean` | `local-qwen38-obliterated` | Qwen3.8-27B OBLITERATED Q4_K_M (GGUF) | `--bare` keeps the prompt small and the OpenAI endpoint returns textual compaction output |
-| `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | the harness runs about 29K tokens and needs the wider window |
-| `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | the escape hatch when the heavy tier costs more GPU than the task is worth |
+| `qwen`, `qwen lean` | `local-qwen4b` | `qwen3.5:4b-64k` | default lean session |
+| `qwen 27b` | `local-qwen38-obliterated` | `qwen3.8:27b-obliterated` | explicit 27B request |
+| `qwen full` | `local-qwen35` | `qwen3.5:4b-64k` | full harness |
+| `qwen fast` | `local-fast` | `qwen3.5:4b-64k` | existing fast profile |
 
 The wrapper prints the tier it resolved at launch. Read that line if you are unsure which model you got.
 
@@ -1613,9 +1628,9 @@ The second check is the one that catches the old MLX failure: that build sat at 
 
 Measure, do not compute. The first estimate for the 14B was 16GB and the real number was 20GB, because the arithmetic omitted the compute graph. `ollama ps` reports resident size; `ollama list` reports on-disk size and will mislead you by roughly half.
 
-### The default local brain is `qwen38-obliterated`
+### The explicit 27B model is `qwen-27b`
 
-The default `qwen` route now runs `OBLITERATUS/Qwen3.8-27B-OBLITERATED` Q4_K_M through Ollama's GGUF engine. It uses the same standalone path as the earlier stock `qwen3.8:27b-bare` tier: a 32,768-token context clamp, bare client prompt, and no separately managed MLX server. The source model card reports 82.3% MMLU against stock's 84.5%, 20/20 tested cyber and code tasks, and 7/8 advanced agent tasks. Those are publisher measurements, not local verification.
+The explicit `qwen-27b` route runs `OBLITERATUS/Qwen3.8-27B-OBLITERATED` Q4_K_M through Ollama's GGUF engine. It uses the same standalone path as the earlier stock `qwen3.8:27b-bare` tier: a 32,768-token context clamp, bare client prompt, and no separately managed MLX server. The source model card reports 82.3% MMLU against stock's 84.5%, 20/20 tested cyber and code tasks, and 7/8 advanced agent tasks. Those are publisher measurements, not local verification.
 
 Install and build the local tag:
 
@@ -1642,11 +1657,11 @@ The 27B GGUF and the 27B MLX server cannot share memory safely. Before the route
 
 The `qwen` wrapper performs the same MLX stop check before warming Ollama. An absent MLX server is the normal state, so that check stays silent. The launch banner names the selected Ollama model and remains the source of truth for the session. A failed MLX stop still prints an error and blocks the unsafe warmup.
 
-### The action-tuned rollback is `qwen38-action`
+### The manual MLX profile is `local-qwen38-action`
 
 Qwen3.8-27B Action-Abliterated comes from `ajsai47/qwen38-action-abliterated-research`: a pinned Qwen3.8-27B checkpoint trained on action contracts, then put through a bounded refusal-direction ablation. Its model card records a 92.5% HarmBench direct-request attack-success rate, and StrongREJECT assistance on forbidden prompts at 87.22% against the base model's 10.54%. Capability held flat, with 62.50% on a frozen 280-item MMLU-Pro sample, matching upstream.
 
-From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. `qwen38-action` still names this checkpoint directly.
+From 2026-08-25 through 2026-08-28 it backed `/model qwen`, the wrapper's lean mode, and cloud-to-local failover. The empty compaction response moved those unattended paths to the GGUF tier. The `local-qwen38-action` profile retains this checkpoint for manual administration.
 
 Read the model card before you lean on it. Reduced refusal is not permission, and it says so itself: the card puts unsupervised execution with destructive, financial, credential, or otherwise high-impact tools out of scope, and this wiring puts the model on exactly those paths. Failover fires with nobody watching, and `local-worker` gets dispatched with Bash and Write. Scoped tool permissions and reading what an unattended agent actually did are the controls now, because the model is no longer one of them.
 
@@ -2060,10 +2075,9 @@ uv run pytest -q --tb=no tests/<file>::<test> 2>&1 | tail -1
 echo "EXPECTED-RED: fails without the fix, as designed"
 ```
 
-This repo is the **source**. The live control plane is operated by hand from an
-independent Terminal session, and machine hooks reject agent attempts to touch it —
-see `~/.claude/CLAUDE.md`, section "Backdoor live-control boundary". Agent
-instructions live in `CLAUDE.md`.
+This repo is the **source**. QA Assist may merge and deploy through the controlled
+release process below. Machine hooks block ad hoc live changes. Agent instructions
+live in `CLAUDE.md`.
 
 ## Memory: claude-mem replica (since 2026-09-04)
 
@@ -2098,3 +2112,40 @@ The suite is the gate: failover, memory recall, the working set, tier serializat
 provider edges. The count is deliberately not quoted here — it moves every time a regression gets
 cover, and a number in prose only ever goes stale. Nothing here needs a secret, so the workflow runs with `contents: read` and no
 environment.
+
+
+## QA Assist merge and production deployment
+
+Shawn authorizes QA Assist to merge verified PRs and promote their exact merge
+commits to production. `.shawns-qa.toml` enables this policy. A separate Mac
+LaunchAgent, `com.screddy.backdoor-deployer`, polls GitHub Deployments once per
+minute using the existing `gh` login. It needs no inbound SSH connection.
+
+Install the reviewed controller from a source checkout:
+
+```bash
+python3 scripts/install-qa-deployer.py
+```
+
+The controller accepts only production requests created by `shawns-qa-assist[bot]`
+for a merged PR whose commit remains at the head of main and passes GitHub's
+`verify` check. It requires a clean detached service checkout, the expected router
+LaunchAgent, installed 4B model tags, and a quiet window. It does not pull or load
+models. It applies the frozen dependencies and the two 4B environment overrides,
+then reloads the router. `/health` must report the exact commit, default 4B, failover
+4B, Codex 4B, and explicit obliterated 27B before it posts success to GitHub.
+
+The controller stores a private recovery journal and previous LaunchAgent under
+`~/.local/share/backdoor-deployer`. A failed or interrupted deployment restores the
+previous commit, dependencies, and LaunchAgent. An uncertain GitHub receipt is
+retried without repeating the deployment. Its GitHub requests bypass proxy
+environment variables so recovery can continue while the router is down.
+
+A quiet window reduces interruption risk; requests can arrive between the check
+and reload. Existing router versions lack an active-request count, so the first
+upgrade also relies on ten seconds without log activity. Later releases include
+streaming requests in the count. Socket activation on 8083/8084 remains prohibited.
+Ad hoc agent mutations of the live router remain blocked by machine hooks.
+
+Validation: `uv run pytest -q` includes deployment authorization, recovery receipt,
+and streaming request-count tests. Tests never operate launchd or load local models.

@@ -12,28 +12,24 @@ of the internet may still work; some networks can reach ChatGPT while blocking
 Anthropic's edge. HTTP 429, 529, 401 and 403 responses still get relayed because
 the provider answered and the caller needs to see that response.
 
-## Live-control boundary — read before running anything
+## Live-control policy
 
-This repo is the **source**, and the source is where agents work. You may inspect
-the live router, edit code here, run tests, and open PRs.
+Shawn authorizes **Shawn's QA Assist** to merge verified PRs and deploy their
+exact merge commits through `scripts/qa_deploy.py`, the independent Mac release
+controller. `.shawns-qa.toml` enables merge and production promotion.
 
-You may **not** touch the live control plane. Shawn operates it himself from an
-independent Terminal session with a rescue path open. Machine PreToolUse hooks
-enforce this, and they will reject a command or a file edit that merely *names* the
-protected artifacts — including this file, which is why the specifics are not
-restated here.
+The controller accepts production GitHub Deployments from `shawns-qa-assist[bot]`
+only. It checks the merged PR, current main commit, successful native CI, clean
+detached service checkout, installed model tags, and a quiet router before applying
+the release. It preserves the previous commit and LaunchAgent, verifies the running
+revision and model routes, and restores the previous release if verification fails.
+It uses direct GitHub connections so router failure cannot cut off its recovery path.
 
-**That section of `~/.claude/CLAUDE.md` no longer exists.** It was removed on
-2026-09-10 along with the router itself, so this file spent that time pointing
-agents at safety guidance that was not there — and "go read the rules" failing
-silently is worse than having no pointer at all. Until a live router exists again
-and the machine rules describe it, treat the boundary as: **inspect freely, change
-nothing that is running.** Anything that starts, stops, restarts, deploys to, or
-repoints a live router or its launchd job is Shawn's to run, from his own session.
-
-If a tool call comes back refused with a message about the live control plane, that
-is this guard doing its job. Do not try to route around it; hand the operation to
-Shawn.
+Agents may maintain and install this controller. Ad hoc edits to the live checkout,
+router LaunchAgent, dependencies, and router lifecycle remain prohibited. Changes
+to that state must use the reviewed QA controller, or Shawn's independent Terminal
+session. Keep the machine hooks enabled. Do not add socket activation on 8083/8084.
+If a hook rejects an operation, report the rejection; do not bypass it.
 
 ## Stack
 
@@ -72,34 +68,26 @@ The count proves what the names prove and carries no sentence to invert.
 
 ## Model tags are custom builds, not pulls
 
-The failover tiers do not exist on any registry. `local-qwen38-obliterated` wants
-`qwen3.8:27b-obliterated`, and the 256K fallback wants `qwen3.5:4b-256k`; both are
-built locally:
+Default Qwen and both automatic failover paths use Qwen3.5 4B. The hybrid
+aliases `Qwen 27b` and `qwen-27b`, or the wrapper command `qwen 27b`, select
+the optional 27B GGUF. Legacy `qwen38-*` aliases no longer select local models.
+
+Build the default and wide-context 4B tags locally:
 
 ```bash
-# 27B failover tier
-ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M   # ~17 GB
-ollama create qwen3.8:27b-obliterated \
-  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
-
-# 256K escalation tier (pick_failover_profile sends oversized sessions here)
 ollama pull qwen3.5:4b
-modelfiles/build.sh qwen3.5-4b-256k.Modelfile                  # -> qwen3.5:4b-256k
+modelfiles/build.sh qwen3.5-4b-64k.Modelfile qwen3.5-4b-256k.Modelfile
 ```
 
-The 27B's custom Modelfile is not optional: the source GGUF's template carries no
-tool contract, so Ollama answers 400 to any request carrying tools without it.
-Build the 256K tag through `modelfiles/build.sh`, not a raw `ollama create` —
-the script bakes in the shared system prompt a plain create would omit.
+Claude failover selects `local-qwen4b` up to 54K estimated input tokens and
+`local-failover-256k` above that. Codex uses the 64K tag with its existing 32K
+request budget. Existing live environment overrides need updating alongside
+the source through the QA controller described above.
 
-Build **both**. With only the 27B, the escalation path 404s on exactly the long
-sessions that needed a wider window.
-
-**Why this matters more than it looks.** Without the tag the breaker opens
-correctly, the request routes to Ollama exactly as designed, and Ollama 404s. The
-symptom is indistinguishable from "failover is broken", and the router log shows a
-clean handoff into a model that is not there. If failover appears not to work,
-check `ollama list` before reading any other code.
+For explicit 27B use, build `qwen3.8:27b-obliterated` with
+`modelfiles/bare/qwen3.8-27b-obliterated.Modelfile`; it supplies the tool
+contract missing from the source GGUF template. The MLX profile remains a
+manual administration option, outside model aliases and automatic failover.
 
 The general rule, for the next tag anyone adds: a name that resolves and builds
 a route but was never pulled fails at the provider, which reads as a broken

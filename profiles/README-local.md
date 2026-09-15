@@ -5,7 +5,7 @@ model**, completely offline. No internet needed once the models are downloaded.
 
 ```
 Claude Code  ->  backdoor proxy (:8082)  ->  Ollama (:11434)  ->  local model
-   (UI +              (translates              (serves the         (Qwen3.8 27B
+   (UI +              (translates              (serves the         (Qwen3.5 4B
     harness)           Anthropic<->OpenAI)      open weights)        on-device)
 ```
 
@@ -15,16 +15,17 @@ Claude Code plugin — the only thing that changes is the model underneath.
 ## One command
 
 ```bash
-qwen            # Lean default on Qwen3.8 27B OBLITERATED at 32K.
-qwen lean       # Same 27B lean route, stated explicitly.
+qwen            # Lean default on Qwen3.5 4B at 64K.
+qwen lean       # Same 4B lean route.
+qwen 27b        # Explicit Qwen3.8 27B OBLITERATED at 32K.
 qwen fast       # Lean mode on Qwen3.5 4B @ 64K (snappiest local brain).
 qwen full       # Full harness on Qwen3.5 4B @ 64K.
 ```
 
 (`claude-local` is a symlink alias for `qwen` if you prefer the longer name.)
 
-The lean prompt makes the 27B practical inside its 32K window. The 4B keeps the
-full-harness and long-context escape paths responsive. MCP servers attach per
+The default and failover routes use 4B. Select 27B with `qwen 27b` or
+`/model Qwen 27b` (`/model qwen-27b` also works). MCP servers attach per
 request so their schemas do not consume the default context.
 
 `qwen` makes sure the Ollama daemon is up, confirms the model is pulled,
@@ -43,32 +44,29 @@ api.anthropic.com** (auth headers, SSE, compression untouched).
 shells (health-guarded: if the router is down, new shells fall back to direct
 Anthropic). So in any normal terminal Claude Code session:
 
-    /model qwen        # switch this session to the local Qwen3.8 27B
+    /model qwen        # switch this session to the local Qwen3.5 4B
     claude --model qwen -p "..."   # one-shot
 
-**Cloud→local failover (2026-07-04):** if the real Anthropic API stops working
-(network gone, usage limit hit, overloaded — 3 consecutive failures within
-2 min), the router opens a circuit breaker and serves passthrough
-`/v1/messages` traffic from a local model instead of failing, so the
-in-flight session keeps going. It probes upstream every 60s and switches
-back automatically; macOS notifications fire on both transitions. Auth
-failures (401/403) stay visible on purpose — they mean a broken credential,
-not a broken network.
+**Cloud→local failover:** after a sustained transport outage to Anthropic,
+the router serves `/v1/messages` through local 4B. It probes upstream every
+60 seconds and returns to cloud when connectivity recovers. HTTP responses
+such as 429, 529, 401 and 403 remain visible to Claude's caller.
+Codex has a separate breaker and also defaults to `qwen3.5:4b-64k`.
 
 **Size-aware tier (the ladder).** The local model is picked by the
 failed-over session's estimated input tokens, so a big session keeps its
 context instead of being truncated to fit the 4B:
 
-| session input | tier | model | ~load @NUM_PARALLEL=4 |
-|---|---|---|---|
-| ≤ 27K | `local-qwen38-obliterated` | qwen3.8:27b-obliterated | ~17GB |
-| > 27K | `local-failover-256k` | qwen3.5:4b-256k | ~13GB |
+| session input | profile | model |
+|---|---|---|
+| ≤ 54K | `local-qwen4b` | `qwen3.5:4b-64k` |
+| > 54K | `local-failover-256k` | `qwen3.5:4b-256k` |
 
-The router strips the harness before sizing. Most sessions fit the stronger
-27B; the 4B 256K tag retains transcripts that outgrow its 32K window. Tune via env: `FAILOVER_TO_LOCAL=0`
-disables; `FAILOVER_THRESHOLD` / `FAILOVER_PROBE_SECONDS` adjust; ladder
-bounds live in `FAILOVER_LADDER` (config.py). Code: `src/proxy/failover.py`
-+ routes + profiles `local-failover-{128k,256k}.env`.
+The router strips the harness and bounds eligible history before escalation.
+Build both tags with `modelfiles/build.sh qwen3.5-4b-64k.Modelfile
+qwen3.5-4b-256k.Modelfile`. `FAILOVER_TO_LOCAL=0` disables Claude failover;
+`FAILOVER_THRESHOLD` and `FAILOVER_PROBE_SECONDS` control its breaker.
+
 
 Notes:
 - The offline `qwen` wrapper still pins :8082 explicitly — unaffected.

@@ -620,15 +620,16 @@ async def _serve_local(
     await _hold_tier(settings)
     response: httpx.Response | None = None
     try:
-        resolved = await mlx_admin.resolve_profile("local-qwen38-obliterated")
-        if resolved != "local-qwen38-obliterated":
-            logger.warning(
-                "Codex local route id=%s exact Qwen runtime unavailable",
-                correlation_id,
-            )
-            raise HTTPException(
-                status_code=503, detail="Local Qwen runtime unavailable"
-            )
+        if settings.codex_local_model == "qwen3.8:27b-obliterated":
+            resolved = await mlx_admin.resolve_profile("local-qwen38-obliterated")
+            if resolved != "local-qwen38-obliterated":
+                logger.warning(
+                    "Codex local route id=%s exact Qwen runtime unavailable",
+                    correlation_id,
+                )
+                raise HTTPException(
+                    status_code=503, detail="Local Qwen runtime unavailable"
+                )
 
         breaker.note_claim(_ollama_openai_base(settings), settings.codex_local_model)
         if not breaker.open:

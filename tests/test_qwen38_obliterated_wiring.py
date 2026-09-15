@@ -1,12 +1,4 @@
-"""The default Qwen route uses the standalone obliterated GGUF tier.
-
-Claude Code compaction exposed a backend-specific failure in the MLX action
-model: its summary request generated only an inline thinking block, which the
-proxy stripped to an empty response.  The stock Qwen3.8 GGUF path did not have
-that failure.  These tests pin the replacement to Ollama's llama.cpp engine,
-keep the action-tuned MLX model reachable by its explicit alias, and retain the
-28K escalation guard used by long-running local sessions.
-"""
+"""Explicit 27B selection retains its tool template and memory interlocks."""
 
 import os
 import shutil
@@ -32,18 +24,19 @@ def _settings_lines(profile: str) -> list[str]:
     return [line for line in env.splitlines() if line and not line.startswith("#")]
 
 
-def test_default_qwen_route_uses_the_obliterated_gguf() -> None:
-    assert MODEL_ROUTES["qwen"] == PROFILE
-    assert MODEL_ROUTES["qwen38-obliterated"] == PROFILE
+def test_explicit_27b_route_uses_the_obliterated_gguf() -> None:
+    assert MODEL_ROUTES["qwen 27b"] == PROFILE
+    assert MODEL_ROUTES["qwen-27b"] == PROFILE
 
 
-def test_action_tuned_mlx_model_remains_an_explicit_rollback() -> None:
-    assert MODEL_ROUTES["qwen38-action"] == ACTION_PROFILE
+def test_legacy_aliases_cannot_select_a_27b_model() -> None:
+    assert "qwen38-action" not in MODEL_ROUTES
+    assert "qwen38-obliterated" not in MODEL_ROUTES
 
 
-def test_normal_failover_uses_the_obliterated_gguf() -> None:
-    assert Settings().failover_profile == PROFILE
-    assert FAILOVER_LADDER[0] == (27_000, PROFILE)
+def test_normal_failover_uses_4b() -> None:
+    assert Settings().failover_profile == "local-qwen4b"
+    assert FAILOVER_LADDER[0] == (54_000, "local-qwen4b")
 
 
 def test_profile_uses_local_ollama_without_thinking_stripping() -> None:
@@ -91,7 +84,7 @@ def test_ollama_27b_profile_is_memory_exclusive_with_mlx() -> None:
     assert PROFILE in exclusive
 
 
-def test_qwen_wrapper_defaults_to_the_obliterated_profile_at_32k() -> None:
+def test_explicit_27b_wrapper_retains_32k_budget() -> None:
     wrapper = (ROOT / "qwen").read_text()
     assert 'PROFILE="local-qwen38-obliterated"' in wrapper
     assert "local-qwen38-obliterated) QWEN_CTX=32000" in wrapper
@@ -106,7 +99,7 @@ def test_qwen_wrapper_keeps_xhigh_output_reservation_inside_the_32k_window() -> 
 
 def test_qwen_wrapper_pins_client_metadata_to_the_qwen_alias() -> None:
     wrapper = (ROOT / "qwen").read_text()
-    assert "EXTRA_ARGS+=(--model qwen)" in wrapper
+    assert 'EXTRA_ARGS+=(--model "$QWEN_ALIAS")' in wrapper
 
 
 def test_bd_claude_applies_the_same_client_budget_to_qwen_profiles() -> None:

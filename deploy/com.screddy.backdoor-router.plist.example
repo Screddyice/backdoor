@@ -49,7 +49,7 @@
         <key>CODEX_LOCAL_RESPONSES_URL</key>
         <string>http://127.0.0.1:11434/v1/responses</string>
         <key>CODEX_LOCAL_MODEL</key>
-        <string>qwen3.8:27b-obliterated</string>
+        <string>qwen3.5:4b-64k</string>
         <key>CODEX_LOCAL_TOOLS</key>
         <string>local</string>
         <key>MEMORY_DB_PATH</key>

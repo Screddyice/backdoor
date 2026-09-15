@@ -1809,8 +1809,17 @@ async def count_tokens(request: Request, settings: Settings = Depends(get_settin
 
 
 @router.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health(request: Request, settings: Settings = Depends(get_settings)):
+    from .release_health import REVISION
+    from .config import load_profile_settings, resolve_model_route
+    return {
+        "status": "ok", "revision": REVISION,
+        "active_requests": getattr(request.app.state, "active_requests", 0),
+        "default_qwen_model": load_profile_settings(resolve_model_route("qwen")).provider_model,
+        "explicit_27b_model": load_profile_settings(resolve_model_route("Qwen 27b")).provider_model,
+        "failover_model": load_profile_settings(settings.failover_profile).provider_model,
+        "codex_local_model": settings.codex_local_model,
+    }
 
 
 # Catch-all LAST: in hybrid mode any endpoint we don't handle locally
