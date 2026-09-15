@@ -22,8 +22,8 @@ FALLBACK_PROFILE = "local-fast"
 PROFILES = Path(__file__).resolve().parents[1] / "profiles"
 
 
-def test_reachable_by_its_own_name_too() -> None:
-    assert MODEL_ROUTES["qwen38-action"] == ACTION_PROFILE
+def test_mlx_is_not_a_model_alias() -> None:
+    assert ACTION_PROFILE not in MODEL_ROUTES.values()
 
 
 def test_removed_9b_routes_are_not_reachable() -> None:

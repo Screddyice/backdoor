@@ -321,12 +321,14 @@ async def test_profile_mode_leaves_the_harness_alone_when_route_bare_is_off(monk
     """route_bare is opt-in per profile; a wide tier keeps its harness."""
     recorder = RecordingClient()
     monkeypatch.setattr(routes, "get_provider_client", lambda: recorder)
+    monkeypatch.setattr(routes, "_get_profile_client", lambda *_: recorder)
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
         router_mode="profile",
         route_bare=False,
         provider_base_url="http://localhost:11434/v1",
-        provider_model="qwen3.8:27b-obliterated",
+        provider_model="qwen3.5:4b-256k",
+        provider_context_tokens=262144,
         qwen_memory=False,
     )
     try:
@@ -335,3 +337,23 @@ async def test_profile_mode_leaves_the_harness_alone_when_route_bare_is_off(monk
         assert HARNESS_SYSTEM[:200] in json.dumps(recorder.payload)
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("alias,model", [
+    ("qwen", "qwen3.5:4b-64k"),
+    ("Qwen", "qwen3.5:4b-64k"),
+    ("Qwen 27b", "qwen3.8:27b-obliterated"),
+    ("qwen-27b", "qwen3.8:27b-obliterated"),
+])
+async def test_model_selection_reaches_provider(routed_app, alias, model):
+    app, recorder, _ = routed_app
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        router_mode="hybrid", qwen_memory=False,
+    )
+    response = await _post(app, {
+        "model": alias,
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 32,
+    })
+    assert response.status_code == 200
+    assert recorder.payload["model"] == model

@@ -522,20 +522,14 @@ def test_unwritable_state_path_does_not_break_the_breaker():
 # ── Failover ladder (size → local tier) ──────────────────────────────────────
 
 
-def test_ladder_normal_session_gets_the_strong_tool_capable_tier():
-    """The common case after bare-mode stripping: a small prompt, so the
-    strongest local model rather than the widest-window one."""
-    assert pick_failover_profile(0) == "local-qwen38-obliterated"
-    assert pick_failover_profile(27_000) == "local-qwen38-obliterated"
-    assert pick_failover_profile(27_001) == "local-failover-256k"
+def test_ladder_normal_session_uses_4b():
+    assert pick_failover_profile(0) == "local-qwen4b"
+    assert pick_failover_profile(54_000) == "local-qwen4b"
+    assert pick_failover_profile(54_001) == "local-failover-256k"
 
 
-def test_ladder_oversize_session_falls_back_to_the_wide_4b():
-    """Bare mode bounds the harness but not the conversation. A transcript that
-    still overflows the 27B's 32K window must keep its context on the 256K 4B —
-    a weaker model that remembers the session beats a stronger one that
-    truncates it."""
-    assert pick_failover_profile(28_001) == "local-failover-256k"
+def test_ladder_oversize_session_uses_wide_4b():
+    assert pick_failover_profile(100_000) == "local-failover-256k"
     assert pick_failover_profile(10_000_000) == "local-failover-256k"
 
 

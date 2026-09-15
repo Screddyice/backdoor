@@ -555,7 +555,7 @@ async def test_eligible_cloud_failure_uses_fresh_memory_backed_qwen_request(
     assert len(local_calls) == 1
     local_payload = json.loads(local_calls[0].content)
     rendered = json.dumps(local_payload)
-    assert local_payload["model"] == "qwen3.8:27b-obliterated"
+    assert local_payload["model"] == "qwen3.5:4b-64k"
     assert "active task" in rendered
     assert "Replica continuity marker" in rendered
     assert "bounded result" in rendered
@@ -568,7 +568,7 @@ async def test_eligible_cloud_failure_uses_fresh_memory_backed_qwen_request(
     assert breaker.open is True
     assert claims == [
         (
-            "qwen3.8:27b-obliterated",
+            "qwen3.5:4b-64k",
             {"source": "codex-failover", "ttl_seconds": 600},
         )
     ]
@@ -1574,7 +1574,7 @@ async def test_local_request_reserves_qwen_before_its_stream_is_iterated(
     assert await anext(stream) == SSE
     await stream.aclose()
     assert unloaded == [
-        ("http://127.0.0.1:11434/v1", "qwen3.8:27b-obliterated")
+        ("http://127.0.0.1:11434/v1", settings.codex_local_model)
     ]
 
 
@@ -1849,3 +1849,33 @@ async def test_the_codex_local_path_hands_its_tier_back():
     assert codex_routes._held_tier is None
     assert not tier_lock.waiting(*held), "the Codex path kept the tier locked"
     tier_lock.reset()
+
+
+async def test_default_4b_failover_does_not_supervise_27b_runtime(
+    codex_app, monkeypatch, tmp_path
+):
+    _, settings, _ = codex_app
+    settings.qwen_memory = False
+    breaker = one_shot_breaker(tmp_path)
+    breaker.record_failure("HTTP 503")
+    sent = []
+
+    async def forbidden(_profile):
+        raise AssertionError("4B must not start or stop the 27B runtime")
+
+    async def prepare(payload, _settings):
+        return payload
+
+    async def send(payload, _settings):
+        sent.append(payload)
+        return httpx.Response(200, stream=BytesStream(SSE))
+
+    monkeypatch.setattr(codex_routes.mlx_admin, "resolve_profile", forbidden)
+    monkeypatch.setattr(codex_routes, "prepare_codex_external_context", prepare)
+    monkeypatch.setattr(codex_routes, "_send_local", send)
+    response = await codex_routes._serve_local(
+        json.loads(FIXTURE.read_text()), settings, breaker, "4b-default", 0.0,
+    )
+    async for _ in response.body_iterator:
+        pass
+    assert sent[0]["model"] == "qwen3.5:4b-64k"

@@ -112,6 +112,7 @@ async def test_failed_over_request_arrives_stripped(offline_app):
 
     assert resp.status_code == 200
     assert recorder.payload is not None, "request never reached the local model"
+    assert recorder.payload["model"] == "qwen3.5:4b-64k"
 
     sent = json.dumps(recorder.payload)
     # The harness system prompt must not be in what the local model receives.
@@ -178,7 +179,7 @@ async def test_stripped_size_picks_the_tier(offline_app):
     stripped = count_messages(bare.messages, bare.system, bare.tools)
 
     assert pick_failover_profile(raw) == "local-failover-256k"       # the 4B
-    assert pick_failover_profile(stripped) == "local-qwen38-obliterated"
+    assert pick_failover_profile(stripped) == "local-qwen4b"
 
 
 # --- deliberate `/model qwen` must obey the ladder too ---------------------
@@ -216,7 +217,7 @@ def _route_request(turns: int) -> dict:
     is what a long-running `qwen` session actually becomes."""
     turn = "Investigate how we can scrape the community directory. " * 400
     return {
-        "model": "qwen",
+        "model": "qwen-27b",
         "system": HARNESS_SYSTEM,
         "tools": [{"name": "Bash", "description": "run a command", "input_schema": {}}],
         "messages": [

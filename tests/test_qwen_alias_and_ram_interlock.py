@@ -34,7 +34,7 @@ def test_model_qwen_resolves_however_it_is_capitalised(typed):
 
 
 @pytest.mark.parametrize(
-    "typed", ["Qwen-Fast", "Qwen38-Action", "Qwen38-Obliterated"]
+    "typed", ["Qwen-Fast", "Qwen 27B", "Qwen-27B"]
 )
 def test_the_other_local_tiers_are_case_insensitive_too(typed):
     assert resolve_model_route(typed) == MODEL_ROUTES[typed.strip().lower()]

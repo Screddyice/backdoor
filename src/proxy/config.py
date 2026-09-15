@@ -82,10 +82,8 @@ class Settings(BaseSettings):
     # (see FAILOVER_LADDER), measured AFTER bare-mode stripping — the size that
     # decides the tier is the size the local model actually has to prefill.
     failover_to_local: bool = True
-    # The default 27B is an Ollama tier and loads on demand. The optional MLX
-    # action checkpoint has its own runtime supervisor and falls back to the
-    # 4B fast profile when its launchd service cannot start.
-    failover_profile: str = "local-qwen38-obliterated"  # default tier
+    # Qwen 4B handles ordinary local sessions and unattended failover.
+    failover_profile: str = "local-qwen4b"
     # Count from the first transport failure. Elapsed outage time below is the
     # safety gate, so concurrent retries in one instant cannot claim the GPU.
     failover_threshold: int = DEFAULT_FAILOVER_THRESHOLD
@@ -172,7 +170,7 @@ class Settings(BaseSettings):
     # spends only what the active turn left unused, so it can never push the
     # allocation past the window. 0 restores the active-turn-only behaviour.
     codex_history_budget_tokens: int = Field(default=12_000, ge=0)
-    codex_local_model: str = "qwen3.8:27b-obliterated"
+    codex_local_model: str = "qwen3.5:4b-64k"
     codex_local_responses_url: str = "http://127.0.0.1:11434/v1/responses"
     codex_local_tools: str = "local"
     codex_failover_to_local: bool = True
@@ -406,34 +404,18 @@ def resolve_model_route(model: str | None) -> str | None:
 
 
 MODEL_ROUTES: dict[str, str] = {
-    "qwen": "local-qwen38-obliterated",  # Qwen3.8-27B OBLITERATED GGUF on Ollama
-    "qwen-fast": "local-fast",    # qwen3.5:4b-64k — lean
-    "qwen38-obliterated": "local-qwen38-obliterated",
-    # Keep the action-tuned MLX checkpoint reachable as an explicit rollback.
-    "qwen38-action": "local-qwen38-action",
+    "qwen": "local-qwen4b",
+    "qwen-fast": "local-fast",
+    "qwen 27b": "local-qwen38-obliterated",
+    "qwen-27b": "local-qwen38-obliterated",
 }
 
 
-# Cloud→local failover ladder: pick the local profile whose context window fits
-# the failed-over session. Each entry is (max_input_tokens_inclusive, profile);
-# the first entry whose bound is >= the estimated input token count wins, else
-# the last. Bounds sit below each tag's real window to leave room for the reply.
-#
-# The bounds are measured AFTER bare-mode stripping, which is what makes this
-# ladder look so different from the all-4B one it replaces. That ladder existed
-# because the harness made every failed-over session enormous: the tiers were
-# 64K/128K/256K windows on a 4B, and the model was shrunk 9B → 4B on 2026-07-09
-# purely to keep prefill tolerable at that size. Stripping the harness attacks
-# the context instead of the model, so the common case is now a small prompt on
-# a much stronger model.
-#
-# The 4B 256K tier is kept as the escape hatch. Bare mode bounds the system
-# prompt and tool traffic but NOT the conversation, and a long enough transcript
-# still overflows the 27B's 32K window — at which point a weaker model that
-# retains the session beats a stronger one that truncates it.
+# Automatic failover uses only 4B tiers. Bounds reserve output and template
+# space; bare-mode stripping and the working-set guard run before escalation.
 FAILOVER_LADDER: list[tuple[float, str]] = [
-    (27_000, "local-qwen38-obliterated"),   # 27K in + 4K out + template reserve
-    (float("inf"), "local-failover-256k"),  # qwen3.5:4b-256k (~262K window)
+    (54_000, "local-qwen4b"),
+    (float("inf"), "local-failover-256k"),
 ]
 
 

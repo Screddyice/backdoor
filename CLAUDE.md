@@ -72,34 +72,26 @@ The count proves what the names prove and carries no sentence to invert.
 
 ## Model tags are custom builds, not pulls
 
-The failover tiers do not exist on any registry. `local-qwen38-obliterated` wants
-`qwen3.8:27b-obliterated`, and the 256K fallback wants `qwen3.5:4b-256k`; both are
-built locally:
+Default Qwen and both automatic failover paths use Qwen3.5 4B. The hybrid
+aliases `Qwen 27b` and `qwen-27b`, or the wrapper command `qwen 27b`, select
+the optional 27B GGUF. Legacy `qwen38-*` aliases no longer select local models.
+
+Build the default and wide-context 4B tags locally:
 
 ```bash
-# 27B failover tier
-ollama pull hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M   # ~17 GB
-ollama create qwen3.8:27b-obliterated \
-  -f modelfiles/bare/qwen3.8-27b-obliterated.Modelfile
-
-# 256K escalation tier (pick_failover_profile sends oversized sessions here)
 ollama pull qwen3.5:4b
-modelfiles/build.sh qwen3.5-4b-256k.Modelfile                  # -> qwen3.5:4b-256k
+modelfiles/build.sh qwen3.5-4b-64k.Modelfile qwen3.5-4b-256k.Modelfile
 ```
 
-The 27B's custom Modelfile is not optional: the source GGUF's template carries no
-tool contract, so Ollama answers 400 to any request carrying tools without it.
-Build the 256K tag through `modelfiles/build.sh`, not a raw `ollama create` —
-the script bakes in the shared system prompt a plain create would omit.
+Claude failover selects `local-qwen4b` up to 54K estimated input tokens and
+`local-failover-256k` above that. Codex uses the 64K tag with its existing 32K
+request budget. Existing live environment overrides need updating alongside
+the source, by Shawn under the live-control boundary above.
 
-Build **both**. With only the 27B, the escalation path 404s on exactly the long
-sessions that needed a wider window.
-
-**Why this matters more than it looks.** Without the tag the breaker opens
-correctly, the request routes to Ollama exactly as designed, and Ollama 404s. The
-symptom is indistinguishable from "failover is broken", and the router log shows a
-clean handoff into a model that is not there. If failover appears not to work,
-check `ollama list` before reading any other code.
+For explicit 27B use, build `qwen3.8:27b-obliterated` with
+`modelfiles/bare/qwen3.8-27b-obliterated.Modelfile`; it supplies the tool
+contract missing from the source GGUF template. The MLX profile remains a
+manual administration option, outside model aliases and automatic failover.
 
 The general rule, for the next tag anyone adds: a name that resolves and builds
 a route but was never pulled fails at the provider, which reads as a broken

@@ -7,34 +7,14 @@
 # Inference runs on-device. Local work remains available without internet;
 # WebSearch, WebFetch, and public HTTP calls can use a live connection.
 #
-# Modes (default changed 2026-08-28 to the obliterated 27B GGUF):
-#   qwen            LEAN (default, 2026-07-09). Minimal prompt (~945 tok) on
-#                   Qwen3.8 OBLITERATED 27B @ 32K: --bare, harness commands,
-#                   no auto hooks, MCP off. The 27B is affordable here ONLY
-#                   because lean keeps the prompt tiny; 23GB resident, so it
-#                   cannot co-reside with the fusion council (~21GB) on this
-#                   36GB host (see keep_alive below). Full mode's ~42K harness prefill made a cold 4B take
-#                   minutes (and stall entirely under memory pressure), so lean
-#                   is the default — that offline hang is exactly why it flipped.
-#   qwen full       FULL harness — still Qwen3.5 4B @ 64K, NOT the 27B. The
-#                   harness prompt is ~29K tokens and does not fit the 27B's 32K
-#                   window with room left to converse. claude-harness hooks
-#                   ACTIVE (the old memory hooks and ralph-loop were dropped
-#                   in 2026-07 because they dominated the ~42K prompt).
-#                   Still a minute+ cold prefill; use when you want the harness.
-#                   MCP OFF by default (see below). 256K-native, no rope.
-#   qwen fast       Lean on Qwen3.5 4B @ 64K — the snappiest local brain, and
-#                   the escape hatch when the 27B is too heavy or too slow.
-#                   (qwen coder / qwen2.5-coder removed 2026-07-04.)
-#   qwen mcp NAME   Attach only the named ~/.claude.json MCP server for this
-#                   session. NAME may be a comma-separated list. Use
-#                   `qwen mcp list` to see valid names.
-#   qwen [args...]  Extra args pass straight through to `claude`.
-#
-# The launch banner prints the resolved model — read it if you are unsure which
-# tier you got. `/model qwen` inside a normal cloud session routes to the same
-# 27B via the :8083 hybrid router, which strips the harness server-side
-# (ROUTE_BARE); that is a separate path from this wrapper, which uses :8082.
+# Modes:
+#   qwen / qwen lean  Lean Qwen3.5 4B @ 64K, with bare client prompts.
+#   qwen fast         Lean 4B using the existing local-fast profile.
+#   qwen full         Full harness on Qwen3.5 4B @ 64K.
+#   qwen 27b          Explicit Qwen3.8 27B OBLITERATED @ 32K.
+#   qwen mcp NAME     Attach named MCP servers; `qwen mcp list` lists them.
+# Remaining arguments pass through to Claude Code.
+# `/model Qwen 27b` or `/model qwen-27b` selects 27B in the hybrid router.
 #
 # Env overrides:
 #   Durable memory comes from Backdoor's local claude-mem replica. It adds no
@@ -71,6 +51,7 @@ MCP_REQUESTED=""
 # Leading mode keywords (consume them; rest passes to claude).
 while :; do
   case "${1:-}" in
+    27b|27B) PROFILE="local-qwen38-obliterated"; MODE="lean"; shift ;;
     lean) MODE="lean"; shift ;;
     fast) PROFILE="local-fast"; MODE="lean"; shift ;;
     full) MODE="full"; shift ;;
@@ -111,22 +92,12 @@ if [ -n "$MCP_REQUESTED" ]; then
   fi
 fi
 
-# Resolve the profile from the FINAL mode, so env overrides that flip the mode
-# (QWEN_FULL/QWEN_LEAN) cannot leave a profile that contradicts it. `fast` is
-# the one explicit pin and wins outright.
-#
-# Default/lean is the GGUF 27B as of 2026-08-28. It is viable because lean mode
-# passes --bare: the prompt is ~945 tokens against a 32K window. Full mode's
-# ~29K harness prompt does NOT fit that window with room left to converse, so it
-# stays on the 4B @ 64K — the tier the 2026-07-09 prefill revert chose for
-# exactly this case. Do not "unify" these two onto the 27B without first giving
-# the 27B a bigger window, and read the KV sizing note in
-# modelfiles/bare/qwen3.8-27b-bare.Modelfile before you do.
+# Explicit fast/27b selections win over mode defaults.
 if [ -z "$PROFILE" ]; then
   if [ "$MODE" = "full" ]; then
-    PROFILE="local-qwen35"           # qwen3.5:4b-64k  — harness needs the window
+    PROFILE="local-qwen35"
   else
-    PROFILE="local-qwen38-obliterated" # obliterated 27B GGUF on Ollama
+    PROFILE="local-qwen4b"
   fi
 fi
 
@@ -147,7 +118,7 @@ case "$PROFILE" in
   # stretch instead of compacting.
   local-qwen38-obliterated) QWEN_CTX=32000 ;; # GGUF 27B @ 32K
   local-qwen38-action) QWEN_CTX=32000 ;;    # MLX 27B @ 64K, held at 32K
-  local-qwen35|local-fast) QWEN_CTX=64000 ;; # qwen3.5:4b-64k  @ 64K
+  local-qwen4b|local-qwen35|local-fast) QWEN_CTX=64000 ;; # qwen3.5:4b-64k  @ 64K
   *) QWEN_CTX=32000 ;;                       # unknown profile: assume the floor
 esac
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-$QWEN_CTX}"
@@ -305,7 +276,9 @@ fi
 # Keep Claude Code's context accounting on the local alias even when the saved
 # user setting names a cloud model. A later --model in "$@" remains available
 # as an explicit caller override.
-EXTRA_ARGS+=(--model qwen)
+QWEN_ALIAS="qwen"
+[ "$PROFILE" = "local-qwen38-obliterated" ] && QWEN_ALIAS="qwen-27b"
+EXTRA_ARGS+=(--model "$QWEN_ALIAS")
 
 # 5. Point backdoor at the profile, ensure the proxy is up, then exec `claude`
 #    DIRECTLY (not `bd claude`, which cd's into the backdoor repo and breaks

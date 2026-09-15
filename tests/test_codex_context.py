@@ -159,7 +159,7 @@ def test_build_local_payload_starts_at_active_user_and_injects_memory_context():
     rendered = json.dumps(local)
     text = content_text(local)
 
-    assert local["model"] == "qwen3.8:27b-obliterated"
+    assert local["model"] == "qwen3.5:4b-64k"
     assert local["stream"] is True
     assert "Relevant context recalled from local memory" in text
     assert "decision one" in text
