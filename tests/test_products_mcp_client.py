@@ -69,8 +69,8 @@ def settings() -> ProductSettings:
         (
             "hypercrawl",
             {
-                "HYPERCRAWL_URL": "https://crawl.example/v1",
-                "HYPERCRAWL_REST_TOKEN": "hc_test_value",
+                "HYPERCRAWL_MCP_URL": "https://crawl.example/v1",
+                "HYPERCRAWL_MCP_TOKEN": "hc_test_value",
             },
         ),
         ("hyperscale", {"HYPERFLOW_API_KEY": "hf_test_value"}),
@@ -90,6 +90,8 @@ def test_selected_product_settings_do_not_require_other_product_credentials(
     for name in (
         "HYPERCRAWL_URL",
         "HYPERCRAWL_REST_TOKEN",
+        "HYPERCRAWL_MCP_URL",
+        "HYPERCRAWL_MCP_TOKEN",
         "HYPERFLOW_API_KEY",
         "ENGAGEMATE_URL",
         "ENGAGEMATE_INTERNAL_API_KEY",

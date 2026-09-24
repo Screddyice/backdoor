@@ -30,8 +30,13 @@ class ProductSettings:
     @classmethod
     def from_env(cls, product: ProductName | None = None) -> "ProductSettings":
         values = cls(
-            hypercrawl_url=os.environ.get("HYPERCRAWL_URL", "").rstrip("/"),
-            hypercrawl_token=os.environ.get("HYPERCRAWL_REST_TOKEN", ""),
+            hypercrawl_url=(
+                os.environ.get("HYPERCRAWL_URL")
+                or os.environ.get("HYPERCRAWL_MCP_URL", "")
+            ).rstrip("/"),
+            hypercrawl_token=os.environ.get("HYPERCRAWL_REST_TOKEN") or os.environ.get(
+                "HYPERCRAWL_MCP_TOKEN", ""
+            ),
             hyperscale_url=os.environ.get(
                 "HYPERSCALE_MCP_URL",
                 "https://hyperflow-one--teamnebula-ai.us-central1.hosted.app/mcp",
