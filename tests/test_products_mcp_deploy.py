@@ -28,7 +28,7 @@ def test_product_runtime_overrides_load_after_shared_credential_files() -> None:
 
 def test_product_runtimes_have_unique_oauth_and_network_boundaries() -> None:
     products = {
-        "hypercrawl": ("8011", "hypercrawl-mcp.5-161-126-205.sslip.io"),
+        "hypercrawl": ("8011", "hypercrawl-mcp.teamnebula.ai"),
         "hyperscale": ("8012", "hyperscale-mcp.5-161-126-205.sslip.io"),
         "engagemate": ("8013", "engagemate-mcp.5-161-126-205.sslip.io"),
     }
