@@ -1,4 +1,4 @@
-hypercrawl-mcp.5-161-126-205.sslip.io {
+hypercrawl-mcp.teamnebula.ai {
     reverse_proxy 127.0.0.1:8011
 }
 
