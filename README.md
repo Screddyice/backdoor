@@ -2013,8 +2013,11 @@ The bridge reuses `src/hermes_mcp/oauth.py` for dynamic client registration, PKC
 tokens, and rotating refresh tokens. It keeps product authorization separate behind the bridge:
 HyperCrawl uses its tenant REST token, HyperScale uses its organization API key, and EngageMate
 uses its internal key plus explicit user ID. Store each product's credentials in a protected
-Hermes-owned `%h/.config/products-mcp/<name>.env` file. The Claude connector receives only the
-public MCP URL.
+Hermes-owned `%h/.config/products-mcp/<name>.env` file. The HyperCrawl instance can also read the
+existing `HYPERCRAWL_MCP_TOKEN` from `%h/.hermes/mcp.env`; install
+[`deploy/products-mcp-http@hypercrawl.service.d/10-hypercrawl-credentials.conf`](deploy/products-mcp-http@hypercrawl.service.d/10-hypercrawl-credentials.conf)
+as an instance-specific systemd drop-in so unrelated MCP credentials stay out of that process.
+The Claude connector receives only the public MCP URL.
 
 Deploy this branch in `~/backdoor-products-mcp`, then install
 [`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start
