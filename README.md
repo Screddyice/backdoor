@@ -1987,7 +1987,7 @@ credential fields empty so Claude uses dynamic registration.
 
 | Connector | Owner | Public endpoint | Tools |
 | --- | --- | --- | --- |
-| HyperCrawl | Team Nebula | `https://hypercrawl-mcp.5-161-126-205.sslip.io/mcp` | `hypercrawl_status`, `hypercrawl_list_tools`, `hypercrawl_call` |
+| HyperCrawl | Team Nebula | `https://hypercrawl-mcp.teamnebula.ai/mcp` | `hypercrawl_status`, `hypercrawl_list_tools`, `hypercrawl_call` |
 | HyperScale | Team Nebula | `https://hyperscale-mcp.5-161-126-205.sslip.io/mcp` | `hyperscale_status`, `hyperscale_list_tools`, `hyperscale_call` |
 | EngageMate | Shawn Reddy Consulting (SRC), Screddyice GitHub organization | `https://engagemate-mcp.5-161-126-205.sslip.io/mcp` | `engagemate_status`, `engagemate_list_tools`, `engagemate_call` |
 
@@ -2023,8 +2023,9 @@ the `hypercrawl`, `hyperscale`, and `engagemate` instances. Each instance loads 
 its bind address, port, OAuth issuer, state path, and product selection take precedence. The
 separate checkout keeps connector updates from changing the live router or Hermes bridge.
 
-Merge [`deploy/products-mcp.Caddyfile`](deploy/products-mcp.Caddyfile) into the host Caddyfile and
-add each public `/mcp` URL as a separate Claude custom connector. For each endpoint, complete OAuth,
+Create an A record for `hypercrawl-mcp.teamnebula.ai` pointing to the MCP bridge host, then merge
+[`deploy/products-mcp.Caddyfile`](deploy/products-mcp.Caddyfile) into the host Caddyfile and add each
+public `/mcp` URL as a separate Claude custom connector. For each endpoint, complete OAuth,
 confirm three tools in `tools/list`, run the matching read-only `*_status` tool, and reload Claude to
 confirm persistence. Keep both the bare hostname and its `:443` form in each
 `HERMES_MCP_ALLOWED_HOSTS` value because Caddy may forward either form after TLS termination.
