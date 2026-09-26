@@ -2024,6 +2024,10 @@ with DCR OAuth, then authorize the connection. Composio's OAuth client registrat
 callback on `backend.composio.dev`; the HyperCrawl redirect-host allowlist includes that host
 in `deploy/products-mcp-hypercrawl.env`. After deploying that setting, retry the Composio
 connection and confirm tool sync and a read-only `hypercrawl_status` call.
+Composio registers a `client_secret_basic` client and sends its client ID in the Basic header
+when exchanging the authorization code. The product bridge accepts that standard request and
+still checks the client secret and grant. The HyperCrawl allowlist also retains the existing
+Claude and local loopback callback hosts.
 
 Deploy this branch in `~/backdoor-products-mcp`, then install
 [`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start
