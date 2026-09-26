@@ -1969,7 +1969,7 @@ separate deployment step.
 | `HERMES_MCP_KEY` | Static only | Bearer key callers must present. Boot refuses on a missing, short (under 16 characters), or placeholder-looking value |
 | `HERMES_MCP_OAUTH_ISSUER` | OAuth only | Public HTTPS origin for the bridge, such as `https://hermes.example.com`. When set, OAuth replaces static bearer authentication and `HERMES_MCP_KEY` is not required |
 | `HERMES_MCP_OAUTH_PASSWORD` | OAuth only | Password Shawn enters on the connector authorization page. Boot refuses missing, short, or placeholder-shaped values |
-| `HERMES_MCP_OAUTH_REDIRECT_HOSTS` | OAuth only | Comma-separated redirect-host allowlist for dynamic registration, such as `claude.ai,claude.com`. Registrations for other hosts are refused |
+| `HERMES_MCP_OAUTH_REDIRECT_HOSTS` | OAuth only | Comma-separated redirect-host allowlist for dynamic registration, such as `claude.ai,claude.com`. Registrations for other hosts are refused. The HyperCrawl product bridge also allows `backend.composio.dev` for Composio Custom MCP |
 | `HERMES_MCP_OAUTH_STATE_PATH` | No | Mode-600 JSON file holding OAuth client registrations and tokens. Defaults to `~/.config/hermes-mcp/oauth-state.json` |
 | `HERMES_MCP_REGISTRY` | No | Path to the profile registry TOML. Defaults to `~/.config/hermes-mcp/registry.toml` |
 | `HERMES_MCP_HOST` | No | Address the bridge binds. Defaults to `127.0.0.1`. A non-loopback address turns **off** the SDK's automatic loopback-only DNS-rebinding protection, so `HERMES_MCP_ALLOWED_HOSTS` is **required** with one: the bridge refuses to start on a non-loopback bind with an empty allowlist rather than serving unprotected. Loopback (`127.0.0.1`, `localhost`, `::1`) needs no allowlist |
@@ -2018,6 +2018,12 @@ existing `HYPERCRAWL_MCP_TOKEN` from `%h/.hermes/mcp.env`; install
 [`deploy/products-mcp-http@hypercrawl.service.d/10-hypercrawl-credentials.conf`](deploy/products-mcp-http@hypercrawl.service.d/10-hypercrawl-credentials.conf)
 as an instance-specific systemd drop-in so unrelated MCP credentials stay out of that process.
 The Claude connector receives only the public MCP URL.
+
+For Composio Custom MCP, register HyperCrawl at `https://hypercrawl-mcp.teamnebula.ai/mcp`
+with DCR OAuth, then authorize the connection. Composio's OAuth client registration uses a
+callback on `backend.composio.dev`; the HyperCrawl redirect-host allowlist includes that host
+in `deploy/products-mcp-hypercrawl.env`. After deploying that setting, retry the Composio
+connection and confirm tool sync and a read-only `hypercrawl_status` call.
 
 Deploy this branch in `~/backdoor-products-mcp`, then install
 [`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start

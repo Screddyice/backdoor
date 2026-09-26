@@ -422,6 +422,29 @@ def test_registration_rejects_unapproved_redirect_and_is_bounded(monkeypatch, tm
         assert second["client_id"] in persisted["clients"]
 
 
+def test_hypercrawl_deployment_allows_composio_registration(monkeypatch, tmp_path):
+    _oauth_env(monkeypatch, tmp_path / "state.json")
+    deployment = Path(__file__).resolve().parents[1] / "deploy/products-mcp-hypercrawl.env"
+    redirect_hosts = next(
+        line.split("=", 1)[1]
+        for line in deployment.read_text(encoding="utf-8").splitlines()
+        if line.startswith("HERMES_MCP_OAUTH_REDIRECT_HOSTS=")
+    )
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", redirect_hosts)
+    app = build_server(REGISTRY).streamable_http_app(
+        stateless_http=True, json_response=True
+    )
+    with TestClient(app, base_url=ISSUER) as client:
+        registered = _register(
+            client, "https://backend.composio.dev/api/v3/toolkits/auth/callback"
+        )
+        assert registered["client_id"]
+        rejected = _register(
+            client, "https://attacker.example/callback", expected_status=400
+        )
+        assert rejected["error"] == "invalid_redirect_uri"
+
+
 @pytest.mark.parametrize(
     "redirect_uri",
     [
