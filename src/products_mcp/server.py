@@ -16,9 +16,17 @@ from src.hermes_mcp.oauth import (
 )
 
 from .client import ProductGateway, ProductName, ProductSettings
+from .oauth_compat import BasicClientIdTokenMiddleware
 
 
 PRODUCT_NAMES = ("hypercrawl", "hyperscale", "engagemate")
+
+
+class ProductMCPServer(MCPServer):
+    def streamable_http_app(self, **kwargs: Any):
+        app = super().streamable_http_app(**kwargs)
+        app.add_middleware(BasicClientIdTokenMiddleware)
+        return app
 
 PRODUCT_PRESENTATION = {
     "hypercrawl": {
@@ -92,7 +100,7 @@ def build_server(
     presentation = PRODUCT_PRESENTATION[selected_product]
     oauth_settings = OAuthSettings.from_env()
     provider = SingleUserOAuthProvider(oauth_settings)
-    server = MCPServer(
+    server = ProductMCPServer(
         selected_product,
         title=presentation["title"],
         description=presentation["description"],

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+
 import pytest
+from starlette.testclient import TestClient
 
 import src.products_mcp.server as products_server
 from src.hermes_mcp.http_server import TransportSecuritySettings
@@ -107,6 +110,52 @@ def test_server_rejects_unknown_product(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="unknown product"):
         build_server(gateway=FakeGateway())
+
+
+def test_composio_basic_token_request_without_form_client_id(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "https://products.example")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "backend.composio.dev")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
+    server = build_server(product="hypercrawl", gateway=FakeGateway())
+    app = server.streamable_http_app(stateless_http=True, json_response=True)
+
+    with TestClient(app, base_url="https://products.example") as client:
+        registration = client.post(
+            "/register",
+            json={
+                "client_name": "Composio",
+                "redirect_uris": ["https://backend.composio.dev/api/v1/auth-apps/add"],
+                "token_endpoint_auth_method": "client_secret_basic",
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+            },
+        )
+        assert registration.status_code == 201
+        credentials = registration.json()
+        form = {
+            "grant_type": "authorization_code",
+            "code": "nonexistent-code",
+            "code_verifier": "nonexistent-verifier",
+            "redirect_uri": "https://backend.composio.dev/api/v1/auth-apps/add",
+        }
+        basic = base64.b64encode(
+            f"{credentials['client_id']}:{credentials['client_secret']}".encode()
+        ).decode()
+        authenticated = client.post(
+            "/token", data=form, headers={"Authorization": f"Basic {basic}"}
+        )
+        assert authenticated.status_code == 400
+        assert authenticated.json()["error"] == "invalid_grant"
+
+        wrong_secret = base64.b64encode(
+            f"{credentials['client_id']}:wrong-secret".encode()
+        ).decode()
+        rejected = client.post(
+            "/token", data=form, headers={"Authorization": f"Basic {wrong_secret}"}
+        )
+        assert rejected.status_code == 401
+        assert rejected.json()["error"] == "invalid_client"
 
 
 @pytest.mark.asyncio
