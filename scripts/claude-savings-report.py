@@ -251,7 +251,7 @@ def counterfactual_usd(tok, now):
     return cost_usd(t, now)
 
 
-def scan(days, now=None):
+def scan(days, now=None, strict=False):
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
     per_model = defaultdict(lambda: {"model": "", "input": 0, "output": 0, "cache_read": 0,
@@ -277,6 +277,8 @@ def scan(days, now=None):
                 try:
                     d = json.loads(line)
                 except Exception:
+                    if strict:
+                        raise ValueError(f"invalid Claude usage line in {path}")
                     continue
                 if d.get("type") != "assistant":
                     continue
@@ -311,7 +313,7 @@ def scan(days, now=None):
     return now, per_model, session_ts, scanned, limit_events
 
 
-def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR, end=None):
+def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR, end=None, strict=False):
     """Read incremental Codex usage without double-counting repeated snapshots."""
     per_model = defaultdict(lambda: {"model": "", "input": 0, "output": 0,
                                      "cache_read": 0, "cache_w5m": 0,
@@ -335,6 +337,8 @@ def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR, end=None):
                 try:
                     record = json.loads(line)
                 except Exception:
+                    if strict:
+                        raise ValueError(f"invalid Codex transcript line in {path}")
                     continue
                 ts = parse_ts(record.get("timestamp", ""))
                 if ts is None or ts < cutoff or (end is not None and ts >= end):
