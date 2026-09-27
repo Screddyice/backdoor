@@ -166,7 +166,10 @@ GPT-5.6 Sol and Claude Opus 5 prices from OpenRouter's public model catalog.
 The collector writes an atomic JSON snapshot under
 `~/.claude/state/weekly-savings/` and sends that snapshot over SSH to the
 Screddy Hermes host. Standalone Qwen stays in its own row because its usage
-log does not identify a Claude or Codex client.
+log does not identify a Claude or Codex client. Local Ollama calls outside
+these transcript sources, including llm-jury council and router failover,
+are excluded until they have a complete per-call token ledger. The email
+names that coverage limit instead of presenting the estimate as all local use.
 
 Remote Hermes checks hourly and sends on Monday at 19:07 Pacific if the
 snapshot covers the complete week and is no more than 24 hours old. If the Mac

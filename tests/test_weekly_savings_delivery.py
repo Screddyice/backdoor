@@ -47,12 +47,21 @@ def test_qwen_sessions_are_measured_once_and_not_assigned_to_a_client(tmp_path):
     ended = (when(25) + timedelta(minutes=5)).timestamp() * 1000
     path.write_text(json.dumps({"sessionId": "s1", "startTime": started, "timestamp": ended,
                                 "models": {"qwen": {"requests": 2, "inputTokens": 1000,
-                                                     "cachedTokens": 100, "outputTokens": 50}}}) + "\n")
+                                                     "cachedTokens": 100, "outputTokens": 50},
+                                           "openai/gpt-5.6-sol": {"requests": 1, "inputTokens": 9000,
+                                                                  "outputTokens": 500}}}) + "\n")
     usage = DELIVERY.qwen_usage(when(20), when(27), path)
     assert usage == {"sessions": 1, "requests": 2, "input": 1000,
                      "cached": 100, "output": 50}
     with pytest.raises(DELIVERY.DataUnavailable, match="crosses"):
         DELIVERY.qwen_usage(when(25, 19, 8), when(27), path)
+
+
+def test_damaged_jury_ledger_blocks_a_snapshot(tmp_path):
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text('{"ts":"2026-09-25T00:00:00+00:00","cost_usd":"unknown"}\n')
+    with pytest.raises(DELIVERY.DataUnavailable, match="ledger is invalid"):
+        DELIVERY.validate_jury_ledger(ledger)
 
 
 def snapshot(cycle, generated):
@@ -112,3 +121,12 @@ def test_collector_publishes_a_local_record_before_the_send_window(tmp_path, mon
     assert "saved" in DELIVERY.collect(when(27, 20))
     assert published == ["2026-09-27"]
     assert DELIVERY.snapshot_path(DELIVERY.cycle_for(when(27, 20))).exists()
+
+
+def test_corrupt_delivery_state_cannot_be_treated_as_unsent(tmp_path, monkeypatch):
+    monkeypatch.setattr(DELIVERY, "STATE_DIR", tmp_path)
+    now = when(28)
+    cycle = DELIVERY.cycle_for(now)
+    (tmp_path / f"delivery-{cycle['id']}.json").write_text("{broken")
+    with pytest.raises(DELIVERY.DataUnavailable, match="unreadable"):
+        DELIVERY.dispatch(now, lambda _: pytest.fail("sent with corrupt state"))

@@ -122,6 +122,10 @@ def qwen_usage(start, end, path=QWEN_USAGE):
                 if session_id in seen:
                     raise DataUnavailable("duplicate Qwen usage session")
                 seen.add(session_id)
+                local_models = {name: usage for name, usage in row["models"].items()
+                                if report.is_local(name)}
+                if not local_models:
+                    continue
                 began = datetime.fromtimestamp(row["startTime"] / 1000, timezone.utc)
                 finished = datetime.fromtimestamp(row["timestamp"] / 1000, timezone.utc)
                 if finished <= start or began >= end:
@@ -129,7 +133,7 @@ def qwen_usage(start, end, path=QWEN_USAGE):
                 if began < start or finished > end:
                     raise DataUnavailable("Qwen session crosses a week boundary")
                 totals["sessions"] += 1
-                for usage in row["models"].values():
+                for usage in local_models.values():
                     for key, field in (("requests", "requests"), ("inputTokens", "input"),
                                        ("cachedTokens", "cached"), ("outputTokens", "output")):
                         value = int(usage.get(key, 0))
@@ -141,6 +145,23 @@ def qwen_usage(start, end, path=QWEN_USAGE):
     return totals
 
 
+def validate_jury_ledger(path):
+    """Reject a damaged ledger instead of treating skipped rows as zero spend."""
+    try:
+        with open(path) as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                datetime.fromisoformat(row["ts"])
+                amount = float(row.get("cost_usd", 0))
+                avoided = float(row.get("avoided_usd", 0))
+                if amount < 0 or avoided < 0:
+                    raise ValueError("negative ledger amount")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DataUnavailable(f"llm-jury ledger is invalid: {type(exc).__name__}") from exc
+
+
 def build_snapshot(cycle, generated_at, get_prices=prices):
     """Read every required local source for one completed, fixed week."""
     required = (Path(report.PROJECTS_DIR), Path(report.CODEX_SESSIONS_DIR),
@@ -150,8 +171,12 @@ def build_snapshot(cycle, generated_at, get_prices=prices):
     start = cycle["start"].astimezone(timezone.utc)
     end = cycle["end"].astimezone(timezone.utc)
     rates = get_prices()
-    _, claude, _, claude_files, _ = report.scan(7, now=end)
-    codex, codex_files = report.scan_codex(start, end=end)
+    validate_jury_ledger(report.LLMJURY_SPEND_LEDGER)
+    try:
+        _, claude, _, claude_files, _ = report.scan(7, now=end, strict=True)
+        codex, codex_files = report.scan_codex(start, end=end, strict=True)
+    except (OSError, ValueError, TypeError) as exc:
+        raise DataUnavailable(f"transcript scan failed: {type(exc).__name__}") from exc
     jury = report.llmjury_spend(7, now=end)
     if not jury["available"]:
         raise DataUnavailable("llm-jury ledger is unreadable")
@@ -238,13 +263,16 @@ def collect(now):
     cycle = cycle_for(now)
     if cycle is None:
         return "No completed week awaits collection."
-    state = read_json(STATE_DIR / f"delivery-{cycle['id']}.json") or {}
-    if state.get("status") in ("attempted", "sent", "skipped"):
-        return "Week already finalized."
-    snapshot = build_snapshot(cycle, now)
-    atomic_json(snapshot_path(cycle), snapshot)
-    publish_snapshot(cycle)
-    return f"Local snapshot saved for week ending {cycle['id']}."
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(STATE_DIR / "collection.lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(STATE_DIR / f"delivery-{cycle['id']}.json") or {}
+        if state.get("status") in ("attempted", "sent", "skipped"):
+            return "Week already finalized."
+        snapshot = build_snapshot(cycle, now)
+        atomic_json(snapshot_path(cycle), snapshot)
+        publish_snapshot(cycle)
+        return f"Local snapshot saved for week ending {cycle['id']}."
 
 
 def email_body(snapshot):
@@ -268,7 +296,10 @@ def email_body(snapshot):
         "This compares measured local tokens with current published OpenRouter rates: "
         "GPT-5.6 Sol for Codex and standalone Qwen; Claude Opus 5 for Claude. "
         "It estimates the charge for equivalent token volume, not a reduction "
-        "in an existing subscription bill. Hardware and electricity costs are excluded.",
+        "in an existing subscription bill. Hardware and electricity costs are excluded. "
+        "Local Ollama calls made outside these three transcript sources, including "
+        "llm-jury council calls and router failover, lack a complete token ledger "
+        "and are excluded from this measured total.",
         f"Local snapshot: {snapshot['generated_at']}. Pricing: {snapshot['pricing_source']}.",
     ])
 
