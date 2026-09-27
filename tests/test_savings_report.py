@@ -247,6 +247,21 @@ def test_local_prefix_matching_is_unchanged_for_bare_tags():
         assert REPORT.is_local(model), model
 
 
+def test_scan_includes_nested_claude_subagent_usage(tmp_path, monkeypatch):
+    monkeypatch.setattr(REPORT, "PROJECTS_DIR", str(tmp_path))
+    path = tmp_path / "project" / "session" / "subagents" / "agent.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "type": "assistant", "timestamp": "2026-09-25T12:00:00Z", "requestId": "r1",
+        "message": {"id": "m1", "model": "claude-qwen-27b",
+                    "usage": {"input_tokens": 1000, "output_tokens": 100}}}) + "\n")
+    _, per_model, _, scanned, _ = REPORT.scan(
+        7, now=datetime(2026, 9, 27, tzinfo=timezone.utc))
+    assert scanned == 1
+    assert per_model["claude-qwen-27b"]["input"] == 1000
+    assert per_model["claude-qwen-27b"]["turns"] == 1
+
+
 # --- send resilience: a transient outage must not cost a week's report -------
 
 
