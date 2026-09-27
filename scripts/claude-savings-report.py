@@ -561,7 +561,7 @@ def send_weekly_email(savings, week_of, today, dry):
     if not key:
         print("email skipped: TMN_COMPOSIO_API_KEY not found", file=sys.stderr)
         return False
-    subject = (f"${savings['usd_saved']:,.0f} not spent this week — AI model report "
+    subject = (f"${savings['usd_saved']:,.2f} not spent this week — AI model report "
                f"({week_of} to {today})")
     body_html = md_to_html(build_savings_email_md(savings, week_of, today))
     if dry:
