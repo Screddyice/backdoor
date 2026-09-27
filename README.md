@@ -158,25 +158,40 @@ python3 scripts/claude-savings-report.py --days 7   # print a report
 python3 scripts/claude-savings-report.py --dry-run   # preview, writes and emails nothing
 ```
 
-Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
-`SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it.
-The email gives local Codex and local Claude their own savings rows. It values
-Codex turns against the OpenRouter GPT-5.6 Sol rate snapshot ($2/M input,
-$0.20/M cached input, $10/M output) and Claude turns against the OpenRouter
-Claude Opus 5 rate snapshot ($5/M input, $25/M output). Override the Codex rates
-with `SAVINGS_OPENROUTER_CODEX_*_PER_MTOK`. It shows OpenRouter usage separately because
-transcript counts alone cannot establish OpenRouter charges. The local Hermes
-cron job runs the report each Sunday at 19:07 Pacific; the older LaunchAgent
-must be disabled to avoid duplicate sends. Hermes runs the script without a
-model call, and the script uses the signed-in Composio CLI for Gmail delivery.
-Install `scripts/hermes-weekly-savings.sh` in `~/.hermes/scripts/` and register
-it with `hermes cron create '7 19 * * 0' --name weekly-ai-savings --script
-hermes-weekly-savings.sh --no-agent --deliver local`.
-The runner records a successful send in `~/.claude/state/hermes-weekly-savings.sent`
-and skips another send within six days. This prevents a resumed job from
-emailing again at the next Sunday tick after a manual catch-up run.
+`scripts/weekly-savings-delivery.py` runs the scheduled email. A Mac LaunchAgent
+collects a fixed Sunday 19:07 to Sunday 19:07 Pacific week after it closes.
+It reads Claude and Codex transcripts, completed Qwen Code sessions from
+`~/.qwen/usage_record.jsonl`, and the llm-jury ledger. It fetches current
+GPT-5.6 Sol and Claude Opus 5 prices from OpenRouter's public model catalog.
+The collector writes an atomic JSON snapshot under
+`~/.claude/state/weekly-savings/` and sends that snapshot over SSH to the
+Screddy Hermes host. Standalone Qwen stays in its own row because its usage
+log does not identify a Claude or Codex client. Local Ollama calls outside
+these transcript sources, including llm-jury council and router failover,
+are excluded until they have a complete per-call token ledger. The email
+names that coverage limit instead of presenting the estimate as all local use.
 
-**The send retries, but only where a retry is safe.** This job fires once a week, so a transport
+Remote Hermes checks hourly and sends on Monday at 19:07 Pacific if the
+snapshot covers the complete week and is no more than 24 hours old. If the Mac
+was closed or a source or price lookup failed, Hermes waits for the next fresh
+snapshot. The window ends Thursday at 19:07 Pacific, three days after the
+normal send. Hermes then records a skipped week. It records an attempted send
+before calling Gmail, so an uncertain Gmail result cannot cause an automatic
+duplicate. The email labels its dollars as OpenRouter-equivalent charges for
+measured token volume. It keeps subscription value and actual OpenRouter spend
+outside the local total; it does not claim a reduction in a flat-rate bill.
+
+The older Sunday Mac Hermes cron and LaunchAgent must stay disabled. Install
+`deploy/com.screddy.weekly-savings-collector.plist` as a Mac LaunchAgent and
+the scripts on the Mac and Screddy Hermes host. Register the remote
+`scripts/hermes-weekly-savings.sh` with Hermes cron at `7 * * * *` in no-agent
+mode. The remote host uses its existing Gmail connection through the local
+Composio CLI.
+
+The older `scripts/claude-savings-report.py` remains a manual transcript report.
+It requires `--email` to send and does not include standalone Qwen sessions.
+
+**The manual report retries, but only where a retry is safe.** The old job fired once a week, so a transport
 blip at that moment used to cost the entire report: a single `getaddrinfo ENOTFOUND
 backend.composio.dev` meant the report was written to disk, the mail never left, and the only
 evidence was a `.err` file nobody opens. That is how the weekly mail went dark. The send now makes

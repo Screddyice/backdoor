@@ -19,7 +19,7 @@ with OpenRouter-routed turns identified from their provider/model IDs:
 Every number that rests on an assumption says so in the report. A week with no
 usage reports zeros — silence is indistinguishable from a broken job.
 
-Usage: claude-savings-report.py [--days N] [--dry-run] [--no-notify]
+Usage: claude-savings-report.py [--days N] [--dry-run] [--no-notify] [--email]
 """
 import glob, json, os, re, subprocess, sys, time
 from collections import defaultdict
@@ -251,15 +251,15 @@ def counterfactual_usd(tok, now):
     return cost_usd(t, now)
 
 
-def scan(days):
-    now = datetime.now(timezone.utc)
+def scan(days, now=None, strict=False):
+    now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
     per_model = defaultdict(lambda: {"model": "", "input": 0, "output": 0, "cache_read": 0,
                                      "cache_w5m": 0, "cache_w1h": 0, "turns": 0})
     seen = set()
     limit_events = 0
     session_ts = defaultdict(list)   # transcript file -> [datetime]
-    files = glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))
+    files = glob.glob(os.path.join(PROJECTS_DIR, "**", "*.jsonl"), recursive=True)
     scanned = 0
     for path in files:
         try:
@@ -277,11 +277,13 @@ def scan(days):
                 try:
                     d = json.loads(line)
                 except Exception:
+                    if strict:
+                        raise ValueError(f"invalid Claude usage line in {path}")
                     continue
                 if d.get("type") != "assistant":
                     continue
                 ts = parse_ts(d.get("timestamp", ""))
-                if ts is None or ts < cutoff:
+                if ts is None or ts < cutoff or ts >= now:
                     continue
                 msg = d.get("message") or {}
                 usage = msg.get("usage") or {}
@@ -311,14 +313,17 @@ def scan(days):
     return now, per_model, session_ts, scanned, limit_events
 
 
-def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR):
+def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR, end=None, strict=False):
     """Read incremental Codex usage without double-counting repeated snapshots."""
     per_model = defaultdict(lambda: {"model": "", "input": 0, "output": 0,
                                      "cache_read": 0, "cache_w5m": 0,
                                      "cache_w1h": 0, "turns": 0})
     scanned = 0
-    pattern = os.path.join(sessions_dir, "**", "*.jsonl")
-    for path in glob.glob(pattern, recursive=True):
+    patterns = [os.path.join(sessions_dir, "**", "*.jsonl")]
+    if sessions_dir == CODEX_SESSIONS_DIR:
+        patterns.append(os.path.join(HOME, ".codex", "archived_sessions", "*.jsonl"))
+    paths = set().union(*(glob.glob(pattern, recursive=True) for pattern in patterns))
+    for path in paths:
         try:
             if datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) < cutoff:
                 continue
@@ -332,9 +337,11 @@ def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR):
                 try:
                     record = json.loads(line)
                 except Exception:
+                    if strict:
+                        raise ValueError(f"invalid Codex transcript line in {path}")
                     continue
                 ts = parse_ts(record.get("timestamp", ""))
-                if ts is None or ts < cutoff:
+                if ts is None or ts < cutoff or (end is not None and ts >= end):
                     continue
                 payload = record.get("payload") or {}
                 if record.get("type") == "turn_context":
@@ -615,7 +622,10 @@ def main():
         days = int(sys.argv[sys.argv.index("--days") + 1])
     dry = "--dry-run" in sys.argv
     notify = "--no-notify" not in sys.argv and not dry
-    send_email = "--no-email" not in sys.argv
+    # The scheduled email uses a complete local snapshot. A manual run must
+    # opt in explicitly so this narrower transcript report cannot mail an
+    # undercount when standalone Qwen has run.
+    send_email = "--email" in sys.argv and "--no-email" not in sys.argv
     sent = False
 
     now, per_model, session_ts, scanned, limit_events = scan(days)
