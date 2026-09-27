@@ -171,7 +171,10 @@ must be disabled to avoid duplicate sends. Hermes runs the script without a
 model call, and the script uses the signed-in Composio CLI for Gmail delivery.
 Install `scripts/hermes-weekly-savings.sh` in `~/.hermes/scripts/` and register
 it with `hermes cron create '7 19 * * 0' --name weekly-ai-savings --script
-~/.hermes/scripts/hermes-weekly-savings.sh --no-agent --deliver local`.
+hermes-weekly-savings.sh --no-agent --deliver local`.
+The runner records a successful send in `~/.claude/state/hermes-weekly-savings.sent`
+and skips another send within six days. This prevents a resumed job from
+emailing again at the next Sunday tick after a manual catch-up run.
 
 **The send retries, but only where a retry is safe.** This job fires once a week, so a transport
 blip at that moment used to cost the entire report: a single `getaddrinfo ENOTFOUND
