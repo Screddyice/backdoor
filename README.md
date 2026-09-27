@@ -160,6 +160,18 @@ python3 scripts/claude-savings-report.py --dry-run   # preview, writes and email
 
 Optional weekly email delivery goes through Gmail via Composio (`SAVINGS_EMAIL_TO`,
 `SAVINGS_EMAIL_FROM_ACCOUNT`); pass `--no-email` to skip it.
+The email gives local Codex and local Claude their own savings rows. It values
+Codex turns against the OpenRouter GPT-5.6 Sol rate snapshot ($2/M input,
+$0.20/M cached input, $10/M output) and Claude turns against the OpenRouter
+Claude Opus 5 rate snapshot ($5/M input, $25/M output). Override the Codex rates
+with `SAVINGS_OPENROUTER_CODEX_*_PER_MTOK`. It shows OpenRouter usage separately because
+transcript counts alone cannot establish OpenRouter charges. The local Hermes
+cron job runs the report each Sunday at 19:07 Pacific; the older LaunchAgent
+must be disabled to avoid duplicate sends. Hermes runs the script without a
+model call, and the script uses the signed-in Composio CLI for Gmail delivery.
+Install `scripts/hermes-weekly-savings.sh` in `~/.hermes/scripts/` and register
+it with `hermes cron create '7 19 * * 0' --name weekly-ai-savings --script
+~/.hermes/scripts/hermes-weekly-savings.sh --no-agent --deliver local`.
 
 **The send retries, but only where a retry is safe.** This job fires once a week, so a transport
 blip at that moment used to cost the entire report: a single `getaddrinfo ENOTFOUND

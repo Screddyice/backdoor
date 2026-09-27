@@ -5,7 +5,8 @@ Measures usage over the trailing window from Claude and Codex transcript JSONLs
 with OpenRouter-routed turns identified from their provider/model IDs:
 
   local routing   turns served by qwen* through the :8083 router — zero cloud
-                  tokens; counterfactual is the same turn at Opus 5 pricing.
+                  tokens; counterfactual uses comparable OpenRouter rates for
+                  Codex and Claude separately.
   prompt caching  cache_read tokens billed at 0.1x input, net of the 1.25x/2x
                   write premium actually paid.
   OpenRouter      measured Claude and Codex transcript usage, kept separate
@@ -44,6 +45,11 @@ CODEX_INPUT_PER_MTOK = float(os.environ.get("SAVINGS_CODEX_INPUT_PER_MTOK", 2.5)
 CODEX_CACHED_INPUT_PER_MTOK = float(os.environ.get("SAVINGS_CODEX_CACHED_INPUT_PER_MTOK", 0.25))
 CODEX_OUTPUT_PER_MTOK = float(os.environ.get("SAVINGS_CODEX_OUTPUT_PER_MTOK", 15.0))
 CODEX_PLAN_COST_MO = float(os.environ.get("SAVINGS_CODEX_PLAN_COST_MO", 200))
+# OpenRouter GPT-5.6 Sol listed rates at 2026-09-26. These are a comparison
+# for local Codex turns, not a claim that those turns would use OpenRouter.
+OPENROUTER_CODEX_INPUT_PER_MTOK = float(os.environ.get("SAVINGS_OPENROUTER_CODEX_INPUT_PER_MTOK", 2.0))
+OPENROUTER_CODEX_CACHED_INPUT_PER_MTOK = float(os.environ.get("SAVINGS_OPENROUTER_CODEX_CACHED_INPUT_PER_MTOK", 0.2))
+OPENROUTER_CODEX_OUTPUT_PER_MTOK = float(os.environ.get("SAVINGS_OPENROUTER_CODEX_OUTPUT_PER_MTOK", 10.0))
 # --- the $200 plan benchmark ------------------------------------------------
 PLAN_COST_MO       = float(os.environ.get("SAVINGS_PLAN_COST_MO", 200))
 # Anthropic's published guidance for Max 20x: ~24-40 Opus-hours/week.
@@ -475,12 +481,17 @@ def build_savings_email_md(s, week_of, today):
         "",
         "| Source | $ saved | How |",
         "|---|---|---|",
-        f"| Open-source models (local) | ${s['local_saved']:,.2f} | "
-        f"{s['local_turns']} turns ran on local hardware instead of metered cloud models |",
-        f"| Codex plan | ${s['codex_saved']:,.2f} | "
-        f"{s['codex_turns']} measured responses valued at metered API rates, net of the plan |",
+        f"| Local agents via Codex | ${s['local_codex_saved']:,.2f} | "
+        f"{s['local_codex_turns']} measured turns; OpenRouter GPT-5.6 Sol rate snapshot |",
+        f"| Local agents via Claude | ${s['local_claude_saved']:,.2f} | "
+        f"{s['local_claude_turns']} measured turns; OpenRouter {COUNTERFACTUAL} rate snapshot |",
+        (f"| Subscription frontier calls | ${s['llmjury']['avoided_usd']:,.2f} | "
+         f"{s['llmjury']['subscription_calls']} estimated llm-jury calls that avoided OpenRouter billing |"
+         if (s.get('llmjury') or {}).get('available') else
+         "| Subscription frontier calls | Unknown | llm-jury ledger unavailable |"),
         "",
-        f"**Total: ${s['usd_saved']:,.2f} saved.**",
+        f"**Estimated total not spent: ${s['usd_saved']:,.2f}.**",
+        f"Codex plan value: ${s['codex_saved']:,.2f}; this is separate from savings.",
         "",
         f"(Not counted above: {s['cache_rate']:.1f}% of input tokens ran from cache this week — "
         f"real efficiency, but not $ saved, since the plan is flat-rate with no per-token bill.)",
@@ -623,7 +634,13 @@ def main():
     # 1. local routing savings
     local_tokens = sum(t["input"] + t["output"] + t["cache_read"] + t["cache_w5m"] + t["cache_w1h"]
                        for t in local.values())
-    local_saved = sum(counterfactual_usd(t, now) for t in local.values())
+    local_claude_saved = sum(counterfactual_usd(t, now) for t in claude_local.values())
+    local_codex_saved = codex_plan_savings(
+        codex_local, input_per_mtok=OPENROUTER_CODEX_INPUT_PER_MTOK,
+        cached_input_per_mtok=OPENROUTER_CODEX_CACHED_INPUT_PER_MTOK,
+        output_per_mtok=OPENROUTER_CODEX_OUTPUT_PER_MTOK,
+        weekly_plan_cost=0)[0]
+    local_saved = local_claude_saved + local_codex_saved
     local_turns = sum(t["turns"] for t in local.values())
     local_claude_turns = sum(t["turns"] for t in claude_local.values())
     local_claude_tokens = sum(t["input"] + t["output"] + t["cache_read"]
@@ -740,8 +757,8 @@ def main():
         "| Source | Tokens | $ | Basis |",
         "|---|---|---|---|",
         f"| Open-source models (local) | {fmt_tok(local_tokens)} | ${local_saved:,.2f} | "
-        f"{local_turns} Claude/Codex turns served locally; counterfactual = {COUNTERFACTUAL} "
-        f"pricing (tokens measured) |",
+        f"{local_turns} Claude/Codex turns served locally; Claude uses OpenRouter "
+        f"{COUNTERFACTUAL} and Codex uses OpenRouter GPT-5.6 Sol rate snapshots |",
         (f"| Frontier escalations on a subscription | — | ${avoided_usd:,.2f} | "
          f"{jury['subscription_calls']} llm-jury escalation(s) the Codex/Claude CLI absorbed "
          f"instead of OpenRouter billing them (estimated: the CLIs return text, not token counts) |"
@@ -849,6 +866,8 @@ def main():
     if send_email:
         savings = {"usd_saved": usd_saved, "cache_rate": cache_rate,
                   "local_saved": local_saved, "local_turns": local_turns,
+                  "local_claude_saved": local_claude_saved,
+                  "local_codex_saved": local_codex_saved,
                   "local_claude_turns": local_claude_turns,
                   "local_claude_tokens": local_claude_tokens,
                   "local_codex_turns": local_codex_turns,
@@ -885,6 +904,8 @@ def main():
         subprocess.run(["osascript", "-e",
                         f'display notification "{msg}" with title "AI model savings report"'],
                        capture_output=True)
+    if send_email and not dry and not sent:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
