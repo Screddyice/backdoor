@@ -150,6 +150,8 @@ def test_email_keeps_local_savings_separate_from_claude_and_codex_openrouter_usa
             "usd_saved": 40.0,
             "cache_rate": 50.0,
             "local_saved": 10.0,
+            "local_claude_saved": 7.0,
+            "local_codex_saved": 3.0,
             "local_turns": 2,
             "local_claude_turns": 2,
             "local_claude_tokens": 900_000,
@@ -161,18 +163,22 @@ def test_email_keeps_local_savings_separate_from_claude_and_codex_openrouter_usa
             "openrouter_codex_tokens": 2_500_000,
             "codex_saved": 30.0,
             "codex_turns": 4,
+            "llmjury": {"available": True, "avoided_usd": 30.0, "subscription_calls": 4,
+                         "calls": 0, "usd": 0.0},
         },
         "2026-08-27",
         "2026-09-03",
     )
 
-    assert "Open-source models (local) | $10.00" in body
-    assert "Codex plan | $30.00" in body
+    assert "Local agents via Codex | $3.00" in body
+    assert "Local agents via Claude | $7.00" in body
+    assert "Subscription frontier calls | $30.00" in body
+    assert "Codex plan value: $30.00" in body
     assert "Local models via Claude | 2 | 900K" in body
     assert "Local models via Codex | 1 | 300K" in body
     assert "OpenRouter via Claude | 3 | 1.2M" in body
     assert "OpenRouter via Codex | 5 | 2.5M" in body
-    assert "**Total: $40.00 saved.**" in body
+    assert "**Estimated total not spent: $40.00.**" in body
 
 
 def test_email_reports_zero_when_no_transcript_attributed_openrouter_usage():
@@ -181,6 +187,8 @@ def test_email_reports_zero_when_no_transcript_attributed_openrouter_usage():
             "usd_saved": 0.0,
             "cache_rate": 0.0,
             "local_saved": 0.0,
+            "local_claude_saved": 0.0,
+            "local_codex_saved": 0.0,
             "local_turns": 0,
             "local_claude_turns": 12,
             "local_claude_tokens": 4_000_000,
