@@ -8,6 +8,7 @@ data keeps the email pending, and the deadline ends that week's attempt.
 import fcntl
 import importlib.util
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -28,6 +29,7 @@ STATE_DIR = Path(os.environ.get("SAVINGS_STATE_DIR", Path.home() / ".claude/stat
 QWEN_USAGE = Path(os.environ.get("SAVINGS_QWEN_USAGE", Path.home() / ".qwen/usage_record.jsonl"))
 REMOTE_SSH = os.environ.get("SAVINGS_REMOTE_SSH", "hermes@5.161.126.205")
 REMOTE_STATE_DIR = os.environ.get("SAVINGS_REMOTE_STATE_DIR", "/home/hermes/.hermes/savings")
+JEV_REMOTE_SSH = os.environ.get("SAVINGS_JEV_REMOTE_SSH", "neb-ops-gcp")
 PRICES_URL = "https://openrouter.ai/api/v1/models"
 MODEL_IDS = ("openai/gpt-5.6-sol", "anthropic/claude-opus-5")
 HOUR = 19
@@ -156,13 +158,91 @@ def validate_jury_ledger(path):
                 datetime.fromisoformat(row["ts"])
                 amount = float(row.get("cost_usd", 0))
                 avoided = float(row.get("avoided_usd", 0))
-                if amount < 0 or avoided < 0:
+                if not all(math.isfinite(value) and value >= 0 for value in (amount, avoided)):
                     raise ValueError("negative ledger amount")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DataUnavailable(f"llm-jury ledger is invalid: {type(exc).__name__}") from exc
 
 
-def build_snapshot(cycle, generated_at, get_prices=prices):
+def usage_bucket():
+    return {"calls": 0, "input": 0, "output": 0, "cached": 0, "actual_usd": 0.0}
+
+
+def ledger_usage(text, start, end, deduplicate=False):
+    result = {}
+    seen = set()
+    try:
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            timestamp = datetime.fromisoformat(row["ts"])
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            if not start <= timestamp < end:
+                continue
+            if row.get("billing") == "subscription":
+                continue
+            if deduplicate:
+                identity = row["id"]
+                if not isinstance(identity, str) or not identity:
+                    raise ValueError("missing request ID")
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            backend = row["backend"]
+            if backend not in ("openrouter", "ollama"):
+                raise ValueError("unsupported metered backend")
+            prompt_tokens = row["prompt_tokens"]
+            completion_tokens = row["completion_tokens"]
+            if any(type(value) is not int or value < 0
+                   for value in (prompt_tokens, completion_tokens)):
+                raise ValueError("invalid native token count")
+            amount = float(row["cost_usd"])
+            if not math.isfinite(amount) or amount < 0 or (backend == "ollama" and amount):
+                raise ValueError("invalid cost")
+            bucket = result.setdefault(backend, usage_bucket())
+            bucket["calls"] += 1
+            bucket["input"] += prompt_tokens
+            bucket["output"] += completion_tokens
+            bucket["actual_usd"] += amount
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DataUnavailable(f"provider usage ledger is invalid: {type(exc).__name__}") from exc
+    return result
+
+
+def jev_usage(start, end):
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", JEV_REMOTE_SSH,
+             "cat ~/.config/jev/usage.jsonl"],
+            check=True, capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise DataUnavailable(f"JEV receipt collection failed: {type(exc).__name__}") from exc
+    return ledger_usage(result.stdout, start, end, deduplicate=True).get("openrouter", usage_bucket())
+
+
+def comparison_row(label, usage, rate):
+    cached = min(usage["cached"], usage["input"])
+    baseline = ((usage["input"] - cached) * rate["prompt"]
+                + cached * rate["input_cache_read"] + usage["output"] * rate["completion"])
+    return {"label": label, **usage, "codex_equivalent_usd": baseline,
+            "net_savings_usd": baseline - usage["actual_usd"]}
+
+
+def transcript_usage(groups, claude=False):
+    bucket = usage_bucket()
+    for usage in groups.values():
+        bucket["calls"] += usage["turns"]
+        bucket["input"] += usage["input"]
+        bucket["cached"] += usage["cache_read"]
+        bucket["output"] += usage["output"]
+        if claude:
+            bucket["input"] += usage["cache_read"] + usage["cache_w5m"] + usage["cache_w1h"]
+    return bucket
+
+
+def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usage):
     """Read every required local source for one completed, fixed week."""
     required = (Path(report.PROJECTS_DIR), Path(report.CODEX_SESSIONS_DIR),
                 QWEN_USAGE, Path(report.LLMJURY_SPEND_LEDGER))
@@ -173,14 +253,17 @@ def build_snapshot(cycle, generated_at, get_prices=prices):
     rates = get_prices()
     validate_jury_ledger(report.LLMJURY_SPEND_LEDGER)
     try:
-        _, claude, _, claude_files, _ = report.scan(7, now=end, strict=True)
-        codex, codex_files = report.scan_codex(start, end=end, strict=True)
+        _, claude, _, claude_files, _ = report.scan(7, now=end, strict=True, cutoff=start)
+        codex, codex_files = report.scan_codex(start, sessions_dir=report.CODEX_SESSIONS_DIR,
+                                              end=end, strict=True)
     except (OSError, ValueError, TypeError) as exc:
         raise DataUnavailable(f"transcript scan failed: {type(exc).__name__}") from exc
     jury = report.llmjury_spend(7, now=end)
     if not jury["available"]:
         raise DataUnavailable("llm-jury ledger is unreadable")
-    qwen = qwen_usage(start, end)
+    qwen = qwen_usage(start, end, QWEN_USAGE)
+    jury_usage = ledger_usage(Path(report.LLMJURY_SPEND_LEDGER).read_text(), start, end)
+    jev = get_jev_usage(start, end)
     local_claude = {k: v for k, v in claude.items() if report.is_local(k)}
     local_codex = {k: v for k, v in codex.items() if report.is_local(k)}
     claude_rate = rates["anthropic/claude-opus-5"]
@@ -198,7 +281,16 @@ def build_snapshot(cycle, generated_at, get_prices=prices):
                  + qwen_cached * codex_rate["input_cache_read"]
                  + qwen["output"] * codex_rate["completion"]},
     }
-    return {"schema": 1, "cycle_id": cycle["id"],
+    comparison = [
+        comparison_row("Local Codex", transcript_usage(local_codex), codex_rate),
+        comparison_row("Local Claude", transcript_usage(local_claude, claude=True), codex_rate),
+        comparison_row("Standalone Qwen", {"calls": qwen["requests"], "input": qwen["input"],
+                       "output": qwen["output"], "cached": qwen["cached"], "actual_usd": 0.0}, codex_rate),
+        comparison_row("LLM-Jury local council", jury_usage.get("ollama", usage_bucket()), codex_rate),
+        comparison_row("LLM-Jury OpenRouter", jury_usage.get("openrouter", usage_bucket()), codex_rate),
+        comparison_row("JEV through OpenRouter", jev, codex_rate),
+    ]
+    return {"schema": 2, "cycle_id": cycle["id"],
             "window_start": start.isoformat(), "window_end": end.isoformat(),
             "window_start_local": cycle["start"].isoformat(),
             "window_end_local": cycle["end"].isoformat(),
@@ -207,6 +299,10 @@ def build_snapshot(cycle, generated_at, get_prices=prices):
             "sources": {"claude_files": claude_files, "codex_files": codex_files,
                         "qwen_sessions": qwen["sessions"], "llmjury_available": True},
             "local": local,
+            "comparison": comparison,
+            "codex_equivalent_usd": sum(row["codex_equivalent_usd"] for row in comparison),
+            "actual_metered_usd": sum(row["actual_usd"] for row in comparison),
+            "net_savings_usd": sum(row["net_savings_usd"] for row in comparison),
             "local_total_usd": sum(row["usd"] for row in local.values()),
             "subscription_avoided_estimate_usd": jury["avoided_usd"],
             "openrouter_metered_usd": jury["usd"]}
@@ -247,16 +343,21 @@ def read_json(path):
 
 
 def snapshot_fresh(snapshot, cycle, now):
-    if not snapshot or snapshot.get("schema") != 1 or snapshot.get("cycle_id") != cycle["id"]:
+    if not snapshot or snapshot.get("schema") != 2 or snapshot.get("cycle_id") != cycle["id"]:
         return False
     try:
         generated = datetime.fromisoformat(snapshot["generated_at"])
+        if generated.tzinfo is None:
+            return False
+        if (datetime.fromisoformat(snapshot["window_start"]) != cycle["start"]
+                or datetime.fromisoformat(snapshot["window_end"]) != cycle["end"]):
+            return False
     except (KeyError, TypeError, ValueError):
         return False
     age = now - generated
     return (cycle["end"] <= generated.astimezone(PACIFIC)
             and timedelta(0) <= age <= timedelta(hours=24)
-            and all(key in snapshot for key in ("local", "pricing", "sources")))
+            and all(key in snapshot for key in ("comparison", "pricing", "sources")))
 
 
 def collect(now):
@@ -276,36 +377,37 @@ def collect(now):
 
 
 def email_body(snapshot):
-    local = snapshot["local"]
     start = snapshot["window_start_local"][:10]
     end = snapshot["window_end_local"][:10]
     return "\n".join([
-        f"# Local-agent cost comparison, {start} to {end}", "",
-        "| Local path | Measured work | OpenRouter-equivalent charge avoided |",
-        "|---|---:|---:|",
-        f"| Codex | {local['codex']['turns']} turns, {report.fmt_tok(local['codex']['tokens'])} tokens | ${local['codex']['usd']:,.2f} |",
-        f"| Claude | {local['claude']['turns']} turns, {report.fmt_tok(local['claude']['tokens'])} tokens | ${local['claude']['usd']:,.2f} |",
-        f"| Standalone Qwen | {local['qwen']['sessions']} sessions, {report.fmt_tok(local['qwen']['input'] + local['qwen']['output'])} tokens | ${local['qwen']['usd']:,.2f} |",
+        f"# Weekly savings versus Codex-only token volume, {start} to {end}", "",
+        "| Recorded path | Calls | Codex-equivalent cost | Metered spend | Estimated net savings |",
+        "|---|---:|---:|---:|---:|",
+        *[f"| {row['label']} | {row['calls']} | ${row['codex_equivalent_usd']:,.4f} | "
+          f"${row['actual_usd']:,.4f} | ${row['net_savings_usd']:,.4f} |" for row in snapshot["comparison"]],
         "",
-        f"**Local total: ${snapshot['local_total_usd']:,.2f}.**",
+        f"**Estimated net savings on recorded calls: ${snapshot['net_savings_usd']:,.4f}.** "
+        f"Codex-equivalent token volume: ${snapshot['codex_equivalent_usd']:,.4f}; "
+        f"metered OpenRouter spend: ${snapshot['actual_metered_usd']:,.4f}.",
         "",
-        f"Subscription-backed frontier calls avoided an estimated ${snapshot['subscription_avoided_estimate_usd']:,.2f} of OpenRouter charges. "
-        f"The llm-jury ledger records ${snapshot['openrouter_metered_usd']:,.2f} of metered OpenRouter spend. "
-        "These figures stay outside the local total.",
+        "Codex subscription frontier calls do not add savings against Codex-only usage. "
+        "They remain on the subscription in both workflows and cancel out of this comparison.",
         "",
-        "This compares measured local tokens with current published OpenRouter rates: "
-        "GPT-5.6 Sol for Codex and standalone Qwen; Claude Opus 5 for Claude. "
-        "It estimates the charge for equivalent token volume, not a reduction "
-        "in an existing subscription bill. Hardware and electricity costs are excluded. "
-        "Local Ollama calls made outside these three transcript sources, including "
-        "llm-jury council calls and router failover, lack a complete token ledger "
-        "and are excluded from this measured total.",
+        "The baseline prices each recorded call's token volume at published GPT-5.6 Sol "
+        "rates, including input-cache pricing where the source supplies cached tokens. "
+        "JEV and LLM-Jury spend comes from provider receipts. Negative savings remain visible. "
+        "This is an API-price counterfactual, not a reduction in a flat-rate Codex subscription "
+        "bill or proof that one Codex solve would use the same tokens as a multi-model council. "
+        "Hardware, electricity, retries without receipts, unlogged local models and router "
+        "failover are excluded. JEV and local-council tracking starts with the accounting "
+        "release; earlier calls are unmeasured, not assumed free. Remote JEV receipts cover "
+        "the Team Nebula JEV service; unrelated OpenRouter activity is excluded.",
         f"Local snapshot: {snapshot['generated_at']}. Pricing: {snapshot['pricing_source']}.",
     ])
 
 
 def send(snapshot):
-    subject = (f"${snapshot['local_total_usd']:,.2f} local model cost avoided "
+    subject = (f"${snapshot['net_savings_usd']:,.4f} estimated savings vs Codex-only "
                f"| week ending {snapshot['cycle_id']}")
     payload = {"recipient_email": report.EMAIL_TO, "subject": subject,
                "body": report.md_to_html(email_body(snapshot)), "is_html": True}

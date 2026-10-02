@@ -165,11 +165,23 @@ It reads Claude and Codex transcripts, completed Qwen Code sessions from
 GPT-5.6 Sol and Claude Opus 5 prices from OpenRouter's public model catalog.
 The collector writes an atomic JSON snapshot under
 `~/.claude/state/weekly-savings/` and sends that snapshot over SSH to the
-Screddy Hermes host. Standalone Qwen stays in its own row because its usage
-log does not identify a Claude or Codex client. Local Ollama calls outside
-these transcript sources, including llm-jury council and router failover,
-are excluded until they have a complete per-call token ledger. The email
-names that coverage limit instead of presenting the estimate as all local use.
+Screddy Hermes host. The schema-2 email compares local Codex, local Claude,
+standalone Qwen, LLM-Jury local council, LLM-Jury OpenRouter, and JEV with one
+Codex-only token-volume baseline. It subtracts native provider spend, preserves
+negative savings, and excludes subscription frontier value from savings because
+Codex subscription calls occur in both workflows. JEV receipts come from
+`~/.config/jev/usage.jsonl` on `neb-ops-gcp` (`SAVINGS_JEV_REMOTE_SSH` overrides
+the SSH alias); the collector never reads the service's OpenRouter credential.
+Both provider receipts use native token counts, and JEV request IDs deduplicate
+exports. Install the JEV receipt release and the LLM-Jury local-token release
+before enabling schema-2 delivery. A missing or unreadable JEV ledger defers
+delivery instead of claiming zero spend. The Mac needs working SSH/IAP access
+to that host when collecting a snapshot.
+
+The amount estimates API charges for equal token volume, not task-level quality
+equivalence or cash saved on a flat-rate Codex subscription. Earlier JEV and
+local-council calls have no receipt and remain excluded. Hardware, electricity,
+unlogged local models, and router failover remain explicit coverage gaps.
 
 Remote Hermes checks hourly and sends on Monday at 19:07 Pacific if the
 snapshot covers the complete week and is no more than 24 hours old. If the Mac
@@ -178,8 +190,9 @@ snapshot. The window ends Thursday at 19:07 Pacific, three days after the
 normal send. Hermes then records a skipped week. It records an attempted send
 before calling Gmail, so an uncertain Gmail result cannot cause an automatic
 duplicate. The email labels its dollars as OpenRouter-equivalent charges for
-measured token volume. It keeps subscription value and actual OpenRouter spend
-outside the local total; it does not claim a reduction in a flat-rate bill.
+measured token volume less metered OpenRouter spend; it does not claim a reduction
+in a flat-rate bill. It rejects legacy or mismatched-window snapshots and uses
+explicit Pacific-week boundaries through daylight-saving changes.
 
 The older Sunday Mac Hermes cron and LaunchAgent must stay disabled. Install
 `deploy/com.screddy.weekly-savings-collector.plist` as a Mac LaunchAgent and
