@@ -183,6 +183,8 @@ def llmjury_spend(days, now=None):
                 if str(rec.get("billing", "")).lower() == "subscription":
                     avoided += float(rec.get("avoided_usd") or 0.0)
                     sub_calls += 1
+                elif rec.get("backend") == "ollama":
+                    continue
                 else:
                     usd += cost
                     calls += 1
@@ -251,9 +253,9 @@ def counterfactual_usd(tok, now):
     return cost_usd(t, now)
 
 
-def scan(days, now=None, strict=False):
+def scan(days, now=None, strict=False, cutoff=None):
     now = now or datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=days)
+    cutoff = cutoff or now - timedelta(days=days)
     per_model = defaultdict(lambda: {"model": "", "input": 0, "output": 0, "cache_read": 0,
                                      "cache_w5m": 0, "cache_w1h": 0, "turns": 0})
     seen = set()

@@ -509,6 +509,8 @@ def test_llmjury_spend_keeps_avoided_apart_from_metered(tmp_path, monkeypatch):
     ledger.write_text("".join(json.dumps(r) + "\n" for r in [
         {"ts": "2026-09-10T12:00:00+00:00", "backend": "openrouter",
          "model": "deepseek/deepseek-v4-pro", "cost_usd": 0.40},
+        {"ts": "2026-09-10T12:01:00+00:00", "backend": "ollama",
+         "model": "gemma3:12b", "cost_usd": 0.0},
         {"ts": "2026-09-10T12:05:00+00:00", "backend": "codex", "model": "gpt-5.6-sol",
          "billing": "subscription", "cost_usd": 0.0, "avoided_usd": 0.25, "estimated": True},
         {"ts": "2026-09-10T12:06:00+00:00", "backend": "claude", "model": "claude-opus-5",
