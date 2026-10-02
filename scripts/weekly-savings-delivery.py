@@ -10,6 +10,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -31,7 +32,7 @@ REMOTE_SSH = os.environ.get("SAVINGS_REMOTE_SSH", "hermes@5.161.126.205")
 REMOTE_STATE_DIR = os.environ.get("SAVINGS_REMOTE_STATE_DIR", "/home/hermes/.hermes/savings")
 JEV_REMOTE_SSH = os.environ.get("SAVINGS_JEV_REMOTE_SSH", "neb-ops-gcp")
 PRICES_URL = "https://openrouter.ai/api/v1/models"
-MODEL_IDS = ("openai/gpt-5.6-sol", "anthropic/claude-opus-5")
+MODEL_IDS = ("anthropic/claude-opus-5",)
 HOUR = 19
 MINUTE = 7
 
@@ -72,7 +73,26 @@ def atomic_json(path, value):
             os.unlink(temp)
 
 
-def prices(fetch=None):
+def codex_baseline_model():
+    selected = os.environ.get("SAVINGS_CODEX_MODEL")
+    if not selected:
+        config_path = Path(os.environ.get("SAVINGS_CODEX_CONFIG", Path.home() / ".codex/config.toml"))
+        try:
+            for line in config_path.read_text().splitlines():
+                if line.strip().startswith("["):
+                    break
+                match = re.match(r"^\s*model\s*=\s*(['\"])([A-Za-z0-9_.:/-]+)\1\s*(?:#.*)?$", line)
+                if match:
+                    selected = match.group(2)
+                    break
+        except OSError as exc:
+            raise DataUnavailable(f"Codex baseline configuration unavailable: {type(exc).__name__}") from exc
+    if not selected or not re.fullmatch(r"[A-Za-z0-9_.:/-]+", selected):
+        raise DataUnavailable("Set SAVINGS_CODEX_MODEL to a published OpenRouter Codex baseline")
+    return selected if "/" in selected else f"openai/{selected}"
+
+
+def prices(fetch=None, model_id=None):
     """Fetch current published rates; a network or schema failure blocks mail."""
     if fetch is None:
         def fetch():
@@ -81,13 +101,13 @@ def prices(fetch=None):
     try:
         models = {row["id"]: row for row in fetch()["data"]}
         result = {}
-        for model_id in MODEL_IDS:
-            pricing = models[model_id]["pricing"]
+        for selected_model in (model_id or codex_baseline_model(), *MODEL_IDS):
+            pricing = models[selected_model]["pricing"]
             rate = {key: float(pricing[key]) for key in
                     ("prompt", "completion", "input_cache_read")}
             if not all(0 <= value < 1 for value in rate.values()):
                 raise ValueError("invalid price")
-            result[model_id] = rate
+            result[selected_model] = rate
         return result
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DataUnavailable(f"OpenRouter price lookup failed: {type(exc).__name__}") from exc
@@ -271,7 +291,11 @@ def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usa
     local_claude = {k: v for k, v in claude.items() if report.is_local(k)}
     local_codex = {k: v for k, v in codex.items() if report.is_local(k)}
     claude_rate = rates["anthropic/claude-opus-5"]
-    codex_rate = rates["openai/gpt-5.6-sol"]
+    codex_models = [model for model in rates if model.startswith("openai/")]
+    if len(codex_models) != 1:
+        raise DataUnavailable("Pricing must identify exactly one OpenAI Codex baseline")
+    baseline_model = codex_models[0]
+    codex_rate = rates[baseline_model]
     qwen_cached = min(qwen["cached"], qwen["input"])
     local = {
         "claude": {"turns": sum(v["turns"] for v in local_claude.values()),
@@ -300,6 +324,7 @@ def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usa
             "window_end_local": cycle["end"].isoformat(),
             "generated_at": generated_at.astimezone(timezone.utc).isoformat(),
             "pricing_source": PRICES_URL, "pricing": rates,
+            "baseline_model": baseline_model,
             "sources": {"claude_files": claude_files, "codex_files": codex_files,
                         "qwen_sessions": qwen["sessions"], "llmjury_available": True},
             "local": local,
@@ -397,8 +422,9 @@ def email_body(snapshot):
         "Codex subscription frontier calls do not add savings against Codex-only usage. "
         "They remain on the subscription in both workflows and cancel out of this comparison.",
         "",
-        "The baseline prices each recorded call's token volume at published GPT-5.6 Sol "
-        "rates, including input-cache pricing where the source supplies cached tokens. "
+        f"The baseline prices each recorded call's token volume at published {snapshot['baseline_model']} "
+        "rates from the Mac's configured Codex default at collection time, including "
+        "input-cache pricing where the source supplies cached tokens. "
         "JEV and LLM-Jury spend comes from provider receipts. Negative savings remain visible. "
         "This is an API-price counterfactual, not a reduction in a flat-rate Codex subscription "
         "bill or proof that one Codex solve would use the same tokens as a multi-model council. "

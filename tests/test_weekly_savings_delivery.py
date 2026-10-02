@@ -34,7 +34,7 @@ def test_published_prices_supply_the_counterfactual():
         {"id": "anthropic/claude-opus-5", "pricing":
          {"prompt": "0.000005", "completion": "0.000025", "input_cache_read": "0.0000005"}},
     ]}
-    rates = DELIVERY.prices(lambda: catalog)
+    rates = DELIVERY.prices(lambda: catalog, model_id="openai/gpt-5.6-sol")
     usage = {"local": {"input": 1_000_000, "cache_read": 200_000,
                        "output": 100_000, "cache_w5m": 0, "cache_w1h": 0}}
     assert DELIVERY.codex_equivalent(usage, rates["openai/gpt-5.6-sol"]) == pytest.approx(2.64)
@@ -55,6 +55,25 @@ def test_qwen_sessions_are_measured_once_and_not_assigned_to_a_client(tmp_path):
                      "cached": 100, "output": 50}
     with pytest.raises(DELIVERY.DataUnavailable, match="crosses"):
         DELIVERY.qwen_usage(when(25, 19, 8), when(27), path)
+
+
+def test_baseline_tracks_configured_codex_instead_of_a_stale_model(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text('model = "gpt-6.1-sol"\n[profiles.other]\nmodel = "gpt-5.6-sol"\n')
+    monkeypatch.delenv("SAVINGS_CODEX_MODEL", raising=False)
+    monkeypatch.setenv("SAVINGS_CODEX_CONFIG", str(config))
+    assert DELIVERY.codex_baseline_model() == "openai/gpt-6.1-sol"
+    monkeypatch.setenv("SAVINGS_CODEX_MODEL", "openai/gpt-6-astra")
+    assert DELIVERY.codex_baseline_model() == "openai/gpt-6-astra"
+
+
+def test_missing_baseline_is_not_silently_replaced_with_old_pricing(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text('[profiles.other]\nmodel = "gpt-5.6-sol"\n')
+    monkeypatch.delenv("SAVINGS_CODEX_MODEL", raising=False)
+    monkeypatch.setenv("SAVINGS_CODEX_CONFIG", str(config))
+    with pytest.raises(DELIVERY.DataUnavailable, match="SAVINGS_CODEX_MODEL"):
+        DELIVERY.codex_baseline_model()
 
 
 def test_damaged_jury_ledger_blocks_a_snapshot(tmp_path):

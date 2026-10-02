@@ -162,7 +162,12 @@ python3 scripts/claude-savings-report.py --dry-run   # preview, writes and email
 collects a fixed Sunday 19:07 to Sunday 19:07 Pacific week after it closes.
 It reads Claude and Codex transcripts, completed Qwen Code sessions from
 `~/.qwen/usage_record.jsonl`, and the llm-jury ledger. It fetches current
-GPT-5.6 Sol and Claude Opus 5 prices from OpenRouter's public model catalog.
+the Mac's configured Codex default and Claude Opus 5 prices from OpenRouter's
+public model catalog. `SAVINGS_CODEX_MODEL` can pin a published baseline;
+otherwise the collector reads the top-level model in `~/.codex/config.toml`
+(`SAVINGS_CODEX_CONFIG` overrides that path). Missing model configuration or
+catalog pricing defers the report instead of substituting a stale model. Each
+snapshot records the selected model and rates.
 The collector writes an atomic JSON snapshot under
 `~/.claude/state/weekly-savings/` and sends that snapshot over SSH to the
 Screddy Hermes host. The schema-2 email compares local Codex, local Claude,
