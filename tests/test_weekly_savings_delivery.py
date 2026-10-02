@@ -107,6 +107,15 @@ def test_local_jury_and_metered_jury_keep_separate_receipts():
     assert usage["openrouter"]["actual_usd"] == 0.004
 
 
+def test_provider_cached_tokens_are_preserved_and_missing_cost_is_not_free():
+    row = {"ts": when(25).isoformat(), "backend": "openrouter", "prompt_tokens": 100,
+           "completion_tokens": 10, "cached_tokens": 80, "cost_usd": 0.001}
+    assert DELIVERY.ledger_usage(json.dumps(row), when(20), when(27))["openrouter"]["cached"] == 80
+    for invalid in ({"cached_tokens": 101}, {"cost_available": False}):
+        with pytest.raises(DELIVERY.DataUnavailable):
+            DELIVERY.ledger_usage(json.dumps({**row, **invalid}), when(20), when(27))
+
+
 def test_legacy_mismatched_and_naive_snapshots_cannot_send():
     cycle = DELIVERY.cycle_for(when(28))
     data = snapshot(cycle, when(28))

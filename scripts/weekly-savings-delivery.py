@@ -195,9 +195,12 @@ def ledger_usage(text, start, end, deduplicate=False):
                 raise ValueError("unsupported metered backend")
             prompt_tokens = row["prompt_tokens"]
             completion_tokens = row["completion_tokens"]
+            cached_tokens = row.get("cached_tokens", 0)
             if any(type(value) is not int or value < 0
-                   for value in (prompt_tokens, completion_tokens)):
+                   for value in (prompt_tokens, completion_tokens, cached_tokens)):
                 raise ValueError("invalid native token count")
+            if cached_tokens > prompt_tokens or row.get("cost_available") is False:
+                raise ValueError("invalid cache count or unavailable cost")
             amount = float(row["cost_usd"])
             if not math.isfinite(amount) or amount < 0 or (backend == "ollama" and amount):
                 raise ValueError("invalid cost")
@@ -205,6 +208,7 @@ def ledger_usage(text, start, end, deduplicate=False):
             bucket["calls"] += 1
             bucket["input"] += prompt_tokens
             bucket["output"] += completion_tokens
+            bucket["cached"] += cached_tokens
             bucket["actual_usd"] += amount
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DataUnavailable(f"provider usage ledger is invalid: {type(exc).__name__}") from exc
