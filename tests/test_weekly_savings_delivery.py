@@ -84,10 +84,13 @@ def test_damaged_jury_ledger_blocks_a_snapshot(tmp_path):
 
 
 def snapshot(cycle, generated):
-    return {"schema": 2, "cycle_id": cycle["id"],
+    return {"schema": 3, "cycle_id": cycle["id"],
             "window_start": cycle["start"].isoformat(), "window_end": cycle["end"].isoformat(),
             "generated_at": generated.astimezone(timezone.utc).isoformat(),
-            "comparison": [], "pricing": {}, "sources": {}}
+            "comparison": [], "pricing": {}, "sources": {},
+            "subscription": {"baseline": "same_codex_subscription", "subscription_savings_usd": 0,
+                             "evidence_message_id": "bill-1"},
+            "actual_metered_usd": 0, "net_savings_usd": 0}
 
 
 def test_comparison_subtracts_spend_and_preserves_negative_savings():
@@ -138,7 +141,7 @@ def test_provider_cached_tokens_are_preserved_and_missing_cost_is_not_free():
 def test_legacy_mismatched_and_naive_snapshots_cannot_send():
     cycle = DELIVERY.cycle_for(when(28))
     data = snapshot(cycle, when(28))
-    for changed in ({"schema": 1}, {"window_start": when(21).isoformat()},
+    for changed in ({"schema": 1}, {"schema": 2}, {"window_start": when(21).isoformat()},
                     {"generated_at": "2026-09-28T19:07:00"}):
         assert not DELIVERY.snapshot_fresh({**data, **changed}, cycle, when(28))
 
@@ -171,15 +174,62 @@ def test_snapshot_combines_native_receipts_against_one_codex_rate(tmp_path, monk
     cycle = DELIVERY.cycle_for(when(28))
     result = DELIVERY.build_snapshot(cycle, when(28),
               lambda: {"openai/gpt-5.6-sol": rate, "anthropic/claude-opus-5": rate},
-              lambda *args: jev)
-    assert result["schema"] == 2
+              lambda *args: jev, lambda now: {"current_plan": "ChatGPT Pro 500",
+                  "scheduled_plan": "ChatGPT Pro 200", "scheduled_date": "2026-10-30",
+                  "evidence_message_id": "bill-1", "evidence_at": when(25).isoformat()})
+    assert result["schema"] == 3
     assert result["codex_equivalent_usd"] == pytest.approx(0.009)
     assert result["actual_metered_usd"] == pytest.approx(0.0011)
-    assert result["net_savings_usd"] == pytest.approx(0.0079)
+    assert result["api_equivalent_difference_usd"] == pytest.approx(0.0079)
+    assert result["net_savings_usd"] == pytest.approx(-0.0011)
+    assert result["subscription"]["subscription_savings_usd"] == 0
     body = DELIVERY.email_body(result)
     assert "JEV through OpenRouter" in body
-    assert "do not add savings" in body
+    assert "subscription bill savings versus keeping the same plan: $0.00" in body
+    assert "This is pending" in body
+    assert "$0.0079" not in body
     assert "earlier calls are unmeasured" in body
+
+
+def plan_message(text, sender="OpenAI <noreply@tm.openai.com>"):
+    return {"sender": sender, "subject": "ChatGPT - Your updated plan",
+            "messageId": "bill-1", "messageTimestamp": "2026-09-30T23:14:06Z",
+            "messageText": text}
+
+
+def test_pending_plan_reduction_is_not_a_current_discount():
+    message = plan_message("Your ChatGPT Pro 500 subscription will remain active until "
+                           "Oct 30, 2026, when your ChatGPT Pro 200 subscription will take effect.")
+    current = datetime(2026, 10, 2, tzinfo=PT)
+    result = DELIVERY.billing_state_from_messages([message], current)
+    assert result["current_plan"] == "ChatGPT Pro 500"
+    assert result["scheduled_plan"] == "ChatGPT Pro 200"
+    assert result["scheduled_date"] == "2026-10-30"
+    with pytest.raises(DELIVERY.DataUnavailable, match="fresh billing confirmation"):
+        DELIVERY.billing_state_from_messages([message], datetime(2026, 10, 30, tzinfo=PT))
+
+
+def test_billing_reads_latest_verified_plan_and_rejects_spoofed_and_future_messages():
+    text = "Your subscription has been upgraded from ChatGPT Pro 200 to ChatGPT Pro 500."
+    message = plan_message(text)
+    now = datetime(2026, 10, 2, tzinfo=PT)
+    result = DELIVERY.billing_state_from_messages([message], now)
+    assert result["current_plan"] == "ChatGPT Pro 500"
+    for invalid in ({**message, "sender": "noreply@tm.openai.com.evil.test"},
+                    {**message, "messageTimestamp": "2026-10-20T00:00:00Z"},
+                    {**message, "messageId": ""}):
+        with pytest.raises(DELIVERY.DataUnavailable):
+            DELIVERY.billing_state_from_messages([invalid], now)
+
+
+def test_forged_positive_subscription_savings_and_nan_cash_cannot_send():
+    cycle = DELIVERY.cycle_for(when(28))
+    data = snapshot(cycle, when(28))
+    invalid = {**data, "subscription": {**data["subscription"], "subscription_savings_usd": 300}}
+    assert not DELIVERY.snapshot_fresh(invalid, cycle, when(28))
+    for changed in ({"net_savings_usd": 20}, {"actual_metered_usd": float("nan")},
+                    {"actual_metered_usd": -1}):
+        assert not DELIVERY.snapshot_fresh({**data, **changed}, cycle, when(28))
 
 
 def test_jev_read_failure_defers_instead_of_inventing_zero_spend(monkeypatch):

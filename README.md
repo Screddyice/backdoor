@@ -170,7 +170,22 @@ catalog pricing defers the report instead of substituting a stale model. Each
 snapshot records the selected model and rates.
 The collector writes an atomic JSON snapshot under
 `~/.claude/state/weekly-savings/` and sends that snapshot over SSH to the
-Screddy Hermes host. The schema-2 email compares local Codex, local Claude,
+Screddy Hermes host. The schema-3 email leads with subscription cash savings
+against keeping the same Codex subscription. That fixed fee cancels between the
+two workflows; offloaded tokens do not discount it. Native OpenRouter/JEV/Jury
+spend is additional cost, so net recorded cash savings are zero minus provider
+spend. API-equivalent values remain diagnostic fields and never appear as cash
+savings in the subject or report. The report does not infer avoided upgrades,
+credit purchases, or refunds from token counts.
+
+The collector identity-checks the billing Gmail account and reads OpenAI plan
+confirmation emails. A pending downgrade remains pending; after its scheduled
+date, delivery requires fresh confirmation rather than assuming it took effect.
+`SAVINGS_BILLING_ACCOUNT` and `SAVINGS_BILLING_EMAIL` override the sender account
+and `admin@teamnebula.ai` identity defaults. No nominal plan name is treated as
+an invoice, and unrelated plan changes add no model-routing savings.
+
+The usage diagnostics compare local Codex, local Claude,
 standalone Qwen, LLM-Jury local council, LLM-Jury OpenRouter, and JEV with one
 Codex-only token-volume baseline. It subtracts native provider spend, preserves
 negative savings, and excludes subscription frontier value from savings because
@@ -179,14 +194,15 @@ Codex subscription calls occur in both workflows. JEV receipts come from
 the SSH alias); the collector never reads the service's OpenRouter credential.
 Both provider receipts use native token counts, and JEV request IDs deduplicate
 exports. Install the JEV receipt release and the LLM-Jury local-token release
-before enabling schema-2 delivery. A missing or unreadable JEV ledger defers
+before enabling schema-3 delivery. A missing or unreadable JEV ledger defers
 delivery instead of claiming zero spend. The Mac needs working SSH/IAP access
 to that host when collecting a snapshot.
 The collector LaunchAgent includes Homebrew's executable path so SSH can run
 the `gcloud` IAP proxy outside an interactive shell.
 
-The amount estimates API charges for equal token volume, not task-level quality
-equivalence or cash saved on a flat-rate Codex subscription. Earlier JEV and
+The diagnostic amounts estimate API charges for equal token volume, not task-level
+quality equivalence or cash saved on a flat-rate Codex subscription. Schema-1/2
+snapshots cannot dispatch through schema 3. Earlier JEV and
 local-council calls have no receipt and remain excluded. Hardware, electricity,
 unlogged local models, and router failover remain explicit coverage gaps.
 
