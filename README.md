@@ -184,8 +184,8 @@ USD/month assumption. The email labels this assumption; it is not an invoice,
 tax-inclusive payment, refund, historical tier price, or billing-period proration.
 Cached input is included in raw input, not added twice. Every path uses the same
 Codex model's input/output/cache rates as weights, not as the dollar headline.
-The estimate is bounded by the nominal weekly budget and retains negative net
-value. Missing cloud usage produces an unavailable estimate, not 100% savings.
+The estimate retains negative net value. Missing cloud usage means unavailable,
+not 100% savings.
 
 This measures the value of workload offloaded, not actual subscription cash
 savings or measured quota. Different tokenizers, repeated council candidates,

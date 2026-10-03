@@ -606,21 +606,17 @@ def email_body(snapshot):
         f"Net recorded cash difference versus the same Codex subscription: "
         f"${snapshot['net_savings_usd']:,.4f}. Negative means added cost, not an invoice saving.",
         "",
-        "Method: value preserved = weekly nominal budget × offloaded weighted workload ÷ "
-        "(recorded cloud Codex weighted workload + offloaded weighted workload). All paths "
-        "use the same configured Codex model's input/output/cache rates as weighting factors. "
-        "This is a workload allocation estimate, not measured Codex quota saved. Raw native "
-        "tokens use different tokenizers; multiple council candidates and checks are not "
-        "proof that one Codex answer would consume the same tokens. Negative net value is retained.",
+        "Method: allocate weekly budget by offloaded weighted workload ÷ "
+        "(cloud Codex + offloaded weighted workload). The same Codex input/output/cache "
+        "rates weight all paths. This is not measured quota saved: tokenizers and council "
+        "candidates differ, so native tokens do not prove equal avoided Codex usage or outcomes.",
         "",
-        "Provider spend comes from native receipts. API-equivalent values are diagnostics only "
-        "and are not the dollar headline. This does not measure an avoided credit purchase, "
-        "upgrade, refund, or the tier a Codex-only workflow would require. "
-        "Hardware, electricity, retries without receipts, unlogged local models and router "
-        "failover, uninstrumented local diff checks, and unlogged Codex frontier calls are "
-        "coverage gaps. These can skew the estimated share. JEV and local-council tracking starts with the accounting "
-        "release; earlier calls are unmeasured, not assumed free. JEV receipts cover the "
-        "desktop and Team Nebula JEV service; unrelated OpenRouter activity is excluded.",
+        "Provider spend uses native receipts; API equivalents are diagnostics. No avoided "
+        "upgrade, credit purchase or refund is measured. Negative estimates are retained. "
+        "Hardware, electricity, unlogged retries, local diff checks, models, frontier calls "
+        "and router failover are coverage gaps that can skew the share. Tracking starts with "
+        "the receipt release; earlier calls are unmeasured, not free. JEV covers desktop and "
+        "Team Nebula service receipts; unrelated OpenRouter activity is excluded.",
         f"Local snapshot: {snapshot['generated_at']}. Billing evidence: "
         f"{subscription['evidence_message_id']} at {subscription['evidence_at']}.",
     ])
