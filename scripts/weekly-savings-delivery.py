@@ -158,10 +158,12 @@ def qwen_usage(start, end, path=QWEN_USAGE):
                 for usage in local_models.values():
                     for key, field in (("requests", "requests"), ("inputTokens", "input"),
                                        ("cachedTokens", "cached"), ("outputTokens", "output")):
-                        value = int(usage.get(key, 0))
-                        if value < 0:
-                            raise DataUnavailable("negative Qwen usage")
+                        value = usage.get(key, 0)
+                        if type(value) is not int or value < 0:
+                            raise DataUnavailable("invalid native Qwen usage")
                         totals[field] += value
+                    if usage.get("cachedTokens", 0) > usage.get("inputTokens", 0):
+                        raise DataUnavailable("Qwen cache count exceeds input")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DataUnavailable(f"Qwen usage unavailable: {type(exc).__name__}") from exc
     return totals

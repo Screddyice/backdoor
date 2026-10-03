@@ -343,7 +343,7 @@ def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR, end=None, strict=False):
                         raise ValueError(f"invalid Codex transcript line in {path}")
                     continue
                 ts = parse_ts(record.get("timestamp", ""))
-                if ts is None or ts < cutoff or (end is not None and ts >= end):
+                if ts is None or (end is not None and ts >= end):
                     continue
                 payload = record.get("payload") or {}
                 if record.get("type") == "turn_context":
@@ -360,6 +360,8 @@ def scan_codex(cutoff, sessions_dir=CODEX_SESSIONS_DIR, end=None, strict=False):
                 if total_key in seen_totals:
                     continue
                 seen_totals.add(total_key)
+                if ts < cutoff:
+                    continue
                 bucket = per_model[model]
                 bucket["model"] = model
                 bucket["input"] += usage.get("input_tokens", 0) or 0
