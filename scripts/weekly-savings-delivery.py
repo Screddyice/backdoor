@@ -254,6 +254,87 @@ def comparison_row(label, usage, rate):
             "net_savings_usd": baseline - usage["actual_usd"]}
 
 
+def billing_state_from_messages(messages, now):
+    verified = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        sender = message.get("sender", "")
+        if not isinstance(sender, str) or not re.fullmatch(
+                r"(?:OpenAI\s*<)?noreply@tm\.openai\.com>?", sender.strip()):
+            continue
+        if message.get("subject") != "ChatGPT - Your updated plan":
+            continue
+        try:
+            timestamp = datetime.fromisoformat(message["messageTimestamp"].replace("Z", "+00:00"))
+            if timestamp.tzinfo is None or timestamp > now:
+                continue
+            text = " ".join(message["messageText"].split())
+            identifier = message["messageId"]
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not isinstance(identifier, str) or not identifier:
+            continue
+        verified.append((timestamp, text, identifier))
+    for timestamp, text, identifier in sorted(verified, reverse=True):
+        pending = re.search(
+            r"Your ChatGPT Pro (\d+) subscription will remain active until "
+            r"([A-Za-z]+ \d{1,2}, \d{4}), when your ChatGPT Pro (\d+) "
+            r"subscription will take effect", text)
+        upgrade = re.search(
+            r"Your subscription has been upgraded from ChatGPT Pro (\d+) "
+            r"to ChatGPT Pro (\d+)", text)
+        if pending:
+            effective = None
+            for date_format in ("%b %d, %Y", "%B %d, %Y"):
+                try:
+                    effective = datetime.strptime(pending.group(2), date_format).date()
+                    break
+                except ValueError:
+                    pass
+            if effective is None:
+                raise DataUnavailable("Codex scheduled plan date is unrecognized")
+            if now.astimezone(PACIFIC).date() >= effective:
+                raise DataUnavailable("Scheduled Codex plan change needs fresh billing confirmation")
+            return {"current_plan": f"ChatGPT Pro {pending.group(1)}",
+                    "scheduled_plan": f"ChatGPT Pro {pending.group(3)}",
+                    "scheduled_date": effective.isoformat(),
+                    "evidence_message_id": identifier, "evidence_at": timestamp.isoformat()}
+        if upgrade:
+            return {"current_plan": f"ChatGPT Pro {upgrade.group(2)}",
+                    "scheduled_plan": None, "scheduled_date": None,
+                    "evidence_message_id": identifier, "evidence_at": timestamp.isoformat()}
+    raise DataUnavailable("No supported Codex plan confirmation in the verified billing mailbox")
+
+
+def billing_state(now):
+    account = os.environ.get("SAVINGS_BILLING_ACCOUNT", report.EMAIL_FROM)
+    expected_email = os.environ.get("SAVINGS_BILLING_EMAIL", "admin@teamnebula.ai")
+    def execute(slug, payload):
+        try:
+            result = subprocess.run(
+                ["composio", "execute", slug, "--account", account, "-d", json.dumps(payload)],
+                check=True, capture_output=True, text=True, timeout=60)
+            answer = json.loads(result.stdout)
+            if answer.get("storedInFile"):
+                answer = json.loads(Path(answer["outputFilePath"]).read_text())
+            if not answer.get("successful") or not isinstance(answer.get("data"), dict):
+                raise ValueError("billing read unsuccessful")
+            return answer["data"]
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            raise DataUnavailable(f"Codex billing read unavailable: {type(exc).__name__}") from exc
+    profile = execute("GMAIL_GET_PROFILE", {})
+    if profile.get("emailAddress") != expected_email:
+        raise DataUnavailable("Codex billing mailbox identity did not match")
+    data = execute("GMAIL_FETCH_EMAILS", {
+        "query": 'from:noreply@tm.openai.com subject:"Your updated plan" newer_than:180d',
+        "max_results": 30, "verbose": True})
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        raise DataUnavailable("Codex billing messages are unavailable")
+    return billing_state_from_messages(messages, now)
+
+
 def transcript_usage(groups, claude=False):
     bucket = usage_bucket()
     for usage in groups.values():
@@ -266,7 +347,8 @@ def transcript_usage(groups, claude=False):
     return bucket
 
 
-def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usage):
+def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usage,
+                   get_billing_state=billing_state):
     """Read every required local source for one completed, fixed week."""
     required = (Path(report.PROJECTS_DIR), Path(report.CODEX_SESSIONS_DIR),
                 QWEN_USAGE, Path(report.LLMJURY_SPEND_LEDGER))
@@ -318,7 +400,11 @@ def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usa
         comparison_row("LLM-Jury OpenRouter", jury_usage.get("openrouter", usage_bucket()), codex_rate),
         comparison_row("JEV through OpenRouter", jev, codex_rate),
     ]
-    return {"schema": 2, "cycle_id": cycle["id"],
+    metered_spend = sum(row["actual_usd"] for row in comparison)
+    subscription = {**get_billing_state(generated_at), "baseline": "same_codex_subscription",
+                    "subscription_savings_usd": 0.0,
+                    "attribution": "No documented routing-related subscription charge reduction"}
+    return {"schema": 3, "cycle_id": cycle["id"],
             "window_start": start.isoformat(), "window_end": end.isoformat(),
             "window_start_local": cycle["start"].isoformat(),
             "window_end_local": cycle["end"].isoformat(),
@@ -328,10 +414,12 @@ def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usa
             "sources": {"claude_files": claude_files, "codex_files": codex_files,
                         "qwen_sessions": qwen["sessions"], "llmjury_available": True},
             "local": local,
+            "subscription": subscription,
             "comparison": comparison,
             "codex_equivalent_usd": sum(row["codex_equivalent_usd"] for row in comparison),
-            "actual_metered_usd": sum(row["actual_usd"] for row in comparison),
-            "net_savings_usd": sum(row["net_savings_usd"] for row in comparison),
+            "actual_metered_usd": metered_spend,
+            "api_equivalent_difference_usd": sum(row["net_savings_usd"] for row in comparison),
+            "net_savings_usd": -metered_spend,
             "local_total_usd": sum(row["usd"] for row in local.values()),
             "subscription_avoided_estimate_usd": jury["avoided_usd"],
             "openrouter_metered_usd": jury["usd"]}
@@ -372,7 +460,7 @@ def read_json(path):
 
 
 def snapshot_fresh(snapshot, cycle, now):
-    if not snapshot or snapshot.get("schema") != 2 or snapshot.get("cycle_id") != cycle["id"]:
+    if not snapshot or snapshot.get("schema") != 3 or snapshot.get("cycle_id") != cycle["id"]:
         return False
     try:
         generated = datetime.fromisoformat(snapshot["generated_at"])
@@ -380,6 +468,16 @@ def snapshot_fresh(snapshot, cycle, now):
             return False
         if (datetime.fromisoformat(snapshot["window_start"]) != cycle["start"]
                 or datetime.fromisoformat(snapshot["window_end"]) != cycle["end"]):
+            return False
+        subscription = snapshot["subscription"]
+        spend = snapshot["actual_metered_usd"]
+        net = snapshot["net_savings_usd"]
+        if (subscription["baseline"] != "same_codex_subscription"
+                or subscription["subscription_savings_usd"] != 0
+                or not subscription["evidence_message_id"]
+                or type(spend) not in (int, float) or not math.isfinite(spend) or spend < 0
+                or type(net) not in (int, float) or not math.isfinite(net)
+                or not math.isclose(net, -spend, abs_tol=1e-12)):
             return False
     except (KeyError, TypeError, ValueError):
         return False
@@ -408,36 +506,45 @@ def collect(now):
 def email_body(snapshot):
     start = snapshot["window_start_local"][:10]
     end = snapshot["window_end_local"][:10]
+    subscription = snapshot["subscription"]
+    scheduled = (f"The billing email schedules {subscription['scheduled_plan']} for "
+                 f"{subscription['scheduled_date']}. This is pending, and no evidence attributes "
+                 "that plan change to local models or JEV. It adds no savings to this report."
+                 if subscription.get("scheduled_plan") else "No pending plan change in the billing confirmation.")
     return "\n".join([
-        f"# Weekly savings versus Codex-only token volume, {start} to {end}", "",
-        "| Recorded path | Calls | Codex-equivalent cost | Metered spend | Estimated net savings |",
-        "|---|---:|---:|---:|---:|",
-        *[f"| {row['label']} | {row['calls']} | ${row['codex_equivalent_usd']:,.4f} | "
-          f"${row['actual_usd']:,.4f} | ${row['net_savings_usd']:,.4f} |" for row in snapshot["comparison"]],
+        f"# Weekly Codex subscription cash comparison, {start} to {end}", "",
+        "**Codex subscription bill savings versus keeping the same plan: $0.00.**",
+        f"Current billing-confirmed plan at collection: **{subscription['current_plan']}**.",
+        "The Codex-only baseline keeps that same subscription. Its fixed fee is paid in both "
+        "workflows, so shifting calls to another model does not reduce the subscription charge.",
+        scheduled, "",
+        "| Recorded path | Calls | Additional provider spend |",
+        "|---|---:|---:|",
+        *[f"| {row['label']} | {row['calls']} | ${row['actual_usd']:,.4f} |"
+          for row in snapshot["comparison"]],
         "",
-        f"**Estimated net savings on recorded calls: ${snapshot['net_savings_usd']:,.4f}.** "
-        f"Codex-equivalent token volume: ${snapshot['codex_equivalent_usd']:,.4f}; "
-        f"metered OpenRouter spend: ${snapshot['actual_metered_usd']:,.4f}.",
+        f"**Additional recorded OpenRouter/JEV/Jury spend: ${snapshot['actual_metered_usd']:,.4f}.**",
+        f"**Net recorded cash difference versus the same Codex subscription: "
+        f"${snapshot['net_savings_usd']:,.4f}.** Negative means added cost, not money saved.",
         "",
-        "Codex subscription frontier calls do not add savings against Codex-only usage. "
-        "They remain on the subscription in both workflows and cancel out of this comparison.",
+        "Local offloading can preserve subscription allowance. Token counts do not establish "
+        "a subscription discount, an avoided credit purchase, or an avoided higher tier. "
+        "This report does not assume any of those charges. Pending refunds also add no savings.",
         "",
-        f"The baseline prices each recorded call's token volume at published {snapshot['baseline_model']} "
-        "rates from the Mac's configured Codex default at collection time, including "
-        "input-cache pricing where the source supplies cached tokens. "
-        "JEV and LLM-Jury spend comes from provider receipts. Negative savings remain visible. "
-        "This is an API-price counterfactual, not a reduction in a flat-rate Codex subscription "
-        "bill or proof that one Codex solve would use the same tokens as a multi-model council. "
+        "Provider spend comes from native receipts. API-equivalent values are diagnostics only "
+        "and never count as subscription savings. The same-plan baseline does not prove what "
+        "tier a Codex-only workflow would require. "
         "Hardware, electricity, retries without receipts, unlogged local models and router "
         "failover are excluded. JEV and local-council tracking starts with the accounting "
         "release; earlier calls are unmeasured, not assumed free. Remote JEV receipts cover "
         "the Team Nebula JEV service; unrelated OpenRouter activity is excluded.",
-        f"Local snapshot: {snapshot['generated_at']}. Pricing: {snapshot['pricing_source']}.",
+        f"Local snapshot: {snapshot['generated_at']}. Billing evidence: "
+        f"{subscription['evidence_message_id']} at {subscription['evidence_at']}.",
     ])
 
 
 def send(snapshot):
-    subject = (f"${snapshot['net_savings_usd']:,.4f} estimated savings vs Codex-only "
+    subject = (f"$0.00 Codex subscription savings; ${snapshot['actual_metered_usd']:,.4f} added spend "
                f"| week ending {snapshot['cycle_id']}")
     payload = {"recipient_email": report.EMAIL_TO, "subject": subject,
                "body": report.md_to_html(email_body(snapshot)), "is_html": True}

@@ -13,7 +13,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>/Users/screddy</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>/Users/screddy/.composio:/Users/screddy/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>StartCalendarInterval</key>
