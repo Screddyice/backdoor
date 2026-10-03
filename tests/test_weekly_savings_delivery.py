@@ -232,6 +232,33 @@ def test_forged_positive_subscription_savings_and_nan_cash_cannot_send():
         assert not DELIVERY.snapshot_fresh({**data, **changed}, cycle, when(28))
 
 
+def test_billing_mailbox_mismatch_stops_before_reading_messages(monkeypatch):
+    calls = []
+    def execute(command, **kwargs):
+        calls.append(command)
+        return DELIVERY.subprocess.CompletedProcess(command, 0, json.dumps({
+            "successful": True, "data": {"emailAddress": "other@example.com"}}))
+    monkeypatch.setattr(DELIVERY.subprocess, "run", execute)
+    with pytest.raises(DELIVERY.DataUnavailable, match="identity did not match"):
+        DELIVERY.billing_state(datetime(2026, 10, 2, tzinfo=PT))
+    assert len(calls) == 1
+
+
+def test_send_subject_uses_subscription_cash_not_api_equivalent(monkeypatch):
+    captured = []
+    data = {"cycle_id": "2026-09-27", "actual_metered_usd": 0.04,
+            "net_savings_usd": -0.04, "api_equivalent_difference_usd": 400}
+    monkeypatch.setattr(DELIVERY, "email_body", lambda _: "subscription cash report")
+    def execute(command, **kwargs):
+        captured.append(json.loads(command[-1]))
+        return DELIVERY.subprocess.CompletedProcess(command, 0, json.dumps({
+            "successful": True, "data": {"messageId": "gmail-1"}}))
+    monkeypatch.setattr(DELIVERY.subprocess, "run", execute)
+    DELIVERY.send(data)
+    assert captured[0]["subject"].startswith("$0.00 Codex subscription savings; $0.0400 added spend")
+    assert "$400" not in captured[0]["subject"]
+
+
 def test_jev_read_failure_defers_instead_of_inventing_zero_spend(monkeypatch):
     def failed(*args, **kwargs):
         raise DELIVERY.subprocess.CalledProcessError(1, "ssh")

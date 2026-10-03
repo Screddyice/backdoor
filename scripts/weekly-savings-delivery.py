@@ -257,8 +257,11 @@ def comparison_row(label, usage, rate):
 def billing_state_from_messages(messages, now):
     verified = []
     for message in messages:
+        if not isinstance(message, dict):
+            continue
         sender = message.get("sender", "")
-        if not re.fullmatch(r"(?:OpenAI\s*<)?noreply@tm\.openai\.com>?", sender.strip()):
+        if not isinstance(sender, str) or not re.fullmatch(
+                r"(?:OpenAI\s*<)?noreply@tm\.openai\.com>?", sender.strip()):
             continue
         if message.get("subject") != "ChatGPT - Your updated plan":
             continue
@@ -282,7 +285,15 @@ def billing_state_from_messages(messages, now):
             r"Your subscription has been upgraded from ChatGPT Pro (\d+) "
             r"to ChatGPT Pro (\d+)", text)
         if pending:
-            effective = datetime.strptime(pending.group(2), "%b %d, %Y").date()
+            effective = None
+            for date_format in ("%b %d, %Y", "%B %d, %Y"):
+                try:
+                    effective = datetime.strptime(pending.group(2), date_format).date()
+                    break
+                except ValueError:
+                    pass
+            if effective is None:
+                raise DataUnavailable("Codex scheduled plan date is unrecognized")
             if now.astimezone(PACIFIC).date() >= effective:
                 raise DataUnavailable("Scheduled Codex plan change needs fresh billing confirmation")
             return {"current_plan": f"ChatGPT Pro {pending.group(1)}",
@@ -313,12 +324,15 @@ def billing_state(now):
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             raise DataUnavailable(f"Codex billing read unavailable: {type(exc).__name__}") from exc
     profile = execute("GMAIL_GET_PROFILE", {})
-    if profile.get("emailAddress", "").casefold() != expected_email.casefold():
+    if profile.get("emailAddress") != expected_email:
         raise DataUnavailable("Codex billing mailbox identity did not match")
     data = execute("GMAIL_FETCH_EMAILS", {
         "query": 'from:noreply@tm.openai.com subject:"Your updated plan" newer_than:180d',
         "max_results": 30, "verbose": True})
-    return billing_state_from_messages(data.get("messages", []), now)
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        raise DataUnavailable("Codex billing messages are unavailable")
+    return billing_state_from_messages(messages, now)
 
 
 def transcript_usage(groups, claude=False):
