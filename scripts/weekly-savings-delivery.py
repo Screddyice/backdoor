@@ -31,6 +31,7 @@ QWEN_USAGE = Path(os.environ.get("SAVINGS_QWEN_USAGE", Path.home() / ".qwen/usag
 REMOTE_SSH = os.environ.get("SAVINGS_REMOTE_SSH", "hermes@5.161.126.205")
 REMOTE_STATE_DIR = os.environ.get("SAVINGS_REMOTE_STATE_DIR", "/home/hermes/.hermes/savings")
 JEV_REMOTE_SSH = os.environ.get("SAVINGS_JEV_REMOTE_SSH", "neb-ops-gcp")
+JEV_USAGE = Path(os.environ.get("SAVINGS_JEV_USAGE", Path.home() / ".config/jev/usage.jsonl"))
 PRICES_URL = "https://openrouter.ai/api/v1/models"
 MODEL_IDS = ("anthropic/claude-opus-5",)
 HOUR = 19
@@ -239,13 +240,15 @@ def ledger_usage(text, start, end, deduplicate=False):
 
 def jev_usage(start, end):
     try:
+        desktop_receipts = JEV_USAGE.read_text()
         result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", JEV_REMOTE_SSH,
              "cat ~/.config/jev/usage.jsonl"],
             check=True, capture_output=True, text=True, timeout=45)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise DataUnavailable(f"JEV receipt collection failed: {type(exc).__name__}") from exc
-    return ledger_usage(result.stdout, start, end, deduplicate=True).get("openrouter", usage_bucket())
+    return ledger_usage(desktop_receipts + "\n" + result.stdout, start, end,
+                        deduplicate=True).get("openrouter", usage_bucket())
 
 
 def comparison_row(label, usage, rate):
@@ -616,8 +619,8 @@ def email_body(snapshot):
         "Hardware, electricity, retries without receipts, unlogged local models and router "
         "failover, uninstrumented local diff checks, and unlogged Codex frontier calls are "
         "coverage gaps. These can skew the estimated share. JEV and local-council tracking starts with the accounting "
-        "release; earlier calls are unmeasured, not assumed free. Remote JEV receipts cover "
-        "the Team Nebula JEV service; unrelated OpenRouter activity is excluded.",
+        "release; earlier calls are unmeasured, not assumed free. JEV receipts cover the "
+        "desktop and Team Nebula JEV service; unrelated OpenRouter activity is excluded.",
         f"Local snapshot: {snapshot['generated_at']}. Billing evidence: "
         f"{subscription['evidence_message_id']} at {subscription['evidence_at']}.",
     ])

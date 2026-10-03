@@ -206,12 +206,13 @@ The usage diagnostics compare local Codex, local Claude,
 standalone Qwen, LLM-Jury local council, LLM-Jury OpenRouter, and JEV with one
 Codex-only token-volume baseline. It subtracts native provider spend, preserves
 negative savings, and excludes subscription frontier value from savings because
-Codex subscription calls occur in both workflows. JEV receipts come from
-`~/.config/jev/usage.jsonl` on `neb-ops-gcp` (`SAVINGS_JEV_REMOTE_SSH` overrides
-the SSH alias); the collector never reads the service's OpenRouter credential.
+Codex subscription calls occur in both workflows. JEV receipts combine the
+desktop `~/.config/jev/usage.jsonl` (`SAVINGS_JEV_USAGE` overrides it) and that
+same path on `neb-ops-gcp` (`SAVINGS_JEV_REMOTE_SSH` overrides the SSH alias).
+The collector never reads either service's OpenRouter credential.
 Both provider receipts use native token counts, and JEV request IDs deduplicate
-exports. Install the JEV receipt release and the LLM-Jury local-token release
-before enabling schema-4 delivery. A missing or unreadable JEV ledger defers
+exports. Install the JEV receipt release on both JEV hosts and the LLM-Jury
+local-token release on the Mac before enabling schema-4 delivery. A missing JEV ledger defers
 delivery instead of claiming zero spend. The Mac needs working SSH/IAP access
 to that host when collecting a snapshot.
 The collector LaunchAgent includes the installed Composio CLI and Homebrew's
@@ -223,8 +224,8 @@ quality equivalence or cash saved on a flat-rate Codex subscription. Schema-1/2/
 snapshots cannot dispatch through schema 4. Earlier JEV and
 local-council calls have no receipt and remain excluded. Hardware, electricity,
 uninstrumented local diff checks, unlogged local models and Codex frontier calls,
-desktop JEV calls outside the remote service, and router failover remain explicit
-coverage gaps. Missing workload can skew the allocation estimate.
+router failover remain explicit coverage gaps. Missing workload can skew the
+allocation estimate.
 
 Remote Hermes checks hourly and sends on Monday at 19:07 Pacific if the
 snapshot covers the complete week and is no more than 24 hours old. If the Mac

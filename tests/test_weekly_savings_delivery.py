@@ -288,10 +288,31 @@ def test_send_subject_uses_estimated_subscription_value_and_tokens(monkeypatch):
     assert "$400" not in captured[0]["subject"]
 
 
-def test_jev_read_failure_defers_instead_of_inventing_zero_spend(monkeypatch):
+def test_jev_read_failure_defers_instead_of_inventing_zero_spend(tmp_path, monkeypatch):
+    local = tmp_path / "jev.jsonl"
+    local.write_text("")
+    monkeypatch.setattr(DELIVERY, "JEV_USAGE", local)
     def failed(*args, **kwargs):
         raise DELIVERY.subprocess.CalledProcessError(1, "ssh")
     monkeypatch.setattr(DELIVERY.subprocess, "run", failed)
+    with pytest.raises(DELIVERY.DataUnavailable, match="JEV receipt collection failed"):
+        DELIVERY.jev_usage(when(20), when(27))
+
+
+def test_jev_combines_desktop_and_remote_receipts_without_duplicates(tmp_path, monkeypatch):
+    row = {"id": "jev-1", "ts": when(25).isoformat(), "backend": "openrouter",
+           "prompt_tokens": 1000, "completion_tokens": 100, "cost_usd": 0.001}
+    local = tmp_path / "jev.jsonl"
+    local.write_text(json.dumps(row))
+    monkeypatch.setattr(DELIVERY, "JEV_USAGE", local)
+    remote = json.dumps(row) + "\n" + json.dumps({**row, "id": "jev-2"})
+    monkeypatch.setattr(DELIVERY.subprocess, "run", lambda *args, **kwargs:
+                        DELIVERY.subprocess.CompletedProcess("ssh", 0, remote))
+    result = DELIVERY.jev_usage(when(20), when(27))
+    assert result["calls"] == 2
+    assert result["input"] + result["output"] == 2200
+    assert result["actual_usd"] == pytest.approx(0.002)
+    monkeypatch.setattr(DELIVERY, "JEV_USAGE", tmp_path / "missing.jsonl")
     with pytest.raises(DELIVERY.DataUnavailable, match="JEV receipt collection failed"):
         DELIVERY.jev_usage(when(20), when(27))
 
