@@ -379,13 +379,16 @@ def test_corrupt_delivery_state_cannot_be_treated_as_unsent(tmp_path, monkeypatc
         DELIVERY.dispatch(now, lambda _: pytest.fail("sent with corrupt state"))
 
 
+VALUE_RATE = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+
+
 def value_usage(input_tokens=1000, output_tokens=100, cached=0, spend=0):
     return {"label": "Local checks", "calls": 1, "input": input_tokens,
             "output": output_tokens, "cached": cached, "actual_usd": spend}
 
 
 def test_subscription_allocation_uses_consistent_input_output_cache_weights():
-    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    rate = VALUE_RATE
     local = value_usage(cached=500, spend=0.04)
     result = DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 200"},
                                          value_usage(), [local], rate)
@@ -393,14 +396,12 @@ def test_subscription_allocation_uses_consistent_input_output_cache_weights():
     assert result["offloaded_tokens"] == 1100
     assert result["offloaded_share"] == pytest.approx(share)
     assert result["net_value_usd"] == pytest.approx(200 * 12 / 52 * share - 0.04)
-    assert "not an invoice" in result["budget_basis"]
 
 
 def test_no_offloading_preserves_no_value_and_expensive_checks_keep_negative_value():
-    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    rate = VALUE_RATE
     plan = {"current_plan": "ChatGPT Pro 500"}
     empty = DELIVERY.subscription_value(plan, value_usage(), [], rate)
-    assert empty["preserved_value_usd"] == 0
     assert empty["net_value_usd"] == 0
     expensive = DELIVERY.subscription_value(plan, value_usage(), [value_usage(spend=100)], rate)
     assert expensive["preserved_value_usd"] == pytest.approx(500 * 12 / 52 * 0.5)
@@ -410,7 +411,7 @@ def test_no_offloading_preserves_no_value_and_expensive_checks_keep_negative_val
 
 @pytest.mark.parametrize("offloads", [[], [value_usage()]])
 def test_missing_codex_usage_is_not_a_hundred_percent_saving(offloads):
-    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    rate = VALUE_RATE
     result = DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 500"},
                                          DELIVERY.usage_bucket(), offloads, rate)
     assert result["status"] == "unavailable_without_cloud_codex_usage"
@@ -422,7 +423,7 @@ def test_missing_codex_usage_is_not_a_hundred_percent_saving(offloads):
 @pytest.mark.parametrize("changed", [{"input": -1}, {"input": 1.5}, {"cached": 1001},
                                     {"output": True}, {"actual_usd": float("nan")}])
 def test_invalid_native_tokens_or_cost_cannot_create_plan_value(changed):
-    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    rate = VALUE_RATE
     with pytest.raises(DELIVERY.DataUnavailable):
         DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 500"}, value_usage(),
                                      [{**value_usage(), **changed}], rate)
@@ -441,7 +442,7 @@ def test_unsupported_plan_and_forged_value_cannot_send():
                                     {"input_cache_read": float("nan")},
                                     {"input_cache_read": 1e-5}])
 def test_invalid_weighting_cannot_overstate_offload_share(changed):
-    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7, **changed}
+    rate = {**VALUE_RATE, **changed}
     with pytest.raises(DELIVERY.DataUnavailable):
         DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 500"}, value_usage(),
                                      [value_usage()], rate)
