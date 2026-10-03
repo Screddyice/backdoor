@@ -443,7 +443,7 @@ def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usa
         comparison_row("Standalone Qwen", {"calls": qwen["requests"], "input": qwen["input"],
                        "output": qwen["output"], "cached": qwen["cached"], "actual_usd": 0.0}, codex_rate),
         comparison_row("LLM-Jury local council", jury_usage.get("ollama", usage_bucket()), codex_rate),
-        comparison_row("LLM-Jury OpenRouter", jury_usage.get("openrouter", usage_bucket()), codex_rate),
+        comparison_row("LLM-Jury OpenRouter (historical)", jury_usage.get("openrouter", usage_bucket()), codex_rate),
         comparison_row("JEV through OpenRouter", jev, codex_rate),
     ]
     metered_spend = sum(row["actual_usd"] for row in comparison)

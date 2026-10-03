@@ -210,6 +210,7 @@ Codex subscription calls occur in both workflows. JEV receipts combine the
 desktop `~/.config/jev/usage.jsonl` (`SAVINGS_JEV_USAGE` overrides it) and that
 same path on `neb-ops-gcp` (`SAVINGS_JEV_REMOTE_SSH` overrides the SSH alias).
 The collector never reads either service's OpenRouter credential.
+OpenRouter is JEV-only; the Jury OpenRouter row audits historical receipts, not a generation route.
 Both provider receipts use native token counts, and JEV request IDs deduplicate
 exports. Install the JEV receipt release on both JEV hosts and the LLM-Jury
 local-token release on the Mac before enabling schema-4 delivery. A missing JEV ledger defers
