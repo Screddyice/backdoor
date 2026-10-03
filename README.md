@@ -197,8 +197,9 @@ exports. Install the JEV receipt release and the LLM-Jury local-token release
 before enabling schema-3 delivery. A missing or unreadable JEV ledger defers
 delivery instead of claiming zero spend. The Mac needs working SSH/IAP access
 to that host when collecting a snapshot.
-The collector LaunchAgent includes Homebrew's executable path so SSH can run
-the `gcloud` IAP proxy outside an interactive shell.
+The collector LaunchAgent includes the installed Composio CLI and Homebrew's
+executable paths so billing reads and the SSH `gcloud` IAP proxy work outside an
+interactive shell.
 
 The diagnostic amounts estimate API charges for equal token volume, not task-level
 quality equivalence or cash saved on a flat-rate Codex subscription. Schema-1/2

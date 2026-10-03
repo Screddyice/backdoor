@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import plistlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -242,6 +243,15 @@ def test_billing_mailbox_mismatch_stops_before_reading_messages(monkeypatch):
     with pytest.raises(DELIVERY.DataUnavailable, match="identity did not match"):
         DELIVERY.billing_state(datetime(2026, 10, 2, tzinfo=PT))
     assert len(calls) == 1
+
+
+def test_collector_environment_can_find_the_installed_billing_cli():
+    path = SCRIPT.parents[1] / "deploy/com.screddy.weekly-savings-collector.plist"
+    with path.open("rb") as stream:
+        config = plistlib.load(stream)
+    environment = config["EnvironmentVariables"]
+    assert environment["HOME"] + "/.composio" in environment["PATH"].split(":")
+    assert "/opt/homebrew/bin" in environment["PATH"].split(":")
 
 
 def test_send_subject_uses_subscription_cash_not_api_equivalent(monkeypatch):
