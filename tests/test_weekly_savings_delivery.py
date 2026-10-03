@@ -85,12 +85,17 @@ def test_damaged_jury_ledger_blocks_a_snapshot(tmp_path):
 
 
 def snapshot(cycle, generated):
-    return {"schema": 3, "cycle_id": cycle["id"],
+    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    cloud = {"calls": 1, "input": 1000, "output": 100, "cached": 0, "actual_usd": 0}
+    subscription = {"baseline": "same_codex_subscription", "subscription_savings_usd": 0,
+                    "current_plan": "ChatGPT Pro 500", "evidence_message_id": "bill-1"}
+    return {"schema": 4, "cycle_id": cycle["id"],
             "window_start": cycle["start"].isoformat(), "window_end": cycle["end"].isoformat(),
             "generated_at": generated.astimezone(timezone.utc).isoformat(),
-            "comparison": [], "pricing": {}, "sources": {},
-            "subscription": {"baseline": "same_codex_subscription", "subscription_savings_usd": 0,
-                             "evidence_message_id": "bill-1"},
+            "comparison": [], "pricing": {"openai/gpt-5.6-sol": rate}, "sources": {},
+            "baseline_model": "openai/gpt-5.6-sol", "cloud_codex": cloud,
+            "subscription": subscription,
+            "subscription_value": DELIVERY.subscription_value(subscription, cloud, [], rate),
             "actual_metered_usd": 0, "net_savings_usd": 0}
 
 
@@ -142,7 +147,8 @@ def test_provider_cached_tokens_are_preserved_and_missing_cost_is_not_free():
 def test_legacy_mismatched_and_naive_snapshots_cannot_send():
     cycle = DELIVERY.cycle_for(when(28))
     data = snapshot(cycle, when(28))
-    for changed in ({"schema": 1}, {"schema": 2}, {"window_start": when(21).isoformat()},
+    for changed in ({"schema": 1}, {"schema": 2}, {"schema": 3},
+                    {"window_start": when(21).isoformat()},
                     {"generated_at": "2026-09-28T19:07:00"}):
         assert not DELIVERY.snapshot_fresh({**data, **changed}, cycle, when(28))
 
@@ -169,7 +175,9 @@ def test_snapshot_combines_native_receipts_against_one_codex_rate(tmp_path, monk
     monkeypatch.setattr(DELIVERY.report, "LLMJURY_SPEND_LEDGER", str(jury_path))
     monkeypatch.setattr(DELIVERY, "QWEN_USAGE", qwen_path)
     monkeypatch.setattr(DELIVERY.report, "scan", lambda *args, **kwargs: (None, {}, None, 0, None))
-    monkeypatch.setattr(DELIVERY.report, "scan_codex", lambda *args, **kwargs: ({}, 0))
+    cloud = {"input": 3000, "output": 300, "cache_read": 0, "turns": 1}
+    monkeypatch.setattr(DELIVERY.report, "scan_codex", lambda *args, **kwargs:
+                        ({"gpt-5.6-sol": cloud}, 1))
     rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
     jev = {"calls": 1, "input": 1000, "output": 100, "cached": 0, "actual_usd": 0.0001}
     cycle = DELIVERY.cycle_for(when(28))
@@ -178,15 +186,23 @@ def test_snapshot_combines_native_receipts_against_one_codex_rate(tmp_path, monk
               lambda *args: jev, lambda now: {"current_plan": "ChatGPT Pro 500",
                   "scheduled_plan": "ChatGPT Pro 200", "scheduled_date": "2026-10-30",
                   "evidence_message_id": "bill-1", "evidence_at": when(25).isoformat()})
-    assert result["schema"] == 3
+    assert result["schema"] == 4
     assert result["codex_equivalent_usd"] == pytest.approx(0.009)
     assert result["actual_metered_usd"] == pytest.approx(0.0011)
     assert result["api_equivalent_difference_usd"] == pytest.approx(0.0079)
     assert result["net_savings_usd"] == pytest.approx(-0.0011)
     assert result["subscription"]["subscription_savings_usd"] == 0
+    value = result["subscription_value"]
+    assert value["offloaded_tokens"] == 3300
+    assert value["cloud_tokens"] == 3300
+    assert value["offloaded_share"] == pytest.approx(0.5)
+    assert value["preserved_value_usd"] == pytest.approx(500 * 12 / 52 * 0.5)
+    assert value["net_value_usd"] == pytest.approx(500 * 12 / 52 * 0.5 - 0.0011)
     body = DELIVERY.email_body(result)
     assert "JEV through OpenRouter" in body
-    assert "subscription bill savings versus keeping the same plan: $0.00" in body
+    assert "Estimated net Codex subscription value preserved" in body
+    assert "Measured offloaded tokens: 3,300" in body
+    assert "Subscription bill reduction attributed to offloading: $0.00" in body
     assert "This is pending" in body
     assert "$0.0079" not in body
     assert "earlier calls are unmeasured" in body
@@ -254,10 +270,12 @@ def test_collector_environment_can_find_the_installed_billing_cli():
     assert "/opt/homebrew/bin" in environment["PATH"].split(":")
 
 
-def test_send_subject_uses_subscription_cash_not_api_equivalent(monkeypatch):
+def test_send_subject_uses_estimated_subscription_value_and_tokens(monkeypatch):
     captured = []
     data = {"cycle_id": "2026-09-27", "actual_metered_usd": 0.04,
-            "net_savings_usd": -0.04, "api_equivalent_difference_usd": 400}
+            "net_savings_usd": -0.04, "api_equivalent_difference_usd": 400,
+            "subscription_value": {"status": "estimated", "net_value_usd": 10.25,
+                                   "offloaded_tokens": 3000}}
     monkeypatch.setattr(DELIVERY, "email_body", lambda _: "subscription cash report")
     def execute(command, **kwargs):
         captured.append(json.loads(command[-1]))
@@ -265,7 +283,8 @@ def test_send_subject_uses_subscription_cash_not_api_equivalent(monkeypatch):
             "successful": True, "data": {"messageId": "gmail-1"}}))
     monkeypatch.setattr(DELIVERY.subprocess, "run", execute)
     DELIVERY.send(data)
-    assert captured[0]["subject"].startswith("$0.00 Codex subscription savings; $0.0400 added spend")
+    assert captured[0]["subject"].startswith("$10.2500 estimated Codex subscription value preserved; "
+                                            "3,000 tokens offloaded")
     assert "$400" not in captured[0]["subject"]
 
 
@@ -337,3 +356,71 @@ def test_corrupt_delivery_state_cannot_be_treated_as_unsent(tmp_path, monkeypatc
     (tmp_path / f"delivery-{cycle['id']}.json").write_text("{broken")
     with pytest.raises(DELIVERY.DataUnavailable, match="unreadable"):
         DELIVERY.dispatch(now, lambda _: pytest.fail("sent with corrupt state"))
+
+
+def value_usage(input_tokens=1000, output_tokens=100, cached=0, spend=0):
+    return {"label": "Local checks", "calls": 1, "input": input_tokens,
+            "output": output_tokens, "cached": cached, "actual_usd": spend}
+
+
+def test_subscription_allocation_uses_consistent_input_output_cache_weights():
+    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    local = value_usage(cached=500, spend=0.04)
+    result = DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 200"},
+                                         value_usage(), [local], rate)
+    share = 0.0021 / (0.003 + 0.0021)
+    assert result["offloaded_tokens"] == 1100
+    assert result["offloaded_share"] == pytest.approx(share)
+    assert result["net_value_usd"] == pytest.approx(200 * 12 / 52 * share - 0.04)
+    assert "not an invoice" in result["budget_basis"]
+
+
+def test_no_offloading_preserves_no_value_and_expensive_checks_keep_negative_value():
+    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    plan = {"current_plan": "ChatGPT Pro 500"}
+    empty = DELIVERY.subscription_value(plan, value_usage(), [], rate)
+    assert empty["preserved_value_usd"] == 0
+    assert empty["net_value_usd"] == 0
+    expensive = DELIVERY.subscription_value(plan, value_usage(), [value_usage(spend=100)], rate)
+    assert expensive["preserved_value_usd"] == pytest.approx(500 * 12 / 52 * 0.5)
+    assert expensive["net_value_usd"] < 0
+    assert expensive["preserved_value_usd"] <= expensive["weekly_nominal_usd"]
+
+
+@pytest.mark.parametrize("offloads", [[], [value_usage()]])
+def test_missing_codex_usage_is_not_a_hundred_percent_saving(offloads):
+    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    result = DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 500"},
+                                         DELIVERY.usage_bucket(), offloads, rate)
+    assert result["status"] == "unavailable_without_cloud_codex_usage"
+    assert result["offloaded_share"] is None
+    assert result["preserved_value_usd"] is None
+    assert result["net_value_usd"] is None
+
+
+@pytest.mark.parametrize("changed", [{"input": -1}, {"input": 1.5}, {"cached": 1001},
+                                    {"output": True}, {"actual_usd": float("nan")}])
+def test_invalid_native_tokens_or_cost_cannot_create_plan_value(changed):
+    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7}
+    with pytest.raises(DELIVERY.DataUnavailable):
+        DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 500"}, value_usage(),
+                                     [{**value_usage(), **changed}], rate)
+
+
+def test_unsupported_plan_and_forged_value_cannot_send():
+    cycle = DELIVERY.cycle_for(when(28))
+    data = snapshot(cycle, when(28))
+    forged = {**data["subscription_value"], "net_value_usd": 1000}
+    assert not DELIVERY.snapshot_fresh({**data, "subscription_value": forged}, cycle, when(28))
+    unsupported = {**data["subscription"], "current_plan": "Unknown plan"}
+    assert not DELIVERY.snapshot_fresh({**data, "subscription": unsupported}, cycle, when(28))
+
+
+@pytest.mark.parametrize("changed", [{"prompt": 0}, {"completion": -1},
+                                    {"input_cache_read": float("nan")},
+                                    {"input_cache_read": 1e-5}])
+def test_invalid_weighting_cannot_overstate_offload_share(changed):
+    rate = {"prompt": 2e-6, "completion": 1e-5, "input_cache_read": 2e-7, **changed}
+    with pytest.raises(DELIVERY.DataUnavailable):
+        DELIVERY.subscription_value({"current_plan": "ChatGPT Pro 500"}, value_usage(),
+                                     [value_usage()], rate)
