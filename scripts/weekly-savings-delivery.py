@@ -178,7 +178,7 @@ def validate_jury_ledger(path):
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                datetime.fromisoformat(row["ts"])
+                datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
                 amount = float(row.get("cost_usd", 0))
                 avoided = float(row.get("avoided_usd", 0))
                 if not all(math.isfinite(value) and value >= 0 for value in (amount, avoided)):
@@ -199,7 +199,7 @@ def ledger_usage(text, start, end, deduplicate=False):
             if not line.strip():
                 continue
             row = json.loads(line)
-            timestamp = datetime.fromisoformat(row["ts"])
+            timestamp = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
             if timestamp.tzinfo is None:
                 timestamp = timestamp.replace(tzinfo=timezone.utc)
             if not start <= timestamp < end:

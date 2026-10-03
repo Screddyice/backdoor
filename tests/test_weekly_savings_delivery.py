@@ -118,6 +118,28 @@ def test_provider_ledger_deduplicates_receipts_and_excludes_frontiers_and_end_bo
     assert usage["openrouter"]["actual_usd"] == pytest.approx(0.001)
 
 
+def test_native_utc_receipts_work_with_python_39_datetime(tmp_path, monkeypatch):
+    class LegacyDatetime(datetime):
+        @classmethod
+        def fromisoformat(cls, value):
+            if value.endswith("Z"):
+                raise ValueError("Python 3.9 does not accept the Z suffix")
+            return super().fromisoformat(value)
+
+    monkeypatch.setattr(DELIVERY, "datetime", LegacyDatetime)
+    receipt = {"ts": "2026-09-25T02:07:00.000Z", "backend": "openrouter", "id": "native-jev",
+               "prompt_tokens": 347, "completion_tokens": 39, "cost_usd": 0.000014574}
+    text = json.dumps(receipt)
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text(text + "\n")
+    DELIVERY.validate_jury_ledger(ledger)
+    usage = DELIVERY.ledger_usage(text, when(20), when(27), deduplicate=True)["openrouter"]
+    assert usage["calls"] == 1
+    assert usage["input"] == 347
+    assert usage["output"] == 39
+    assert usage["actual_usd"] == pytest.approx(0.000014574)
+
+
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -1])
 def test_nonfinite_or_negative_spend_cannot_be_counted_as_savings(invalid):
     text = json.dumps({"ts": when(25).isoformat(), "backend": "openrouter",
