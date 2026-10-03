@@ -131,6 +131,26 @@ def test_codex_plan_savings_uses_cached_rate_and_subtracts_the_plan():
     assert saved == pytest.approx(1.2)
 
 
+def test_codex_week_keeps_earlier_model_context_and_ignores_repeated_boundary_usage(tmp_path):
+    usage = {"input_tokens": 100, "output_tokens": 20, "cached_input_tokens": 10}
+    event = {"type": "event_msg", "payload": {"type": "token_count", "info": {
+        "total_token_usage": usage, "last_token_usage": usage}}}
+    _write_jsonl(tmp_path / "2026" / "session.jsonl", [
+        {"type": "turn_context", "timestamp": "2026-09-02T23:58:00Z",
+         "payload": {"model": "qwen"}},
+        {**event, "timestamp": "2026-09-02T23:59:00Z"},
+        {**event, "timestamp": "2026-09-03T00:00:01Z"},
+        {"type": "event_msg", "timestamp": "2026-09-03T00:00:02Z", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {"input_tokens": 150},
+                                               "last_token_usage": usage}}},
+    ])
+    result, _ = REPORT.scan_codex(datetime(2026, 9, 3, tzinfo=timezone.utc),
+                                  sessions_dir=str(tmp_path), strict=True)
+    assert "unknown-codex" not in result
+    assert result["qwen"]["turns"] == 1
+    assert result["qwen"]["input"] == 100
+
+
 def test_openrouter_usage_is_identified_without_mixing_in_local_models():
     usage = {
         "anthropic/claude-sonnet-4": {"turns": 2},

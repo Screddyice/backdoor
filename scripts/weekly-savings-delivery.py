@@ -31,6 +31,7 @@ QWEN_USAGE = Path(os.environ.get("SAVINGS_QWEN_USAGE", Path.home() / ".qwen/usag
 REMOTE_SSH = os.environ.get("SAVINGS_REMOTE_SSH", "hermes@5.161.126.205")
 REMOTE_STATE_DIR = os.environ.get("SAVINGS_REMOTE_STATE_DIR", "/home/hermes/.hermes/savings")
 JEV_REMOTE_SSH = os.environ.get("SAVINGS_JEV_REMOTE_SSH", "neb-ops-gcp")
+JEV_USAGE = Path(os.environ.get("SAVINGS_JEV_USAGE", Path.home() / ".config/jev/usage.jsonl"))
 PRICES_URL = "https://openrouter.ai/api/v1/models"
 MODEL_IDS = ("anthropic/claude-opus-5",)
 HOUR = 19
@@ -158,10 +159,12 @@ def qwen_usage(start, end, path=QWEN_USAGE):
                 for usage in local_models.values():
                     for key, field in (("requests", "requests"), ("inputTokens", "input"),
                                        ("cachedTokens", "cached"), ("outputTokens", "output")):
-                        value = int(usage.get(key, 0))
-                        if value < 0:
-                            raise DataUnavailable("negative Qwen usage")
+                        value = usage.get(key, 0)
+                        if type(value) is not int or value < 0:
+                            raise DataUnavailable("invalid native Qwen usage")
                         totals[field] += value
+                    if usage.get("cachedTokens", 0) > usage.get("inputTokens", 0):
+                        raise DataUnavailable("Qwen cache count exceeds input")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DataUnavailable(f"Qwen usage unavailable: {type(exc).__name__}") from exc
     return totals
@@ -237,13 +240,15 @@ def ledger_usage(text, start, end, deduplicate=False):
 
 def jev_usage(start, end):
     try:
+        desktop_receipts = JEV_USAGE.read_text()
         result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", JEV_REMOTE_SSH,
              "cat ~/.config/jev/usage.jsonl"],
             check=True, capture_output=True, text=True, timeout=45)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise DataUnavailable(f"JEV receipt collection failed: {type(exc).__name__}") from exc
-    return ledger_usage(result.stdout, start, end, deduplicate=True).get("openrouter", usage_bucket())
+    return ledger_usage(desktop_receipts + "\n" + result.stdout, start, end,
+                        deduplicate=True).get("openrouter", usage_bucket())
 
 
 def comparison_row(label, usage, rate):
@@ -252,6 +257,47 @@ def comparison_row(label, usage, rate):
                 + cached * rate["input_cache_read"] + usage["output"] * rate["completion"])
     return {"label": label, **usage, "codex_equivalent_usd": baseline,
             "net_savings_usd": baseline - usage["actual_usd"]}
+
+
+def subscription_value(subscription, cloud, comparison, rate):
+    """Allocate a nominal weekly plan budget over recorded weighted workload."""
+    plan = re.fullmatch(r"ChatGPT Pro (200|500)", subscription["current_plan"])
+    if not plan:
+        raise DataUnavailable("Codex plan has no supported nominal budget")
+    monthly = float(plan.group(1))
+    weekly = monthly * 12 / 52
+    if any(type(rate[field]) not in (int, float) or not math.isfinite(rate[field])
+           or not 0 < rate[field] < 1 for field in ("prompt", "completion")):
+        raise DataUnavailable("Invalid token weighting rates")
+    if (type(rate["input_cache_read"]) not in (int, float)
+            or not math.isfinite(rate["input_cache_read"])
+            or not 0 <= rate["input_cache_read"] <= rate["prompt"]):
+        raise DataUnavailable("Invalid cache weighting rate")
+    for row in (cloud, *comparison):
+        values = [row[field] for field in ("calls", "input", "output", "cached")]
+        if any(type(value) is not int or value < 0 for value in values):
+            raise DataUnavailable("Invalid recorded token counts")
+        if row["cached"] > row["input"]:
+            raise DataUnavailable("Recorded cache count exceeds input")
+        amount = row["actual_usd"]
+        if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
+            raise DataUnavailable("Invalid recorded provider cost")
+    cloud_weight = comparison_row("Cloud Codex", cloud, rate)["codex_equivalent_usd"]
+    offload_weight = sum(comparison_row(row["label"], row, rate)["codex_equivalent_usd"]
+                         for row in comparison)
+    spend = sum(row["actual_usd"] for row in comparison)
+    measured = cloud_weight > 0
+    share = offload_weight / (cloud_weight + offload_weight) if measured else None
+    gross = weekly * share if measured else None
+    return {"monthly_nominal_usd": monthly, "weekly_nominal_usd": weekly,
+            "budget_basis": "Current confirmed Pro tier label interpreted as nominal USD/month; "
+                            "not an invoice, tax, proration, refund or historical charge",
+            "status": "estimated" if measured else "unavailable_without_cloud_codex_usage",
+            "cloud_tokens": cloud["input"] + cloud["output"],
+            "offloaded_tokens": sum(row["input"] + row["output"] for row in comparison),
+            "cloud_weight": cloud_weight, "offloaded_weight": offload_weight,
+            "offloaded_share": share, "preserved_value_usd": gross,
+            "net_value_usd": gross - spend if measured else None}
 
 
 def billing_state_from_messages(messages, now):
@@ -397,14 +443,21 @@ def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usa
         comparison_row("Standalone Qwen", {"calls": qwen["requests"], "input": qwen["input"],
                        "output": qwen["output"], "cached": qwen["cached"], "actual_usd": 0.0}, codex_rate),
         comparison_row("LLM-Jury local council", jury_usage.get("ollama", usage_bucket()), codex_rate),
-        comparison_row("LLM-Jury OpenRouter", jury_usage.get("openrouter", usage_bucket()), codex_rate),
+        comparison_row("LLM-Jury OpenRouter (historical)", jury_usage.get("openrouter", usage_bucket()), codex_rate),
         comparison_row("JEV through OpenRouter", jev, codex_rate),
     ]
     metered_spend = sum(row["actual_usd"] for row in comparison)
     subscription = {**get_billing_state(generated_at), "baseline": "same_codex_subscription",
                     "subscription_savings_usd": 0.0,
                     "attribution": "No documented routing-related subscription charge reduction"}
-    return {"schema": 3, "cycle_id": cycle["id"],
+    unknown = {model: usage for model, usage in codex.items()
+               if model == "unknown-codex" and usage["turns"]}
+    if unknown:
+        raise DataUnavailable("Codex usage has no attributable model")
+    cloud_codex = transcript_usage({model: usage for model, usage in codex.items()
+                                  if not report.is_local(model)})
+    value = subscription_value(subscription, cloud_codex, comparison, codex_rate)
+    return {"schema": 4, "cycle_id": cycle["id"],
             "window_start": start.isoformat(), "window_end": end.isoformat(),
             "window_start_local": cycle["start"].isoformat(),
             "window_end_local": cycle["end"].isoformat(),
@@ -415,6 +468,8 @@ def build_snapshot(cycle, generated_at, get_prices=prices, get_jev_usage=jev_usa
                         "qwen_sessions": qwen["sessions"], "llmjury_available": True},
             "local": local,
             "subscription": subscription,
+            "cloud_codex": cloud_codex,
+            "subscription_value": value,
             "comparison": comparison,
             "codex_equivalent_usd": sum(row["codex_equivalent_usd"] for row in comparison),
             "actual_metered_usd": metered_spend,
@@ -460,7 +515,7 @@ def read_json(path):
 
 
 def snapshot_fresh(snapshot, cycle, now):
-    if not snapshot or snapshot.get("schema") != 3 or snapshot.get("cycle_id") != cycle["id"]:
+    if not snapshot or snapshot.get("schema") != 4 or snapshot.get("cycle_id") != cycle["id"]:
         return False
     try:
         generated = datetime.fromisoformat(snapshot["generated_at"])
@@ -479,7 +534,13 @@ def snapshot_fresh(snapshot, cycle, now):
                 or type(net) not in (int, float) or not math.isfinite(net)
                 or not math.isclose(net, -spend, abs_tol=1e-12)):
             return False
-    except (KeyError, TypeError, ValueError):
+        expected = subscription_value(subscription, snapshot["cloud_codex"],
+                                      snapshot["comparison"],
+                                      snapshot["pricing"][snapshot["baseline_model"]])
+        if expected != snapshot["subscription_value"] or not math.isclose(
+                spend, sum(row["actual_usd"] for row in snapshot["comparison"]), abs_tol=1e-12):
+            return False
+    except (KeyError, TypeError, ValueError, ZeroDivisionError, DataUnavailable):
         return False
     age = now - generated
     return (cycle["end"] <= generated.astimezone(PACIFIC)
@@ -507,44 +568,65 @@ def email_body(snapshot):
     start = snapshot["window_start_local"][:10]
     end = snapshot["window_end_local"][:10]
     subscription = snapshot["subscription"]
+    value = snapshot["subscription_value"]
+    if value["status"] == "estimated":
+        headline = (f"**Estimated net Codex subscription value preserved: "
+                    f"${value['net_value_usd']:,.4f}.**")
+        calculation = (f"${value['weekly_nominal_usd']:,.4f} nominal weekly budget × "
+                       f"{value['offloaded_share']:.4%} recorded weighted offload share = "
+                       f"${value['preserved_value_usd']:,.4f} gross value; minus "
+                       f"${snapshot['actual_metered_usd']:,.4f} provider spend = "
+                       f"${value['net_value_usd']:,.4f} estimated net value.")
+    else:
+        headline = "**Subscription-value estimate unavailable: no recorded cloud Codex usage.**"
+        calculation = "Offloaded tokens and provider spend are measured; missing usage is not zero."
     scheduled = (f"The billing email schedules {subscription['scheduled_plan']} for "
                  f"{subscription['scheduled_date']}. This is pending, and no evidence attributes "
                  "that plan change to local models or JEV. It adds no savings to this report."
                  if subscription.get("scheduled_plan") else "No pending plan change in the billing confirmation.")
     return "\n".join([
-        f"# Weekly Codex subscription cash comparison, {start} to {end}", "",
-        "**Codex subscription bill savings versus keeping the same plan: $0.00.**",
+        f"# Weekly Codex token offloading and subscription value, {start} to {end}", "",
+        headline,
+        f"**Measured offloaded tokens: {value['offloaded_tokens']:,}; "
+        f"recorded cloud Codex tokens: {value['cloud_tokens']:,}.**",
         f"Current billing-confirmed plan at collection: **{subscription['current_plan']}**.",
-        "The Codex-only baseline keeps that same subscription. Its fixed fee is paid in both "
-        "workflows, so shifting calls to another model does not reduce the subscription charge.",
+        calculation,
+        f"Budget assumption: ${value['monthly_nominal_usd']:,.2f}/month, annualized as "
+        "monthly × 12 ÷ 52. This uses the current tier label as nominal USD, not a verified "
+        "invoice amount or the price paid during a week with plan changes.",
         scheduled, "",
-        "| Recorded path | Calls | Additional provider spend |",
-        "|---|---:|---:|",
-        *[f"| {row['label']} | {row['calls']} | ${row['actual_usd']:,.4f} |"
+        "| Recorded path | Calls | Input tokens | Cached input (included) | Output tokens | Provider spend |",
+        "|---|---:|---:|---:|---:|---:|",
+        *[f"| {row['label']} | {row['calls']} | {row['input']:,} | {row['cached']:,} | "
+          f"{row['output']:,} | ${row['actual_usd']:,.4f} |"
           for row in snapshot["comparison"]],
         "",
         f"**Additional recorded OpenRouter/JEV/Jury spend: ${snapshot['actual_metered_usd']:,.4f}.**",
-        f"**Net recorded cash difference versus the same Codex subscription: "
-        f"${snapshot['net_savings_usd']:,.4f}.** Negative means added cost, not money saved.",
+        "Subscription bill reduction attributed to offloading: $0.00.",
+        f"Net recorded cash difference versus the same Codex subscription: "
+        f"${snapshot['net_savings_usd']:,.4f}. Negative means added cost, not an invoice saving.",
         "",
-        "Local offloading can preserve subscription allowance. Token counts do not establish "
-        "a subscription discount, an avoided credit purchase, or an avoided higher tier. "
-        "This report does not assume any of those charges. Pending refunds also add no savings.",
+        "Method: allocate weekly budget by offloaded weighted workload ÷ "
+        "(cloud Codex + offloaded weighted workload). The same Codex input/output/cache "
+        "rates weight all paths. This is not measured quota saved: tokenizers and council "
+        "candidates differ, so native tokens do not prove equal avoided Codex usage or outcomes.",
         "",
-        "Provider spend comes from native receipts. API-equivalent values are diagnostics only "
-        "and never count as subscription savings. The same-plan baseline does not prove what "
-        "tier a Codex-only workflow would require. "
-        "Hardware, electricity, retries without receipts, unlogged local models and router "
-        "failover are excluded. JEV and local-council tracking starts with the accounting "
-        "release; earlier calls are unmeasured, not assumed free. Remote JEV receipts cover "
-        "the Team Nebula JEV service; unrelated OpenRouter activity is excluded.",
+        "Provider spend uses native receipts; API equivalents are diagnostics. No avoided "
+        "upgrade, credit purchase or refund is measured. Negative estimates are retained. "
+        "Hardware, electricity, unlogged retries, local diff checks, models, frontier calls "
+        "and router failover are coverage gaps that can skew the share. Tracking starts with "
+        "the receipt release; earlier calls are unmeasured, not free. JEV covers desktop and "
+        "Team Nebula service receipts; unrelated OpenRouter activity is excluded.",
         f"Local snapshot: {snapshot['generated_at']}. Billing evidence: "
         f"{subscription['evidence_message_id']} at {subscription['evidence_at']}.",
     ])
 
 
 def send(snapshot):
-    subject = (f"$0.00 Codex subscription savings; ${snapshot['actual_metered_usd']:,.4f} added spend "
+    value = snapshot["subscription_value"]
+    headline = (f"${value['net_value_usd']:,.4f} estimated Codex subscription value preserved"
+                if value["status"] == "estimated" else "Codex subscription value estimate unavailable")
+    subject = (f"{headline}; {value['offloaded_tokens']:,} tokens offloaded "
                f"| week ending {snapshot['cycle_id']}")
     payload = {"recipient_email": report.EMAIL_TO, "subject": subject,
                "body": report.md_to_html(email_body(snapshot)), "is_html": True}

@@ -170,13 +170,30 @@ catalog pricing defers the report instead of substituting a stale model. Each
 snapshot records the selected model and rates.
 The collector writes an atomic JSON snapshot under
 `~/.claude/state/weekly-savings/` and sends that snapshot over SSH to the
-Screddy Hermes host. The schema-3 email leads with subscription cash savings
-against keeping the same Codex subscription. That fixed fee cancels between the
-two workflows; offloaded tokens do not discount it. Native OpenRouter/JEV/Jury
-spend is additional cost, so net recorded cash savings are zero minus provider
-spend. API-equivalent values remain diagnostic fields and never appear as cash
-savings in the subject or report. The report does not infer avoided upgrades,
-credit purchases, or refunds from token counts.
+Screddy Hermes host. The schema-4 email leads with measured offloaded input/output
+tokens and **estimated net Codex subscription value preserved**. It allocates a
+nominal weekly subscription budget across recorded workload:
+
+`gross value = nominal monthly budget × 12 / 52 × offloaded weighted workload /
+(recorded cloud Codex weighted workload + offloaded weighted workload)`
+
+`net value = gross value - native OpenRouter/JEV/Jury spend`
+
+The current billing-confirmed Pro 200 or Pro 500 tier label supplies the nominal
+USD/month assumption. The email labels this assumption; it is not an invoice,
+tax-inclusive payment, refund, historical tier price, or billing-period proration.
+Cached input is included in raw input, not added twice. Every path uses the same
+Codex model's input/output/cache rates as weights, not as the dollar headline.
+The estimate retains negative net value. Missing cloud usage means unavailable,
+not 100% savings.
+
+This measures the value of workload offloaded, not actual subscription cash
+savings or measured quota. Different tokenizers, repeated council candidates,
+and differing prompts mean native offloaded tokens do not prove an equal Codex
+token count or task outcome. The report separately shows unchanged-plan cash
+difference as zero minus provider spend, and never infers avoided upgrades,
+credit purchases, or refunds. It recomputes the allocation before dispatch to
+reject inconsistent snapshots.
 
 The collector identity-checks the billing Gmail account and reads OpenAI plan
 confirmation emails. A pending downgrade remains pending; after its scheduled
@@ -189,12 +206,14 @@ The usage diagnostics compare local Codex, local Claude,
 standalone Qwen, LLM-Jury local council, LLM-Jury OpenRouter, and JEV with one
 Codex-only token-volume baseline. It subtracts native provider spend, preserves
 negative savings, and excludes subscription frontier value from savings because
-Codex subscription calls occur in both workflows. JEV receipts come from
-`~/.config/jev/usage.jsonl` on `neb-ops-gcp` (`SAVINGS_JEV_REMOTE_SSH` overrides
-the SSH alias); the collector never reads the service's OpenRouter credential.
+Codex subscription calls occur in both workflows. JEV receipts combine the
+desktop `~/.config/jev/usage.jsonl` (`SAVINGS_JEV_USAGE` overrides it) and that
+same path on `neb-ops-gcp` (`SAVINGS_JEV_REMOTE_SSH` overrides the SSH alias).
+The collector never reads either service's OpenRouter credential.
+OpenRouter is JEV-only; the Jury OpenRouter row audits historical receipts, not a generation route.
 Both provider receipts use native token counts, and JEV request IDs deduplicate
-exports. Install the JEV receipt release and the LLM-Jury local-token release
-before enabling schema-3 delivery. A missing or unreadable JEV ledger defers
+exports. Install the JEV receipt release on both JEV hosts and the LLM-Jury
+local-token release on the Mac before enabling schema-4 delivery. A missing JEV ledger defers
 delivery instead of claiming zero spend. The Mac needs working SSH/IAP access
 to that host when collecting a snapshot.
 The collector LaunchAgent includes the installed Composio CLI and Homebrew's
@@ -202,10 +221,12 @@ executable paths so billing reads and the SSH `gcloud` IAP proxy work outside an
 interactive shell.
 
 The diagnostic amounts estimate API charges for equal token volume, not task-level
-quality equivalence or cash saved on a flat-rate Codex subscription. Schema-1/2
-snapshots cannot dispatch through schema 3. Earlier JEV and
+quality equivalence or cash saved on a flat-rate Codex subscription. Schema-1/2/3
+snapshots cannot dispatch through schema 4. Earlier JEV and
 local-council calls have no receipt and remain excluded. Hardware, electricity,
-unlogged local models, and router failover remain explicit coverage gaps.
+uninstrumented local diff checks, unlogged local models and Codex frontier calls,
+router failover remain explicit coverage gaps. Missing workload can skew the
+allocation estimate.
 
 Remote Hermes checks hourly and sends on Monday at 19:07 Pacific if the
 snapshot covers the complete week and is no more than 24 hours old. If the Mac
