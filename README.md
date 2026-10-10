@@ -2110,6 +2110,13 @@ existing `HYPERCRAWL_MCP_TOKEN` from `%h/.hermes/mcp.env`; install
 as an instance-specific systemd drop-in so unrelated MCP credentials stay out of that process.
 The Claude connector receives only the public MCP URL.
 
+Headless clients such as Claude Code can skip the password consent screen with a static key. Set
+`PRODUCTS_MCP_KEY` in the instance's `%h/.config/products-mcp/<name>.env`, then send it as
+`Authorization: Bearer <key>`. OAuth keeps working alongside it. When the variable is unset, only
+OAuth tokens are accepted. Boot refuses a key shorter than 16 characters or one that looks like a
+placeholder. Give each product its own key, and rotate one by changing the file and restarting that
+instance.
+
 For Composio Custom MCP, register HyperCrawl at `https://hypercrawl-mcp.teamnebula.ai/mcp`
 with DCR OAuth, then authorize the connection. Composio's OAuth client registration uses a
 callback on `backend.composio.dev`; the HyperCrawl redirect-host allowlist includes that host

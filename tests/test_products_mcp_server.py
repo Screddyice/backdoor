@@ -208,3 +208,65 @@ def test_main_passes_configured_bind_to_explicit_http_runner(monkeypatch) -> Non
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8010
     assert isinstance(captured["transport_security"], TransportSecuritySettings)
+
+
+STATIC_KEY = "products-mcp-unit-test-key"
+INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    },
+}
+
+
+def _key_app(monkeypatch, tmp_path, key: str | None):
+    monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "https://products.example")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "claude.ai,claude.com")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
+    if key is None:
+        monkeypatch.delenv("PRODUCTS_MCP_KEY", raising=False)
+    else:
+        monkeypatch.setenv("PRODUCTS_MCP_KEY", key)
+    server = build_server(product="hypercrawl", gateway=FakeGateway())
+    return server.streamable_http_app(
+        stateless_http=True,
+        json_response=True,
+        transport_security=TransportSecuritySettings(
+            allowed_hosts=["products.example"], allowed_origins=[]
+        ),
+    )
+
+
+def _initialize(client: TestClient, token: str):
+    return client.post(
+        "/mcp",
+        json=INITIALIZE,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+
+
+def test_static_key_authorizes_mcp_requests(monkeypatch, tmp_path) -> None:
+    app = _key_app(monkeypatch, tmp_path, STATIC_KEY)
+    with TestClient(app, base_url="https://products.example") as client:
+        assert _initialize(client, STATIC_KEY).status_code == 200
+        assert _initialize(client, STATIC_KEY + "x").status_code == 401
+
+
+def test_static_key_is_ignored_when_unset(monkeypatch, tmp_path) -> None:
+    app = _key_app(monkeypatch, tmp_path, None)
+    with TestClient(app, base_url="https://products.example") as client:
+        assert _initialize(client, STATIC_KEY).status_code == 401
+
+
+@pytest.mark.parametrize("bad", ["short", "aaaaaaaaaaaaaaaaaaaa", "abababababababababab"])
+def test_weak_static_key_refuses_to_start(monkeypatch, tmp_path, bad) -> None:
+    with pytest.raises(ValueError, match="PRODUCTS_MCP_KEY"):
+        _key_app(monkeypatch, tmp_path, bad)

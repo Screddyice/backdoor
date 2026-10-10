@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 from typing import Any, cast
 
+from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.mcpserver import MCPServer
 
+from src.hermes_mcp.http_server import MIN_KEY_LEN, PLACEHOLDERS
 from src.hermes_mcp.oauth import (
     LOGIN_COMPLETION_PATH,
     OAuthSettings,
@@ -20,6 +23,51 @@ from .oauth_compat import BasicClientIdTokenMiddleware
 
 
 PRODUCT_NAMES = ("hypercrawl", "hyperscale", "engagemate")
+
+
+def _static_key_from_env() -> bytes | None:
+    """Return PRODUCTS_MCP_KEY as bytes, None when unset, or refuse a weak key."""
+    value = os.environ.get("PRODUCTS_MCP_KEY", "")
+    if not value:
+        return None
+    lowered = value.strip().lower()
+    if (
+        len(value) < MIN_KEY_LEN
+        or lowered in PLACEHOLDERS
+        or len(set(lowered)) <= 2
+    ):
+        raise ValueError(
+            f"PRODUCTS_MCP_KEY must be at least {MIN_KEY_LEN} characters and not a "
+            "placeholder; refusing to start"
+        )
+    return value.encode("utf-8")
+
+
+class KeyOrOAuthProvider(SingleUserOAuthProvider):
+    """Accept OAuth tokens, plus one optional static key for headless clients.
+
+    Claude Code and other non-browser clients send PRODUCTS_MCP_KEY as a bearer
+    token, so they skip the password consent screen. Unset, behavior is OAuth only.
+    """
+
+    def __init__(self, settings: OAuthSettings, static_key: bytes | None) -> None:
+        super().__init__(settings)
+        self._static_key = static_key
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if self._static_key is not None:
+            try:
+                supplied = token.encode("utf-8", errors="surrogateescape")
+            except UnicodeEncodeError:
+                supplied = b""
+            if hmac.compare_digest(supplied, self._static_key):
+                return AccessToken(
+                    token=token,
+                    client_id="products-mcp-key",
+                    scopes=[self.settings.scope],
+                    resource=str(self.settings.resource_url),
+                )
+        return await super().load_access_token(token)
 
 
 class ProductMCPServer(MCPServer):
@@ -99,7 +147,7 @@ def build_server(
     selected_product = _selected_product(product)
     presentation = PRODUCT_PRESENTATION[selected_product]
     oauth_settings = OAuthSettings.from_env()
-    provider = SingleUserOAuthProvider(oauth_settings)
+    provider = KeyOrOAuthProvider(oauth_settings, _static_key_from_env())
     server = ProductMCPServer(
         selected_product,
         title=presentation["title"],
