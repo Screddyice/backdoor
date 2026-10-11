@@ -278,3 +278,35 @@ async def test_upstream_errors_hide_response_bodies_and_credentials() -> None:
     assert "500" in message
     assert "hunter2" not in message
     assert "hf_test_value" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("product,status,payload,typed", [
+    ("hypercrawl", 503, {"code": "SEARCH_UNAVAILABLE", "blocked": True}, True),
+    ("hypercrawl", 503, {"code": "SEARCH_UNAVAILABLE", "blocked": 1}, False),
+    ("hypercrawl", 503, {"code": "SEARCH_UNAVAILABLE", "blocked": False}, False),
+    ("hypercrawl", 503, {"code": "OTHER_ERROR", "blocked": True}, False),
+    ("hypercrawl", 500, {"code": "SEARCH_UNAVAILABLE", "blocked": True}, False),
+    ("engagemate", 503, {"code": "SEARCH_UNAVAILABLE", "blocked": True}, False),
+    ("hypercrawl", 503, ["SEARCH_UNAVAILABLE"], False),
+    ("hypercrawl", 503, "not-json", False),
+])
+async def test_search_unavailable_preserves_only_safe_typed_details(product, status, payload, typed):
+    if isinstance(payload, dict):
+        payload = {**payload, "error": "private upstream detail", "diagnostics": "private upstream detail"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(payload, str):
+            return httpx.Response(status, text=payload)
+        return httpx.Response(status, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = ProductGateway(settings(), http=client)
+        with pytest.raises(UpstreamError) as caught:
+            await gateway._request_json(product, "POST", "https://public.example/v1/search", headers={})
+
+    message = str(caught.value)
+    assert ("SEARCH_UNAVAILABLE" in message) is typed
+    assert ("blocked=true" in message) is typed
+    assert "private upstream detail" not in message
+    assert "not-json" not in message

@@ -2085,6 +2085,10 @@ replacement is needed. A configured policy without an authenticated context fail
 Enable this only on the HyperCrawl instance after verifying the saved connection's client ID.
 To roll back, restore the previous environment setting and restart that instance.
 
+When public search returns the typed HTTP 503 `SEARCH_UNAVAILABLE` failure, the
+gateway preserves that code and blocked status with a fixed retry message. It
+does not echo provider response bodies or arbitrary diagnostic text.
+
 `src/products_mcp/` runs three OAuth MCP instances for Claude desktop, web, and mobile:
 
 | Connector | Owner | Public endpoint | Tools |
