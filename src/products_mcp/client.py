@@ -333,6 +333,20 @@ class ProductGateway:
         except httpx.HTTPError as exc:
             raise UpstreamError(f"{product} request failed: {type(exc).__name__}") from exc
         if response.status_code >= 400:
+            # Preserve only our typed public-search failure, never upstream text.
+            if product == "hypercrawl" and response.status_code == 503:
+                try:
+                    failure = response.json()
+                except ValueError:
+                    failure = None
+                if (isinstance(failure, dict)
+                        and failure.get("code") == "SEARCH_UNAVAILABLE"
+                        and failure.get("blocked") is True):
+                    raise UpstreamError(
+                        "hypercrawl upstream returned HTTP 503 "
+                        "(SEARCH_UNAVAILABLE, blocked=true): Search providers "
+                        "could not return verified results. Try again later."
+                    )
             raise UpstreamError(
                 f"{product} upstream returned HTTP {response.status_code}"
             )
