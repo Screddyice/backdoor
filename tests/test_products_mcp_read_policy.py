@@ -17,11 +17,11 @@ def setup(monkeypatch, tmp_path):
     state = tmp_path / "oauth.json"
     tokens = {name: {"token": name, "client_id": client, "scopes": ["hermes"],
         "resource": "https://products.example/mcp", "expires_at": int(time.time()) + 3600}
-        for name, client in [("muse-test-token", "muse-client"), ("other-test-token", "other-client")]}
+        for name, client in [("muse", "muse-client"), ("other", "other-client")]}
     state.write_text(json.dumps({"access_tokens": tokens}))
     state.chmod(0o600)
     monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "https://products.example")
-    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")  # review-gate:allow synthetic fixture, not a live password
     monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "backend.composio.dev")
     monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(state))
     monkeypatch.setenv("PRODUCTS_MCP_READ_ONLY_CLIENT_IDS", "muse-client")
@@ -33,7 +33,7 @@ def setup(monkeypatch, tmp_path):
     with TestClient(server.streamable_http_app(stateless_http=True, json_response=True,
                     transport_security=TransportSecuritySettings(allowed_hosts=["products.example"])),
                     base_url="https://products.example") as client:
-        def call(name, arguments=None, token="muse-test-token"):
+        def call(name, arguments=None, token="muse"):
             response = client.post("/mcp", headers={"Authorization": f"Bearer {token}",
                 "Accept": "application/json, text/event-stream"}, json={"jsonrpc": "2.0", "id": 1,
                 "method": "tools/call", "params": {"name": name, "arguments": arguments or {}}})
@@ -87,15 +87,15 @@ def test_disallowed_calls_stop_before_any_upstream_dispatch(setup, name, args):
 
 def test_other_authenticated_clients_keep_existing_surface(setup):
     gateway, call = setup
-    result = call("hypercrawl_list_tools", token="other-test-token").json()["result"]["structuredContent"]
+    result = call("hypercrawl_list_tools", token="other").json()["result"]["structuredContent"]
     assert len(result["tools"]) == 4
-    call("hypercrawl_call", {"tool_name": "post_v1_accounts", "arguments": {"body": {}}}, token="other-test-token")
+    call("hypercrawl_call", {"tool_name": "post_v1_accounts", "arguments": {"body": {}}}, token="other")
     gateway.call_tool.assert_awaited_once_with("hypercrawl", "post_v1_accounts", {"body": {}})
 
 
 def test_invalid_auth_is_rejected_before_gateway(setup):
     gateway, call = setup
-    assert call("hypercrawl_status", token="invalid-test-token").status_code == 401
+    assert call("hypercrawl_status", token="invalid").status_code == 401
     gateway.list_tools.assert_not_awaited()
 
 
