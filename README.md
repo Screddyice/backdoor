@@ -2074,6 +2074,17 @@ credential fields empty so Claude uses dynamic registration.
 
 ### Account-synced product connectors
 
+HyperCrawl can restrict selected existing OAuth clients with
+`PRODUCTS_MCP_READ_ONLY_CLIENT_IDS`, a comma-separated list of verified client IDs.
+Those clients see and may call only `post_v1_search` and `post_v1_crawl_public`.
+Search accepts a bounded query/context, one to five results, SearXNG, and cache bypass;
+public crawl accepts only a URL. Other operations and extra fields are refused before
+upstream dispatch. The authenticated OAuth identity selects this policy; caller input
+cannot select or bypass it. Other clients retain their existing access, and no token
+replacement is needed. A configured policy without an authenticated context fails closed.
+Enable this only on the HyperCrawl instance after verifying the saved connection's client ID.
+To roll back, restore the previous environment setting and restart that instance.
+
 `src/products_mcp/` runs three OAuth MCP instances for Claude desktop, web, and mobile:
 
 | Connector | Owner | Public endpoint | Tools |

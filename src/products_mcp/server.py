@@ -17,6 +17,7 @@ from src.hermes_mcp.oauth import (
 
 from .client import ProductGateway, ProductName, ProductSettings
 from .oauth_compat import BasicClientIdTokenMiddleware
+from .read_policy import ReadPolicy
 
 
 PRODUCT_NAMES = ("hypercrawl", "hyperscale", "engagemate")
@@ -129,12 +130,12 @@ def build_server(
     active_gateway = gateway or ProductGateway(
         ProductSettings.from_env(selected_product)
     )
-    _register_product(server, active_gateway, selected_product)
+    _register_product(server, active_gateway, selected_product, ReadPolicy.from_env(selected_product))
     return server
 
 
 def _register_product(
-    server: MCPServer, gateway: ProductGateway, product: ProductName
+    server: MCPServer, gateway: ProductGateway, product: ProductName, policy: ReadPolicy
 ) -> None:
     title = PRODUCT_PRESENTATION[product]["title"]
 
@@ -146,8 +147,9 @@ def _register_product(
         ),
     )
     async def list_tools() -> dict[str, Any]:
+        policy.restricted()
         tools = await gateway.list_tools(product)
-        return {"product": product, "tools": tools}
+        return {"product": product, "tools": policy.catalog(tools)}
 
     @server.tool(
         name=f"{product}_call",
@@ -159,7 +161,8 @@ def _register_product(
     async def call_tool(
         tool_name: str, arguments: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        return await gateway.call_tool(product, tool_name, arguments or {})
+        checked = policy.arguments(tool_name, arguments or {})
+        return await gateway.call_tool(product, tool_name, checked)
 
     @server.tool(
         name=f"{product}_status",
@@ -169,8 +172,9 @@ def _register_product(
         ),
     )
     async def status() -> dict[str, Any]:
+        policy.restricted()
         tools = await gateway.list_tools(product)
-        return {"product": product, "ok": True, "toolCount": len(tools)}
+        return {"product": product, "ok": True, "toolCount": len(policy.catalog(tools))}
 
 
 def main() -> None:
