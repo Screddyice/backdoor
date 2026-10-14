@@ -372,6 +372,18 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in `.env` and you can tr
 
 ---
 
+## Saved HyperCrawl sessions in connected apps
+
+The HyperCrawl product gateway exposes `get_v1_sessions` and URL-only
+`post_v1_crawl` to its authenticated read clients, alongside public search and
+public crawl. Session listing returns domains, counts and save times; authenticated
+crawls apply the gateway tenant's existing cookies on the HyperCrawl server.
+Clients cannot supply cookies or a different tenant, import/delete sessions, or
+invoke browser actions through this read policy. Cookie values remain on the server.
+
+Verify the gateway with `uv run pytest tests/test_products_mcp_read_policy.py`.
+An app that cached the older public-only catalog should refresh its tool list.
+
 ## Running the tests
 
 **The suite posts no desktop notifications.** Fifteen test sites build a `FailoverBreaker` without

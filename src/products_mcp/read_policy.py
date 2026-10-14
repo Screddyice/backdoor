@@ -1,4 +1,4 @@
-"""Bound selected OAuth clients to explicit public reads before upstream dispatch."""
+"""Bound selected OAuth clients to explicit reads before upstream dispatch."""
 
 from __future__ import annotations
 
@@ -50,7 +50,14 @@ class PublicCrawl(BaseModel):
         return value
 
 
-READ_INPUTS = {"post_v1_search": PublicSearch, "post_v1_crawl_public": PublicCrawl}
+READ_INPUTS = {
+    "post_v1_search": PublicSearch,
+    "post_v1_crawl_public": PublicCrawl,
+    # This URL-only REST operation applies the existing tenant's saved session;
+    # it accepts no browser actions, inline cookies, or caller-selected tenant.
+    "post_v1_crawl": PublicCrawl,
+}
+SESSION_METADATA = "get_v1_sessions"
 
 
 @dataclass(frozen=True)
@@ -78,15 +85,23 @@ class ReadPolicy:
     def catalog(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not self.restricted():
             return tools
-        return [{**tool, "inputSchema": {
+        result = [{**tool, "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {"body": READ_INPUTS[tool["name"]].model_json_schema()},
             "required": ["body"],
         }} for tool in tools if tool.get("name") in READ_INPUTS]
+        result.extend({**tool, "inputSchema": {
+            "type": "object", "additionalProperties": False, "properties": {},
+        }} for tool in tools if tool.get("name") == SESSION_METADATA)
+        return result
 
     def arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if not self.restricted():
             return arguments
+        if name == SESSION_METADATA:
+            if arguments:
+                raise ValueError("Session metadata operation accepts no arguments")
+            return {}
         model = READ_INPUTS.get(name)
         if model is None:
             raise PermissionError("Operation is not allowed for this read-only client")

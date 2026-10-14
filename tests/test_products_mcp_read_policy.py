@@ -1,4 +1,4 @@
-"""Authenticated HTTP requests cannot bypass a selected client's public-read policy."""
+"""Authenticated requests expose saved-session reads without granting mutations."""
 
 import json
 import time
@@ -27,7 +27,7 @@ def setup(monkeypatch, tmp_path):
     monkeypatch.setenv("PRODUCTS_MCP_READ_ONLY_CLIENT_IDS", "muse-client")
     gateway = AsyncMock()
     gateway.list_tools.return_value = [{"name": name, "inputSchema": {"type": "object"}}
-        for name in ["post_v1_search", "post_v1_crawl_public", "post_v1_crawl", "post_v1_accounts"]]
+        for name in ["post_v1_search", "post_v1_crawl_public", "post_v1_crawl", "get_v1_sessions", "post_v1_accounts"]]
     gateway.call_tool.return_value = {"ok": True}
     server = build_server(product="hypercrawl", gateway=gateway)
     with TestClient(server.streamable_http_app(stateless_http=True, json_response=True,
@@ -44,9 +44,10 @@ def setup(monkeypatch, tmp_path):
 def test_authenticated_catalog_and_status_expose_only_authorized_operations(setup):
     gateway, call = setup
     result = call("hypercrawl_list_tools").json()["result"]["structuredContent"]
-    assert [t["name"] for t in result["tools"]] == ["post_v1_search", "post_v1_crawl_public"]
+    assert [t["name"] for t in result["tools"]] == ["post_v1_search", "post_v1_crawl_public", "post_v1_crawl", "get_v1_sessions"]
     assert result["tools"][0]["inputSchema"]["additionalProperties"] is False
-    assert call("hypercrawl_status").json()["result"]["structuredContent"]["toolCount"] == 2
+    assert result["tools"][-1]["inputSchema"] == {"type": "object", "additionalProperties": False, "properties": {}}
+    assert call("hypercrawl_status").json()["result"]["structuredContent"]["toolCount"] == 4
     gateway.call_tool.assert_not_awaited()
 
 
@@ -54,6 +55,7 @@ def test_authenticated_catalog_and_status_expose_only_authorized_operations(setu
     ("post_v1_search", {"query": " IANA ", "maxResults": 1},
      {"query": "IANA", "maxResults": 1, "provider": "searxng", "cache": False}),
     ("post_v1_crawl_public", {"url": "https://example.com/"}, {"url": "https://example.com/"}),
+    ("post_v1_crawl", {"url": "https://example.com/profile"}, {"url": "https://example.com/profile"}),
 ])
 def test_exact_reads_dispatch_bounded_input(setup, name, body, expected):
     gateway, call = setup
@@ -63,7 +65,13 @@ def test_exact_reads_dispatch_bounded_input(setup, name, body, expected):
 
 
 @pytest.mark.parametrize("name,args", [
-    ("post_v1_accounts", {"body": {}}), ("post_v1_crawl", {"body": {"url": "https://example.com"}}),
+    ("post_v1_accounts", {"body": {}}), ("post_v1_sessions", {"body": {}}),
+    ("delete_v1_sessions", {"body": {"domain": "example.com"}}),
+    ("get_v1_sessions", {"tenant": "other"}),
+    ("get_v1_sessions", {"body": {}}),
+    ("post_v1_crawl", {"body": {"url": "https://example.com", "actions": []}}),
+    ("post_v1_crawl", {"body": {"url": "https://example.com", "storageState": {}}}),
+    ("post_v1_crawl", {"body": {"url": "https://user:password@example.com"}}),
     ("POST_V1_SEARCH", {"body": {"query": "IANA"}}),
     ("post_v1_search", {"body": {"query": "IANA", "maxResults": 6}}),
     ("post_v1_search", {"body": {"query": "IANA", "maxResults": True}}),
@@ -88,9 +96,16 @@ def test_disallowed_calls_stop_before_any_upstream_dispatch(setup, name, args):
 def test_other_authenticated_clients_keep_existing_surface(setup):
     gateway, call = setup
     result = call("hypercrawl_list_tools", token="other").json()["result"]["structuredContent"]
-    assert len(result["tools"]) == 4
+    assert len(result["tools"]) == 5
     call("hypercrawl_call", {"tool_name": "post_v1_accounts", "arguments": {"body": {}}}, token="other")
     gateway.call_tool.assert_awaited_once_with("hypercrawl", "post_v1_accounts", {"body": {}})
+
+
+def test_saved_session_metadata_dispatches_without_cookie_or_tenant_arguments(setup):
+    gateway, call = setup
+    result = call("hypercrawl_call", {"tool_name": "get_v1_sessions", "arguments": {}}).json()
+    assert result["result"].get("isError") is not True
+    gateway.call_tool.assert_awaited_once_with("hypercrawl", "get_v1_sessions", {})
 
 
 def test_invalid_auth_is_rejected_before_gateway(setup):
