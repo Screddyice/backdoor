@@ -57,9 +57,6 @@ def settings() -> ProductSettings:
         hypercrawl_token="hc_test_value",
         hyperscale_url="https://scale.example/mcp",
         hyperscale_key="hf_test_value",
-        engagemate_url="http://127.0.0.1:13100",
-        engagemate_key="engage_test_value",
-        engagemate_user_id="user_test",
     )
 
 
@@ -74,14 +71,6 @@ def settings() -> ProductSettings:
             },
         ),
         ("hyperscale", {"HYPERFLOW_API_KEY": "hf_test_value"}),
-        (
-            "engagemate",
-            {
-                "ENGAGEMATE_URL": "http://127.0.0.1:13100",
-                "INTERNAL_API_KEY": "engage_test_value",
-                "ENGAGEMATE_USER_ID": "user_test",
-            },
-        ),
     ],
 )
 def test_selected_product_settings_do_not_require_other_product_credentials(
@@ -93,10 +82,6 @@ def test_selected_product_settings_do_not_require_other_product_credentials(
         "HYPERCRAWL_MCP_URL",
         "HYPERCRAWL_MCP_TOKEN",
         "HYPERFLOW_API_KEY",
-        "ENGAGEMATE_URL",
-        "ENGAGEMATE_INTERNAL_API_KEY",
-        "INTERNAL_API_KEY",
-        "ENGAGEMATE_USER_ID",
     ):
         monkeypatch.delenv(name, raising=False)
     for name, value in environment.items():
@@ -106,10 +91,8 @@ def test_selected_product_settings_do_not_require_other_product_credentials(
 
     if product == "hypercrawl":
         assert loaded.hypercrawl_token == "hc_test_value"
-    elif product == "hyperscale":
-        assert loaded.hyperscale_key == "hf_test_value"
     else:
-        assert loaded.engagemate_key == "engage_test_value"
+        assert loaded.hyperscale_key == "hf_test_value"
 
 
 def test_selected_product_settings_reject_missing_required_credential(
@@ -216,24 +199,26 @@ async def test_hyperscale_forwards_native_mcp_list_and_call() -> None:
     assert messages[-1]["params"] == {"name": "campaign_list_templates", "arguments": {}}
 
 
+def test_engagemate_is_no_longer_a_gateway_product() -> None:
+    fields = set(ProductSettings.__dataclass_fields__)
+
+    assert not {name for name in fields if name.startswith("engagemate")}
+
+
 @pytest.mark.asyncio
-async def test_engagemate_uses_internal_key_and_user_headers() -> None:
+async def test_engagemate_requests_are_refused_without_reaching_upstream() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/openapi.json":
-            return httpx.Response(200, json=OPENAPI)
-        return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json=OPENAPI)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         gateway = ProductGateway(settings(), http=client)
-        await gateway.list_tools("engagemate")
-        result = await gateway.call_tool("engagemate", "health_health_get", {})
+        with pytest.raises(UpstreamError, match="unknown product: engagemate"):
+            await gateway.list_tools("engagemate")  # type: ignore[arg-type]
 
-    assert result == {"status": 200, "body": {"ok": True}}
-    assert requests[-1].headers["x-internal-api-key"] == "engage_test_value"
-    assert requests[-1].headers["x-user-id"] == "user_test"
+    assert requests == []
 
 
 @pytest.mark.asyncio
@@ -255,10 +240,10 @@ async def test_openapi_call_rejects_missing_body_and_unknown_arguments() -> None
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         gateway = ProductGateway(settings(), http=client)
         with pytest.raises(UpstreamError, match="requires request body"):
-            await gateway.call_tool("engagemate", "accounts_update", {"account_id": "a"})
+            await gateway.call_tool("hypercrawl", "accounts_update", {"account_id": "a"})
         with pytest.raises(UpstreamError, match="unexpected argument"):
             await gateway.call_tool(
-                "engagemate",
+                "hypercrawl",
                 "accounts_update",
                 {"account_id": "a", "body": {}, "misspelled": True},
             )
@@ -287,7 +272,6 @@ async def test_upstream_errors_hide_response_bodies_and_credentials() -> None:
     ("hypercrawl", 503, {"code": "SEARCH_UNAVAILABLE", "blocked": False}, False),
     ("hypercrawl", 503, {"code": "OTHER_ERROR", "blocked": True}, False),
     ("hypercrawl", 500, {"code": "SEARCH_UNAVAILABLE", "blocked": True}, False),
-    ("engagemate", 503, {"code": "SEARCH_UNAVAILABLE", "blocked": True}, False),
     ("hypercrawl", 503, ["SEARCH_UNAVAILABLE"], False),
     ("hypercrawl", 503, "not-json", False),
 ])

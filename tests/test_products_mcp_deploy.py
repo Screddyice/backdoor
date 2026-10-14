@@ -30,7 +30,6 @@ def test_product_runtimes_have_unique_oauth_and_network_boundaries() -> None:
     products = {
         "hypercrawl": ("8011", "hypercrawl-mcp.teamnebula.ai"),
         "hyperscale": ("8012", "hyperscale-mcp.5-161-126-205.sslip.io"),
-        "engagemate": ("8013", "engagemate-mcp.5-161-126-205.sslip.io"),
     }
 
     for product, (port, hostname) in products.items():
@@ -44,3 +43,10 @@ def test_product_runtimes_have_unique_oauth_and_network_boundaries() -> None:
             f"/{product}-oauth-state.json"
         )
         assert runtime["HERMES_MCP_ALLOWED_HOSTS"] == f"{hostname},{hostname}:443"
+
+
+def test_retired_engagemate_runtime_is_not_deployed() -> None:
+    caddyfile = (ROOT / "deploy/products-mcp.Caddyfile").read_text()
+
+    assert not (ROOT / "deploy/products-mcp-engagemate.env").exists()
+    assert "engagemate" not in caddyfile

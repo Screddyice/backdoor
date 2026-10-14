@@ -20,7 +20,7 @@ from .oauth_compat import BasicClientIdTokenMiddleware
 from .read_policy import ReadPolicy
 
 
-PRODUCT_NAMES = ("hypercrawl", "hyperscale", "engagemate")
+PRODUCT_NAMES = ("hypercrawl", "hyperscale")
 
 
 class ProductMCPServer(MCPServer):
@@ -39,10 +39,9 @@ PRODUCT_PRESENTATION = {
         "instructions": (
             "Use HyperCrawl for public web research, site search, crawling, URL "
             "mapping, page extraction, browser sessions, and structured website data. "
-            "Do not use it for LinkedIn outreach or campaigns; use HyperScale. Do not "
-            "use it for Instagram engagement; use EngageMate. Team Nebula owns "
-            "HyperCrawl. Start with hypercrawl_status or hypercrawl_list_tools. Prefer "
-            "read-only discovery, and use hypercrawl_call for account changes, "
+            "Do not use it for LinkedIn outreach or campaigns; use HyperScale. Team "
+            "Nebula owns HyperCrawl. Start with hypercrawl_status or "
+            "hypercrawl_list_tools. Prefer read-only discovery, and use hypercrawl_call for account changes, "
             "authentication, form submission, or other external actions only after an "
             "explicit request."
         ),
@@ -56,28 +55,10 @@ PRODUCT_PRESENTATION = {
         "instructions": (
             "Use HyperScale for LinkedIn prospects, connections, outbound campaigns, "
             "sequences, outreach status, and campaign templates. Do not use it for web "
-            "crawling or general research; use HyperCrawl. Do not use it for Instagram "
-            "engagement; use EngageMate. Team Nebula owns HyperScale. Start with "
-            "hyperscale_status or hyperscale_list_tools. Prefer read-only inspection, "
+            "crawling or general research; use HyperCrawl. Team Nebula owns "
+            "HyperScale. Start with hyperscale_status or hyperscale_list_tools. Prefer read-only inspection, "
             "and use hyperscale_call to launch campaigns, connect accounts, or send "
             "outreach only after an explicit request."
-        ),
-    },
-    "engagemate": {
-        "title": "EngageMate",
-        "description": (
-            "Instagram onboarding, audience discovery, engagement controls, account "
-            "status, and service health tools."
-        ),
-        "instructions": (
-            "Use EngageMate for Instagram account onboarding, audience and target "
-            "discovery, engagement settings, account status, and service health. Do not "
-            "use it for LinkedIn outreach; use HyperScale. Do not use it for general web "
-            "research or crawling; use HyperCrawl. Shawn Reddy Consulting owns "
-            "EngageMate; it is not a Team Nebula product. Start with engagemate_status "
-            "or engagemate_list_tools. Prefer read-only inspection, and use "
-            "engagemate_call to connect accounts or perform social engagement only "
-            "after an explicit request."
         ),
     },
 }
@@ -87,7 +68,7 @@ def _selected_product(product: str | None = None) -> ProductName:
     selected = (product or os.environ.get("PRODUCTS_MCP_PRODUCT", "")).strip().lower()
     if not selected:
         raise ValueError(
-            "PRODUCTS_MCP_PRODUCT must select hypercrawl, hyperscale, or engagemate"
+            "PRODUCTS_MCP_PRODUCT must select hypercrawl or hyperscale"
         )
     if selected not in PRODUCT_NAMES:
         raise ValueError(f"unknown product: {selected}")

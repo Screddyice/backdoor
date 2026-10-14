@@ -23,11 +23,6 @@ EXPECTED_TOOLS = {
         "hyperscale_call",
         "hyperscale_status",
     },
-    "engagemate": {
-        "engagemate_list_tools",
-        "engagemate_call",
-        "engagemate_status",
-    },
 }
 
 
@@ -44,12 +39,6 @@ EXPECTED_ROUTING = {
         "exclude": "web crawling",
         "owner": "Team Nebula",
     },
-    "engagemate": {
-        "title": "EngageMate",
-        "purpose": "Instagram",
-        "exclude": "LinkedIn outreach",
-        "owner": "Shawn Reddy Consulting",
-    },
 }
 
 
@@ -62,7 +51,7 @@ class FakeGateway:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("product", ["hypercrawl", "hyperscale", "engagemate"])
+@pytest.mark.parametrize("product", ["hypercrawl", "hyperscale"])
 async def test_server_registers_only_selected_product_tools(
     monkeypatch, product
 ) -> None:
@@ -77,7 +66,7 @@ async def test_server_registers_only_selected_product_tools(
     assert {tool.name for tool in tools} == EXPECTED_TOOLS[product]
 
 
-@pytest.mark.parametrize("product", ["hypercrawl", "hyperscale", "engagemate"])
+@pytest.mark.parametrize("product", ["hypercrawl", "hyperscale"])
 def test_server_advertises_product_specific_routing_instructions(
     monkeypatch, tmp_path, product
 ) -> None:
@@ -208,3 +197,27 @@ def test_main_passes_configured_bind_to_explicit_http_runner(monkeypatch) -> Non
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8010
     assert isinstance(captured["transport_security"], TransportSecuritySettings)
+
+
+def test_server_rejects_the_retired_engagemate_product(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "https://products.example")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "claude.ai,claude.com")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
+
+    with pytest.raises(ValueError, match="unknown product: engagemate"):
+        build_server(product="engagemate", gateway=FakeGateway())
+
+
+@pytest.mark.parametrize("product", ["hypercrawl", "hyperscale"])
+def test_remaining_products_no_longer_route_to_engagemate(
+    monkeypatch, tmp_path, product
+) -> None:
+    monkeypatch.setenv("HERMES_MCP_OAUTH_ISSUER", "https://products.example")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_REDIRECT_HOSTS", "claude.ai,claude.com")
+    monkeypatch.setenv("HERMES_MCP_OAUTH_STATE_PATH", str(tmp_path / "state.json"))
+
+    server = build_server(product=product, gateway=FakeGateway())
+
+    assert "EngageMate" not in server.instructions
