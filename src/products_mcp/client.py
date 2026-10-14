@@ -10,7 +10,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
-ProductName = Literal["hypercrawl", "hyperscale", "engagemate"]
+ProductName = Literal["hypercrawl", "hyperscale"]
 
 
 class UpstreamError(RuntimeError):
@@ -23,9 +23,6 @@ class ProductSettings:
     hypercrawl_token: str
     hyperscale_url: str
     hyperscale_key: str
-    engagemate_url: str
-    engagemate_key: str
-    engagemate_user_id: str
 
     @classmethod
     def from_env(cls, product: ProductName | None = None) -> "ProductSettings":
@@ -42,17 +39,10 @@ class ProductSettings:
                 "https://hyperflow-one--teamnebula-ai.us-central1.hosted.app/mcp",
             ).rstrip("/"),
             hyperscale_key=os.environ.get("HYPERFLOW_API_KEY", ""),
-            engagemate_url=os.environ.get(
-                "ENGAGEMATE_URL", "http://127.0.0.1:13100"
-            ).rstrip("/"),
-            engagemate_key=os.environ.get("ENGAGEMATE_INTERNAL_API_KEY", "")
-            or os.environ.get("INTERNAL_API_KEY", ""),
-            engagemate_user_id=os.environ.get("ENGAGEMATE_USER_ID", ""),
         )
         required_by_product = {
             "hypercrawl": {"HYPERCRAWL_URL", "HYPERCRAWL_REST_TOKEN"},
             "hyperscale": {"HYPERFLOW_API_KEY"},
-            "engagemate": {"INTERNAL_API_KEY", "ENGAGEMATE_USER_ID"},
         }
         required = (
             required_by_product[product]
@@ -65,8 +55,6 @@ class ProductSettings:
                 "HYPERCRAWL_URL": values.hypercrawl_url,
                 "HYPERCRAWL_REST_TOKEN": values.hypercrawl_token,
                 "HYPERFLOW_API_KEY": values.hyperscale_key,
-                "INTERNAL_API_KEY": values.engagemate_key,
-                "ENGAGEMATE_USER_ID": values.engagemate_user_id,
             }.items()
             if name in required and not value
         ]
@@ -163,11 +151,6 @@ class ProductGateway:
         if product == "hypercrawl":
             return self.settings.hypercrawl_url, {
                 "authorization": f"Bearer {self.settings.hypercrawl_token}"
-            }
-        if product == "engagemate":
-            return self.settings.engagemate_url, {
-                "x-internal-api-key": self.settings.engagemate_key,
-                "x-user-id": self.settings.engagemate_user_id,
             }
         raise UpstreamError(f"unknown product: {product}")
 

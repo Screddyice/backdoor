@@ -2089,26 +2089,31 @@ When public search returns the typed HTTP 503 `SEARCH_UNAVAILABLE` failure, the
 gateway preserves that code and blocked status with a fixed retry message. It
 does not echo provider response bodies or arbitrary diagnostic text.
 
-`src/products_mcp/` runs three OAuth MCP instances for Claude desktop, web, and mobile:
+`src/products_mcp/` runs two OAuth MCP instances for Claude desktop, web, and mobile:
 
 | Connector | Owner | Public endpoint | Tools |
 | --- | --- | --- | --- |
 | HyperCrawl | Team Nebula | `https://hypercrawl-mcp.teamnebula.ai/mcp` | `hypercrawl_status`, `hypercrawl_list_tools`, `hypercrawl_call` |
 | HyperScale | Team Nebula | `https://hyperscale-mcp.5-161-126-205.sslip.io/mcp` | `hyperscale_status`, `hyperscale_list_tools`, `hyperscale_call` |
-| EngageMate | Shawn Reddy Consulting (SRC), Screddyice GitHub organization | `https://engagemate-mcp.5-161-126-205.sslip.io/mcp` | `engagemate_status`, `engagemate_list_tools`, `engagemate_call` |
 
 Each server advertises product-specific instructions during MCP initialization so clients can
 route requests without relying on the connector name alone:
 
 | Request intent | Connector | Exclusions |
 | --- | --- | --- |
-| Public web research, site search, crawling, URL mapping, page extraction, browser sessions, or structured website data | HyperCrawl | LinkedIn outreach and Instagram engagement |
-| LinkedIn prospects, connections, outbound campaigns, sequences, outreach status, or templates | HyperScale | General web crawling and Instagram engagement |
-| Instagram onboarding, audience discovery, engagement settings, account status, or service health | EngageMate | LinkedIn outreach and general web crawling |
+| Public web research, site search, crawling, URL mapping, page extraction, browser sessions, or structured website data | HyperCrawl | LinkedIn outreach |
+| LinkedIn prospects, connections, outbound campaigns, sequences, outreach status, or templates | HyperScale | General web crawling |
 
 The instructions direct clients to call the product's read-only status or list tool first. Clients
-reserve account connections, campaign launches, messages, form submissions, and social engagement
-for an explicit user request.
+reserve account connections, campaign launches, messages, and form submissions for an explicit user
+request.
+
+EngageMate was removed from the gateway on 2026-10-14 after the service was shut down. The server
+now refuses `PRODUCTS_MCP_PRODUCT=engagemate`, the `engagemate-mcp` Caddy block and runtime file are
+gone, and the remaining instructions no longer send Instagram requests anywhere. Instagram work is
+planned inside HyperScale. On an existing host, also delete
+`%h/.config/products-mcp/engagemate.env` and drop any unit line that loads it, then restart the
+remaining instances.
 
 Set `PRODUCTS_MCP_PRODUCT` to one product for each process. The server refuses a missing or unknown
 value and registers only that product's three tools. The list tool returns upstream operation names
@@ -2117,8 +2122,7 @@ the bridge as an open HTTP proxy.
 
 The bridge reuses `src/hermes_mcp/oauth.py` for dynamic client registration, PKCE, one-hour access
 tokens, and rotating refresh tokens. It keeps product authorization separate behind the bridge:
-HyperCrawl uses its tenant REST token, HyperScale uses its organization API key, and EngageMate
-uses its internal key plus explicit user ID. Store each product's credentials in a protected
+HyperCrawl uses its tenant REST token, and HyperScale uses its organization API key. Store each product's credentials in a protected
 Hermes-owned `%h/.config/products-mcp/<name>.env` file. The HyperCrawl instance can also read the
 existing `HYPERCRAWL_MCP_TOKEN` from `%h/.hermes/mcp.env`; install
 [`deploy/products-mcp-http@hypercrawl.service.d/10-hypercrawl-credentials.conf`](deploy/products-mcp-http@hypercrawl.service.d/10-hypercrawl-credentials.conf)
@@ -2137,7 +2141,7 @@ Claude and local loopback callback hosts.
 
 Deploy this branch in `~/backdoor-products-mcp`, then install
 [`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start
-the `hypercrawl`, `hyperscale`, and `engagemate` instances. Each instance loads its matching
+the `hypercrawl` and `hyperscale` instances. Each instance loads its matching
 `%h/.config/products-mcp/<name>.env` credential file before `deploy/products-mcp-<name>.env`, so
 its bind address, port, OAuth issuer, state path, and product selection take precedence. The
 separate checkout keeps connector updates from changing the live router or Hermes bridge.
