@@ -2095,7 +2095,9 @@ does not echo provider response bodies or arbitrary diagnostic text.
 | --- | --- | --- | --- |
 | HyperCrawl | Team Nebula | `https://hypercrawl-mcp.teamnebula.ai/mcp` | `hypercrawl_status`, `hypercrawl_list_tools`, `hypercrawl_call` |
 | HyperScale | Team Nebula | `https://hyperscale-mcp.5-161-126-205.sslip.io/mcp` | `hyperscale_status`, `hyperscale_list_tools`, `hyperscale_call` |
-| EngageMate | Shawn Reddy Consulting (SRC), Screddyice GitHub organization | `https://engagemate-mcp.5-161-126-205.sslip.io/mcp` | `engagemate_status`, `engagemate_list_tools`, `engagemate_call` |
+
+The standalone EngageMate connector is retired. Use the existing HyperScale connection
+for integrated engagement operations when advertised; do not start a separate EngageMate instance.
 
 Each server advertises product-specific instructions during MCP initialization so clients can
 route requests without relying on the connector name alone:
@@ -2103,8 +2105,8 @@ route requests without relying on the connector name alone:
 | Request intent | Connector | Exclusions |
 | --- | --- | --- |
 | Public web research, site search, crawling, URL mapping, page extraction, browser sessions, or structured website data | HyperCrawl | LinkedIn outreach and Instagram engagement |
-| LinkedIn prospects, connections, outbound campaigns, sequences, outreach status, or templates | HyperScale | General web crawling and Instagram engagement |
-| Instagram onboarding, audience discovery, engagement settings, account status, or service health | EngageMate | LinkedIn outreach and general web crawling |
+| LinkedIn prospects, connections, outbound campaigns, sequences, outreach status, or templates | HyperScale | General web crawling |
+| Instagram onboarding, audience discovery, engagement settings, account status, or service health | HyperScale integrated engagement tools, when advertised | General web crawling |
 
 The instructions direct clients to call the product's read-only status or list tool first. Clients
 reserve account connections, campaign launches, messages, form submissions, and social engagement
@@ -2137,7 +2139,7 @@ Claude and local loopback callback hosts.
 
 Deploy this branch in `~/backdoor-products-mcp`, then install
 [`deploy/products-mcp-http@.service`](deploy/products-mcp-http@.service) as a user service. Start
-the `hypercrawl`, `hyperscale`, and `engagemate` instances. Each instance loads its matching
+the `hypercrawl` and `hyperscale` instances. Each instance loads its matching
 `%h/.config/products-mcp/<name>.env` credential file before `deploy/products-mcp-<name>.env`, so
 its bind address, port, OAuth issuer, state path, and product selection take precedence. The
 separate checkout keeps connector updates from changing the live router or Hermes bridge.
