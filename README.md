@@ -2285,3 +2285,9 @@ Ad hoc agent mutations of the live router remain blocked by machine hooks.
 
 Validation: `uv run pytest -q` includes deployment authorization, recovery receipt,
 and streaming request-count tests. Tests never operate launchd or load local models.
+
+## CI
+
+Pull requests and pushes to `main` run on Crow CI, a Woodpecker-based server on Shawn's Mac. The pipeline in `.woodpecker.yaml` installs the package with its dev extras on Python 3.12 (plus zsh) and runs `pytest -q`, the same suite as `.github/workflows/ci.yml`. A green `ci/crow/...` status on the pull request's head commit is the merge check.
+
+GitHub Actions is the fallback. The workflow's `crow-gate` job waits up to three minutes for a Crow status. If one appears, the GitHub test job is skipped. If none appears (the Mac was asleep or offline), the tests run on GitHub as before. A manual run (`gh workflow run ci.yml`) always runs them.
